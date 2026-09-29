@@ -1,0 +1,4 @@
+# Shell launchers must keep LF endings: with core.autocrlf=true git on Windows
+# would otherwise write CRLF into them, and a CRLF shebang is not executable
+# by /bin/sh ("\r: not found").
+*.sh text eol=lf
