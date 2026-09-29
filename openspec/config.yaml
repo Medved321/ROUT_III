@@ -1,0 +1,33 @@
+schema: spec-driven
+
+# Project context
+# Показывается AI при создании артефактов.
+context: |
+  ROUT III — серверо-ориентированный FPS-шутер в стиле Doom 1 (DDA raycasting).
+  Tech stack: Python 3.12 (`py -3.12`), pygame 2.6 (SDL 2.28), asyncio, UDP (big-endian struct protocol).
+  Архитектура: авторитетный сервер (server/), pygame клиент (client/), общий протокол (shared/).
+  Лобби: один сервер, много партий; клиент: меню → партия → игра (lobby ⇄ game).
+  Запуск: run_server.bat / run_client.bat. Актуальная спека: openspec/specs/001-doom-shooter.md
+  Детали протокола: SPEC.md (в корне проекта).
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
