@@ -87,7 +87,7 @@ def _load_rifle():
     try:
         img1 = pygame.image.load('skins/riffle_1.png').convert_alpha()
         img2 = pygame.image.load('skins/riffle_2.png').convert_alpha()
-        s = 3.0
+        s = 1
         w, h = int(img1.get_width() * s), int(img1.get_height() * s)
         _RIFLE_IDLE = pygame.transform.scale(img1, (w, h)) if w > 0 and h > 0 else img1
         w, h = int(img2.get_width() * s), int(img2.get_height() * s)
@@ -207,7 +207,7 @@ def draw_wpn(idx, tmr, fire, bob):
             _load_rifle()
         img = _RIFLE_FIRE if fire else _RIFLE_IDLE
         gw, gh = img.get_size()
-        gs.screen.blit(img, (wx - gw // 2, wy + 200 - gh))
+        gs.screen.blit(img, (wx - gw // 2 - 100, wy + 200 - gh))
 
     elif wn == 'BFG':
         glow = 255 if fire else 100

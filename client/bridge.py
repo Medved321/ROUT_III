@@ -88,8 +88,10 @@ class RenderBridge:
     def __init__(self, surface: pygame.Surface, scale: int | None = None):
         self._surface = surface
         self.set_output_surface(surface)
-        gs.font = pygame.font.SysFont("monospace", 34, bold=True)
-        gs.sm_font = pygame.font.SysFont("monospace", 18)
+        # ``gs.font``/``gs.sm_font`` are sized in layout units and owned by
+        # ``engine.viewport.ensure_hud_fonts()``, which render() calls every
+        # frame -- building them here froze one window's text size for the whole
+        # session and made the HUD unreadable at every other resolution.
         # ``gs.render_scale``/``gs.view_dist`` are owned by ``Settings``
         # (``apply_runtime``); never reset them to import-time defaults here.
         if scale is not None:
@@ -240,6 +242,7 @@ class RenderBridge:
         mode: str = 'pve',
         impacts: list[dict] | None = None,
         local_state: int = 0,
+        fps: float = 0.0,
     ) -> None:
         # The animation clock runs on the frame period, not on snapshots, so a
         # 20 Hz snapshot stream still animates at the display rate.  Fed here
@@ -252,6 +255,9 @@ class RenderBridge:
         gs.pa = angle
         gs.pz = 0.0
         gs.pitch = 0.0
+        # Measured by the caller, not by the engine: a clock lives in the
+        # client, and gs.fps is only the readout for the HUD.
+        gs.fps = float(fps)
         gs.lvl_type = 'pvp' if mode == 'pvp' else 'pve'
         player_dict['hp'] = max(0, int(health))
         player_dict['wpn'] = weapon

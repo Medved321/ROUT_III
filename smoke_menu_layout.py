@@ -36,7 +36,7 @@ from client.lobby_screen import LobbyScreen
 from client.pause_screen import PauseScreen
 from client.renderer import SCREEN_HEIGHT, SCREEN_WIDTH, Renderer
 from client.sector_editor_screen import SectorEditorScreen
-from client.settings import Settings
+from client.settings import DEFAULTS, Settings, format_value
 from client.settings_screen import CUSTOM_ROW_KEY, SPEC, SettingsScreen
 from client.ui_layout import ellipsize
 
@@ -57,6 +57,28 @@ failures: list[str] = []
 def check(ok: bool, message: str) -> None:
     if not ok:
         failures.append(message)
+
+
+def worst_values(spec: dict) -> list[str]:
+    """The widest texts a settings row can ever show.
+
+    A row is not checked against the value that happens to be in ``config.json``
+    but against everything it can reach: every entry of a list row, both ends of
+    a numeric range, and the hand-typed size a ``custom`` row accepts -- that one
+    is not in its preset list, so it reads as «Другое → …» and is the longest
+    string the value band will ever be asked to hold.
+    """
+    key = spec["key"]
+    texts: list[str] = []
+    for value in spec.get("values") or []:
+        texts.append(format_value(key, value))
+    if "min" in spec:
+        texts.append(format_value(key, spec["min"]))
+        texts.append(format_value(key, spec["max"]))
+    if spec.get("custom"):
+        for size in ("3840\u00d72160", "4444\u00d73333"):
+            texts.append(format_value(key, size))
+    return texts or [format_value(key, DEFAULTS[key])]
 
 
 # ── element collection ───────────────────────────────────────────
@@ -171,6 +193,32 @@ for name, screen in SCREENS:
     screen.draw(surface, settings) if name == "settings" else screen.draw(surface)
     check_geometry(name, screen)
 print("geometry: no overlaps, everything inside the canvas, labels fit")
+
+# A settings row used to draw an empty panel with a pair of arrows: the caption
+# band was measured from the value band's left edge, which already sat at the
+# caption's own padding, so every width came out as zero and every name was
+# silently dropped. A caption nobody can read is not a layout nit, so the bands
+# are checked for the thing that actually broke: an empty or cut caption, and a
+# value that reaches under the arrows.
+_settings_screen = dict(SCREENS)["settings"]
+_settings_font = _settings_screen.font
+for _i, _spec in enumerate(SPEC):
+    _rect = _settings_screen._row_rect(_i)
+    _label_rect = _settings_screen._label_rect(_rect)
+    _value_rect = _settings_screen._value_rect(_rect)
+    check(_label_rect.width > 0 and _value_rect.width > 0,
+          f"settings: {_spec['key']} has an empty band (label {_label_rect}, "
+          f"value {_value_rect})")
+    check(ellipsize(_spec["label"], _settings_font, _label_rect.width) == _spec["label"],
+          f"settings: caption {_spec['label']!r} is cut to {_label_rect.width}px")
+    for _value in worst_values(_spec):
+        check(ellipsize(_value, _settings_font, _value_rect.width) == _value,
+              f"settings: value {_value!r} is cut to {_value_rect.width}px")
+    check(not _label_rect.colliderect(_value_rect),
+          f"settings: {_spec['key']} caption and value bands overlap")
+    check(not _value_rect.colliderect(_settings_screen._left_arrow(_rect)),
+          f"settings: {_spec['key']} value band runs under the arrows")
+print("settings: every caption and value fits its own band")
 
 # ── hit-testing through the real mapping ──────────────────────────
 renderer = Renderer((1000, 700))

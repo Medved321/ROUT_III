@@ -162,6 +162,7 @@ class GameWorld:
         # grants exactly DASH_TICKS ticks of boosted movement.
         self._update_dash()
         self._update_fire_cooldowns()
+        self._update_shooting_flags()
         self._update_enemies()
         self._update_bullets()
         self._update_impacts()
@@ -241,6 +242,20 @@ class GameWorld:
             wp: WeaponComponent = comps[WeaponComponent]
             if wp.fire_cooldown > 0:
                 wp.fire_cooldown -= 1
+
+    def _update_shooting_flags(self) -> None:
+        """Clear the one-tick `state = 2` shooting pulse.
+
+        handle_shoot() raises it when a shot really happened; the input channel
+        no longer publishes it (PLAYER_INPUT carries only the held button), so
+        without this the flag would stick and every client would show a
+        permanent muzzle flash. Only `2` is touched — dash (`3`) is derived
+        from the dash component on every input packet and must survive.
+        """
+        for _eid, comps in self.entities.query(Player):
+            pl: Player = comps[Player]
+            if pl.state == 2:
+                pl.state = 0
 
     # ------------------------------------------------------------------
     #  Enemy AI (simplified ROUT_II_III port, px space)
@@ -588,6 +603,11 @@ class GameWorld:
                 "state": pl.state,
                 "wpn": wp.current,
                 "ammo": dict(wp.ammo),
+                # Ticks left before this weapon can fire again. Read live from
+                # the component (not from the last decision) so the client sees
+                # the cooldown counting down; fire_seq is filled in by the
+                # server from the session, which is where intents are numbered.
+                "fire_ready": wp.fire_cooldown,
                 "name": pl.name,
             })
         return states

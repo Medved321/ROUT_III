@@ -36,8 +36,9 @@ import pygame  # noqa: E402
 import client.bridge  # noqa: E402,F401  (registers the content providers)
 from client.enemy_models import (  # noqa: E402
     ANIM_STATES, CACHE_MAX_ENTRIES, CACHE_MAX_PIXELS, ENEMY_MODELS,
-    ENEMY_SURFACES, anim_frame_of, anim_state_of, cache_stats, clear_cache,
-    get_corpse_surface, get_enemy_surface, model_for, size_bucket, view_index,
+    ENEMY_SURFACES, SIZE_STEPS, anim_frame_of, anim_state_of, cache_stats,
+    clear_cache, get_corpse_surface, get_enemy_surface, model_for, size_bucket,
+    view_index,
 )
 from engine import constants as const  # noqa: E402
 from engine import game_state as gs  # noqa: E402
@@ -232,10 +233,9 @@ def test_cache_key_separates_view_and_detail():
 def test_size_ladder_bounds_the_cache():
     # A continuous range of pixel heights must collapse onto a small ladder,
     # otherwise a long walk would mint a surface per step.
-    assert size_bucket(1000) == size_bucket(256) == 256
-    for h in (5, 7, 12, 30, 77, 140, 500):
-        assert size_bucket(h) in (6, 8, 10, 13, 16, 20, 25, 31, 38, 46, 56, 68,
-                                  82, 98, 116, 136, 160, 188, 220, 256), h
+    assert size_bucket(4) == size_bucket(5) == 6
+    for h in (7, 12, 30, 77, 140, 500, 900):
+        assert size_bucket(h) in SIZE_STEPS, h
     clear_cache()
     for h in range(8, 260):          # every exact pixel height
         get_enemy_surface("imp", h, 0, "walk", 2, 2)
@@ -243,6 +243,127 @@ def test_size_ladder_bounds_the_cache():
     assert st["items"] <= len(range(6, 257)) * 1.0, st
     assert st["items"] < 60, st
     check(f"252 pixel heights -> {st['items']} cache entries")
+
+
+def test_ladder_never_caps_growth_on_screen():
+    # The model is blitted 1:1, so a rung *is* the drawn height and the top
+    # rung is the growth limit.  It used to be 256 px, which froze every enemy
+    # while the walls around it kept growing -- the enemy read as shrinking on
+    # approach (sector projection is in screen pixels: a 56-unit soldier is
+    # 420 px at 100 units and 700 px at 60).
+    top = SIZE_STEPS[-1]
+    assert top >= 1024, top               # covers any window, 4K included
+    prev = 0
+    for h in range(4, top + 1):
+        s = size_bucket(h)
+        assert s >= h, (h, s)             # never below the projection
+        assert s >= prev, (h, s, prev)    # monotonic
+        prev = s
+    # Above the window there is nothing left to tell the rungs apart, so
+    # clamping to the top rung is deliberate rather than a cap in the way.
+    assert size_bucket(top + 1) == size_bucket(99999) == top
+    # And the rungs a sector map actually asks for stay distinct.
+    proj = [int(round(56 * 750.0 / d)) for d in (400, 200, 100, 60)]
+    buckets = [size_bucket(p) for p in proj]
+    assert buckets == sorted(buckets) and len(set(buckets)) == len(buckets), \
+        (proj, buckets)
+    check(f"ladder {SIZE_STEPS[0]}..{top} px; {proj} -> {buckets}")
+
+
+def test_growth_is_monotonic_in_distance():
+    # The reported defect: an enemy got *smaller* as the player closed in.
+    # Driven through the real projection, not by feeding sizes in by hand --
+    # the ladder rung and the drawn height have to track ``sh`` on their own.
+    from engine import constants as const
+    from engine import game_state as gs
+    from engine.sector_render import project_object
+
+    keep = (const.W, const.H, const.FOV, gs.px, gs.py, gs.pa, gs.sec_scene)
+    const.W, const.H, const.FOV = 1000, 700, 1.2
+    gs.px = gs.py = gs.pa = 0.0
+    gs.sec_scene = None
+    try:
+        drawn = []
+        for d in (400, 300, 200, 150, 100, 75, 60, 50, 40, 30, 20):
+            sx, sh, ground_y, perp = project_object(float(d), 0.0, 56.0)
+            assert sx is not None, d
+            r = get_enemy_surface("soldier", sh, 0, "idle", 2, 3) \
+                .get_bounding_rect()
+            drawn.append((d, int(sh), r.height))
+            # The fit is exact for the rung, and the rung is never below the
+            # projection, so the drawn height tracks the projection from above
+            # and by no more than the rung it snapped to.
+            rung = size_bucket(sh)
+            assert abs(r.height - rung) <= max(3, rung * 0.04), \
+                (d, sh, rung, r.height)
+            if sh <= SIZE_STEPS[-1]:
+                assert r.height >= sh, (d, sh, r.height)
+            else:
+                # Taller than the window: the top rung stands in for every size
+                # above it, which is allowed only because the difference is
+                # off-screen by then.
+                assert rung == SIZE_STEPS[-1], (d, sh, rung)
+        for (d0, _, h0), (d1, p1, h1) in zip(drawn, drawn[1:]):
+            if p1 <= const.H:
+                assert h1 > h0, ("enemy shrank on approach", drawn)
+            else:
+                # Taller than the window: the top rung stands in for every
+                # size above it, so this may only not go backwards.
+                assert h1 >= h0, ("enemy shrank on approach", drawn)
+        # While the enemy still fits the window, it must have grown past the
+        # rung that used to freeze it.
+        assert drawn[-4][2] > 256, drawn
+    finally:
+        (const.W, const.H, const.FOV, gs.px, gs.py, gs.pa,
+         gs.sec_scene) = keep
+    check("closer = bigger: " + " ".join(f"{d}->{h}" for d, _, h in drawn))
+
+
+def test_silhouette_fills_the_requested_height():
+    # A part stack does not fill the box it is given -- a dog's head tops out
+    # at 0.53 of it -- and the shortfall differs per type, so the fit is
+    # measured.  What matters is that every type now lands on the projection.
+    for t in ENEMY_TYPES:
+        for h, tol in ((256, 0.03), (512, 0.03), (64, 0.10)):
+            r = get_enemy_surface(t, h, 0, "idle", 0, 3).get_bounding_rect()
+            assert abs(r.height / h - 1.0) <= tol, (t, h, r)
+    check("20/20 types fill the projected height")
+
+
+def test_silhouette_stands_on_the_floor():
+    # The engine bottom-aligns the box at one floor line, so a walker has to
+    # touch the bottom edge and a floater has to keep air under itself (that is
+    # what ``anchor`` means).  What is pinned is which of the two it is, not
+    # the exact pixel: the fit rounds, and a brush rounds again on top of it.
+    for t in ENEMY_TYPES:
+        m = model_for(t)
+        want = int(round(128 * m.anchor / max(0.4, 1.0 - m.anchor)))
+        for h in (128, 256, 512):
+            for v in (0, 2, 5):
+                s = get_enemy_surface(t, h, 0, "idle", v, 3)
+                r = s.get_bounding_rect()
+                gap = s.get_height() - 1 - (r.y + r.height - 1)
+                if want == 0:
+                    assert gap <= 2, ("hovering walker", t, h, v, gap)
+                else:
+                    assert gap >= want - 8, ("floater on the floor", t, h, v,
+                                             gap, want)
+    check("walkers touch the floor, floaters keep their hover gap")
+
+
+def test_quadruped_legs_are_drawn():
+    # ``leg_quad`` used to be declared with w = h = 0, which the painter
+    # collapsed to max(1, 0): a one-pixel dot instead of a leg.
+    for t in ("dog", "pinkie", "arachnotron", "boss_spider"):
+        legs = [p for p in model_for(t).parts if p.kind == 'leg_quad']
+        assert len(legs) == 4, (t, len(legs))
+        for p in legs:
+            assert p.w > 0.0 and p.h > 0.0, (t, p)
+    # And they survive into the picture: the leg pixels are below the body.
+    s = get_enemy_surface("dog", 256, 0, "idle", 2, 3)
+    r = s.get_bounding_rect()
+    assert r.height > 0 and s.get_height() - 1 == r.y + r.height - 1, r
+    check("quadruped legs have thickness and length")
 
 
 # ---------------------------------------------------------------------------
@@ -383,15 +504,21 @@ def test_corpse_per_type():
                 continue
             assert bodies[a] != bodies[b], f"corpse of {a} == corpse of {b}"
     # Corpses lie flat: drawn wider than tall, whatever the class.  The
-    # silhouette still reads as the type -- a dog is long, a turret is a
-    # compact thick mass, and the two must not be the same shape lying down.
+    # silhouette still reads as the type -- the flattening is applied to the
+    # silhouette, so a long quadruped lies longer than a squat mass -- and the
+    # two must not be the same shape lying down.
     shapes = {}
     for t in ENEMY_TYPES:
         b = get_corpse_surface(t, 64).get_bounding_rect()
         assert b.width > b.height, (t, b.width, b.height)
         shapes[t] = b.width / b.height
-    assert shapes["dog"] > shapes["mancubus"] * 1.8, \
-        (shapes["dog"], shapes["mancubus"])
+    for t, s in shapes.items():
+        assert 1.2 <= s <= 3.05, (t, s)
+    # A squat turret mass lies rounder than a long quadruped does, and the
+    # widest boss reaches the cap.  Before the fit, this comparison ran on the
+    # surface *box*, so it was really measuring padding, not the type.
+    assert shapes["dog"] > shapes["mancubus"], (shapes["dog"], shapes["mancubus"])
+    assert shapes["boss_spider"] >= max(shapes.values()) - 0.01, shapes
     check("20 distinct corpses, each lying flat in its own shape")
 
 
@@ -595,6 +722,11 @@ def main():
     test_fallback_for_unknown_types()
     test_cache_key_separates_view_and_detail()
     test_size_ladder_bounds_the_cache()
+    test_ladder_never_caps_growth_on_screen()
+    test_growth_is_monotonic_in_distance()
+    test_silhouette_fills_the_requested_height()
+    test_silhouette_stands_on_the_floor()
+    test_quadruped_legs_are_drawn()
     test_renderer_has_no_enemy_type_branches()
     test_no_surfaces_allocated_per_frame()
     test_models_actually_reach_the_screen()

@@ -98,6 +98,11 @@ def make_client(weapon_id=0, shoot=False, pressed=False, anim_until=0.0,
     c._fire_anim_until = anim_until
     c._fire_anim_wpn = anim_wpn
     c._next_fire_time = gate
+    c._fire_intent_pending = False
+    c._fire_undecided = 0
+    c._server_fire_seq = 0
+    c._server_fire_ready = 0
+    c.local_weapon = weapon_id
     c.input_handler = FakeInput(weapon_id, shoot, pressed)
     c.network = FakeNet()
     c.local_angle = 0.0
@@ -205,13 +210,26 @@ def pick(idx, tmr):
     return rec.last
 
 
+def fitted(key, img):
+    """The surface draw_wpn is expected to blit for this frame.
+
+    draw_wpn no longer blits the module-level frame surfaces directly: every
+    frame is normalised to one height per weapon for the current window (change
+    `viewport-scaling`), so the identity to assert is the *fitted* copy of the
+    frame the thresholds select. Comparing against _fit_wpn() keeps this test
+    about frame selection, which is what it is for.  The weapon name is the key's
+    first field -- WPN_TARGET_H is keyed by name, not by weapon id.
+    """
+    return er._fit_wpn(key, img, er.ui_px(er.WPN_TARGET_H[key[0]]))
+
+
 f = WPN[2]['f']  # SHOTGUN
-assert pick(2, f) is er._SHOTGUN_FIRE
-assert pick(2, int(f * 0.9)) is er._SHOTGUN_FIRE
-assert pick(2, int(f * 0.6)) is er._SHOTGUN_FIRE
-assert pick(2, int(f * 0.4)) is er._SHOTGUN_RECOIL
-assert pick(2, 1) is er._SHOTGUN_RECOIL
-assert pick(2, 0) is er._SHOTGUN_IDLE
+assert pick(2, f) is fitted(('SHOTGUN', 'fire'), er._SHOTGUN_FIRE)
+assert pick(2, int(f * 0.9)) is fitted(('SHOTGUN', 'fire'), er._SHOTGUN_FIRE)
+assert pick(2, int(f * 0.6)) is fitted(('SHOTGUN', 'fire'), er._SHOTGUN_FIRE)
+assert pick(2, int(f * 0.4)) is fitted(('SHOTGUN', 'recoil'), er._SHOTGUN_RECOIL)
+assert pick(2, 1) is fitted(('SHOTGUN', 'recoil'), er._SHOTGUN_RECOIL)
+assert pick(2, 0) is fitted(('SHOTGUN', 'idle'), er._SHOTGUN_IDLE)
 print("shotgun thresholds follow the tempo OK")
 
 g = WPN[5]['f']  # SSG: eight buckets over the cooldown
@@ -224,15 +242,43 @@ g2 = g * 2
 phases2 = [pick(5, int(g2 * k / 8) + 1) for k in range(7, 0, -1)]
 assert phases2[0] is phases[0] and phases2[-1] is phases[5], (
     "SSG phases must not move when the tempo changes")
-assert pick(5, 0) is er._get_ssg(1)
+assert pick(5, 0) is fitted(('SSG', 1), er._get_ssg(1))
 print("SSG thresholds follow the tempo OK")
 
 # tmr beyond the weapon's own tempo clamps: the phase stays in [0, 1] and the
 # recoil offset never leaves its half-wave
-assert pick(2, 10 * f) is er._SHOTGUN_FIRE
+assert pick(2, 10 * f) is fitted(('SHOTGUN', 'fire'), er._SHOTGUN_FIRE)
 for tmr in (f, 5 * f, 40 * f):
     p = min(max(tmr / f, 0.0), 1.0)
     assert 0.0 <= p <= 1.0
 print("oversized tmr clamps OK")
+
+# ── normalisation: one height per weapon, at every window size ────────────────
+# The loaders used to bake a literal 3.0x into each PNG, so the guns spanned
+# 17%..119% of the window height and were only correct at the size they were
+# tuned at.  What must hold now is a *share* of the window, not a pixel count.
+from engine import constants as _c  # noqa: E402
+
+BASE_W, BASE_H = _c.W, _c.H
+try:
+    for w, h in ((640, 480), (1000, 700), (1920, 1080), (3840, 2160)):
+        _c.W, _c.H = w, h
+        shares = {}
+        for idx in (0, 1, 2, 3, 5):
+            wn = WPN[idx]['n']
+            surf = pick(idx, 0)
+            target = er.ui_px(er.WPN_TARGET_H[wn])
+            assert surf.get_height() == target, (
+                f"{wn}@{w}x{h}: drawn {surf.get_height()}px, wanted {target}px")
+            shares[wn] = surf.get_height() / float(h)
+        lo, hi = min(shares.values()), max(shares.values())
+        # Every gun occupies a comparable share of the window; before this change
+        # the rifle alone was taller than the whole window at 480p.
+        assert hi / lo < 1.5, f"{w}x{h}: gun sizes diverge too far: {shares}"
+        # ... and none of them eats the screen.
+        assert hi < 0.5, f"{w}x{h}: a gun covers {hi:.0%} of the window"
+    print("weapon viewmodel normalised to the window OK")
+finally:
+    _c.W, _c.H = BASE_W, BASE_H
 
 print("WEAPON ANIMATION TEST PASSED")

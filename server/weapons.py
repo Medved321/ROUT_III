@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import random
+from typing import NamedTuple
 
 from shared.combat import wpn_cooldown_ticks
 from shared.components import Position, Rotation, Health, Player, WeaponComponent
@@ -18,6 +19,19 @@ from server.game_data import (
 )
 
 MAX_HP = 200
+
+
+class FireResult(NamedTuple):
+    """Server decision about one fire intent.
+
+    A refused intent is a normal outcome, not an error: the client sends an
+    intent on every gate opening and only the server knows whether the weapon
+    was ready.  Returning it makes the decision visible instead of silent.
+    """
+
+    fired: bool
+    reason: str = ''          # '' | 'cooldown' | 'no_ammo' | 'proj_cap' | 'noop'
+    cooldown: int = 0         # ticks remaining on the weapon after the call
 
 
 def apply_weapon_switch(world, entity_id: int, weapon_id: int) -> None:
@@ -140,16 +154,24 @@ def _hitscan_players(world, shooter_eid: int, x: float, y: float,
     return True
 
 
-def handle_shoot(world, entity_id: int) -> None:
+def handle_shoot(world, entity_id: int) -> FireResult:
+    """Resolve one fire intent and report the decision.
+
+    Every early exit returns a refusal instead of ``None``: an intent that the
+    server drops silently is what the client cannot tell apart from a lost
+    packet, and it is what made "every other click does nothing" invisible.
+    """
     pos = world.entities.get_component(entity_id, Position)
     rot = world.entities.get_component(entity_id, Rotation)
     wp = world.entities.get_component(entity_id, WeaponComponent)
     pl = world.entities.get_component(entity_id, Player)
     if not pos or not rot or not wp or not pl:
-        return
+        return FireResult(False, 'noop', 0)
 
     if wp.fire_cooldown > 0:
-        return
+        # Refused, but not silent: the client learns the weapon is still hot
+        # and cuts its predicted recoil instead of keeping a phantom shot.
+        return FireResult(False, 'cooldown', wp.fire_cooldown)
     wdef = WPN[wp.current]
 
     # melee weapon (chainsaw)
@@ -157,7 +179,7 @@ def handle_shoot(world, entity_id: int) -> None:
         wp.fire_cooldown = wpn_cooldown_ticks(wdef['f'])
         pl.state = 2
         _fire_melee(world, entity_id, pos, rot)
-        return
+        return FireResult(True, '', wp.fire_cooldown)
 
     # ammo
     ammo_key = wdef['a']
@@ -165,9 +187,11 @@ def handle_shoot(world, entity_id: int) -> None:
     if ammo_key:
         cur = wp.ammo.get(ammo_key, 0)
         if cur < cost:
-            pl.state = 2
+            # No ammo: no shot, and no state = 2 (that flag means "a shot
+            # happened").  The cooldown still stands so a held fire button
+            # cannot spam dry-fire intents at the input rate.
             wp.fire_cooldown = wpn_cooldown_ticks(wdef['f'])
-            return
+            return FireResult(False, 'no_ammo', wp.fire_cooldown)
         wp.ammo[ammo_key] = cur - cost
 
     wp.fire_cooldown = wpn_cooldown_ticks(wdef['f'])
@@ -186,7 +210,7 @@ def handle_shoot(world, entity_id: int) -> None:
     if wdef.get('proj'):
         active = sum(1 for b in world.bullets if b.get('from_player'))
         if active >= MAX_PLAYER_PROJ:
-            return
+            return FireResult(False, 'proj_cap', wp.fire_cooldown)
         spd = wdef.get('proj_spd', PLAYER_PROJ_SPEED)
         world.bullets.append({
             'x': x,
@@ -200,7 +224,7 @@ def handle_shoot(world, entity_id: int) -> None:
             'src': entity_id,
             'from_player': True,
         })
-        return
+        return FireResult(True, '', wp.fire_cooldown)
 
     for _ in range(pellets):
         angle = base_angle + (random.uniform(-cone, cone) if cone else 0.0)
@@ -233,6 +257,8 @@ def handle_shoot(world, entity_id: int) -> None:
             wx = x + math.cos(angle) * end_dist
             wy = y + math.sin(angle) * end_dist
             world.impact(wx, wy, 'wall')
+
+    return FireResult(True, '', wp.fire_cooldown)
 
 
 def _fire_melee(world, entity_id: int, pos: Position, rot: Rotation) -> None:

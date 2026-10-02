@@ -22,7 +22,7 @@ from shared.combat import wpn_cooldown_ticks  # noqa: F401  (re-export)
 # --- player ---------------------------------------------------------------
 PLAYER_RADIUS = 16
 PLAYER_MAX_HP = 200
-MOVE_SPEED_PX = 400.0   # 3.0 tiles/s * 64  (per-second speed)
+MOVE_SPEED_PX = 250.0   # 3.0 tiles/s * 64  (per-second speed)
 # Dash (player dash change): a burst of speed along the current movement input.
 # All in server ticks, so the dash needs no network timer -- the world already
 # ticks at TICK_RATE. 2.5x for 5 ticks covers ~120 px (~1.9 tiles) in 250 ms.
@@ -57,7 +57,7 @@ BULLET_SPAWN_OFFSET = 20
 BALL_SUB_STEP = 4.0
 
 # Player projectile (RIFLE plasma ball): server-authoritative, damage on hit.
-PLAYER_PROJ_SPEED = fps60_per_tick(12.0)   # ~12 px/frame@60 -> px/tick
+PLAYER_PROJ_SPEED = fps60_per_tick(32.0)   # ~12 px/frame@60 -> px/tick
 PLAYER_PROJ_MAX_DIST = 900.0
 MAX_PLAYER_PROJ = 32
 
@@ -70,7 +70,7 @@ WPN = [
     {'n': 'CHAINSAW', 'd': 10, 'r': 100,   'f': 4,  'a': None, 'c': (180, 0, 0),  'snd': 'chainsaw', 'melee': True},
     {'n': 'PISTOL',   'd': 3,  'r': 900,   'f': 16, 'a': 'pstl', 'c': (50, 50, 55), 'snd': 'pistol'},
     {'n': 'SHOTGUN',  'd': 25, 'r': 720,   'f': 50, 'a': 'shl',  'c': (100, 70, 40), 'snd': 'shotgun', 'pellets': 7, 'cone': 0.15},
-    {'n': 'RIFLE',    'd': 4,  'r': 850,   'f': 8,  'a': 'slg',  'c': (40, 60, 40),  'snd': 'rifle', 'proj': True, 'proj_spd': PLAYER_PROJ_SPEED, 'proj_max_dist': PLAYER_PROJ_MAX_DIST},
+    {'n': 'RIFLE',    'd': 4,  'r': 850,   'f': 8,  'a': 'slg',  'c': (100, 0, 0),  'snd': 'rifle', 'proj': True, 'proj_spd': PLAYER_PROJ_SPEED, 'proj_max_dist': PLAYER_PROJ_MAX_DIST},
     {'n': 'BFG',      'd': 50, 'r': 16500,  'f': 30, 'a': 'BFG',  'c': (0, 60, 0),    'snd': 'bfg', 'charge': True},
     {'n': 'SSG',      'd': 5,  'r': 520,   'f': 75, 'a': 'shl',  'c': (80, 50, 25),  'snd': 'ssg', 'cost': 2, 'pellets': 20, 'cone': 0.25},
 ]

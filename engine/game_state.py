@@ -112,6 +112,10 @@ other_name = ''
 other_wpn = 0
 
 # HUD / stats
+# Frame rate of the last rendered frame, in whole fps.  The engine has no
+# clock of its own, so the client measures it and feeds it here once per
+# frame; 0 means "not measured yet" and the readout stays hidden.
+fps = 0.0
 kills = 0
 rounds = 0
 shots_fired = 0
@@ -129,7 +133,6 @@ dm_team_mode = False
 dm_winner = 0
 orda_wave = 0
 wave_msg_timer = 0
-speedrun_timer = 0
 lvl_type = 'exit'
 exit_pos = (0, 0)
 show_key_msg = 0

@@ -7,6 +7,8 @@ pygame), so it can be exercised headlessly by ``smoke_sector_editor.py``.
 """
 from __future__ import annotations
 
+import math
+
 from shared.sector_map import (
     MAX_SECTOR_HEIGHT, MIN_SECTOR_HEIGHT, STEP_HEIGHT,
     LineDef, Sector, SectorMap, SideDef, Thing, Vertex,
@@ -14,6 +16,30 @@ from shared.sector_map import (
 
 ENTITY_KINDS = ("vertices", "linedefs", "sidedefs", "sectors", "things")
 GRID_DEFAULT = 16
+
+# ── stairs ────────────────────────────────────────────────────────────────
+# The tool's whole point is that every riser stays walkable, so the default
+# rise is comfortably below STEP_HEIGHT and the caller's value is clamped to
+# it rather than trusted: a "rise" above STEP_HEIGHT would silently produce a
+# wall between two treads, which is the one thing a staircase must never be.
+STAIR_RISE_DEFAULT = 16
+STAIR_RISE_MIN = 1
+STAIR_RISE_MAX = STEP_HEIGHT
+# World units a click may sit off the wall it is supposed to be on. Generous
+# enough for a mouse click, tight enough that a click in the middle of a room
+# is not silently snapped onto the nearest wall.
+STAIR_POINT_TOL = 12.0
+# A tread shorter than this is not a tread you can aim at in the 2D overlay
+# nor walk onto deliberately; the tool refuses instead of producing slivers.
+STAIR_MIN_RUN = 4.0
+# Ceiling for the step count. 64 steps is already 2x MAX_SECTOR_HEIGHT /
+# STEP_HEIGHT, so anything beyond it is a mistake (points on the same walls)
+# rather than a staircase the author meant.
+STAIR_MAX_STEPS = 64
+# Neutral texture for the riser and rail faces.  There is no step texture in
+# WALL_TEXTURE_ORDER, and the lip is authored later through the wall palette
+# (the "lower"/"upper" slots exist for exactly this).
+STAIR_FACE_TEX = "wall"
 
 
 def clamp_sector_heights(floor_h, ceil_h) -> tuple[int, int]:
@@ -55,6 +81,21 @@ def _item_from_json(kind: str, item) -> object:
                       int(item[4]), int(item[5]), int(item[6]))
     return Thing(float(item[0]), float(item[1]), str(item[2]), int(item[3]),
                  float(item[4]))
+
+
+# ── stair geometry helpers ────────────────────────────────────────────────
+def _stair_segments_cross(a, b, c, d) -> bool:
+    """True when segment ``ab`` properly crosses segment ``cd``."""
+    def side(p, q, r) -> int:
+        v = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+        if v > 1e-9:
+            return 1
+        if v < -1e-9:
+            return -1
+        return 0
+    o1, o2 = side(a, b, c), side(a, b, d)
+    o3, o4 = side(c, d, a), side(c, d, b)
+    return o1 != o2 and o3 != o4
 
 
 def _apply_item(obj, kind: str, item) -> None:
@@ -753,6 +794,447 @@ class SectorEditor:
             self.sides[ld.back].lower = outer.lower
         self._after_mutate()
         return new_id, []
+
+    # ── stairs ─────────────────────────────────────────────────────────
+    def _line_param(self, li: int, x: float, y: float) -> tuple[float, float] | None:
+        """``(t, distance)`` of the projection of ``(x, y)`` onto linedef ``li``.
+
+        ``None`` when the projection falls outside the segment or the linedef is
+        degenerate — a point off the end of a wall is not "on" that wall, and
+        silently projecting it onto the tip would build a staircase whose end
+        is not where the author clicked.
+        """
+        if not (0 <= li < len(self.lines)):
+            return None
+        ld = self.lines[li]
+        if not (0 <= ld.v1 < len(self.verts) and 0 <= ld.v2 < len(self.verts)):
+            return None
+        v1, v2 = self.verts[ld.v1], self.verts[ld.v2]
+        dx, dy = v2.x - v1.x, v2.y - v1.y
+        den = dx * dx + dy * dy
+        if den <= 1e-9:
+            return None
+        t = ((x - v1.x) * dx + (y - v1.y) * dy) / den
+        if t < -1e-6 or t > 1 + 1e-6:
+            return None
+        t = max(0.0, min(1.0, t))
+        return t, math.hypot(x - (v1.x + t * dx), y - (v1.y + t * dy))
+
+    def _nearest_stair_line(self, x: float, y: float) -> tuple[int, float] | None:
+        """Closest linedef within ``STAIR_POINT_TOL``, as ``(index, t)``."""
+        best: tuple[float, int, float] | None = None
+        for li in range(len(self.lines)):
+            hit = self._line_param(li, x, y)
+            if hit is None or hit[1] > STAIR_POINT_TOL:
+                continue
+            if best is None or hit[1] < best[0]:
+                best = (hit[1], li, hit[0])
+        return None if best is None else (best[1], best[2])
+
+    def _nearest_stair_hit(self, x: float, y: float):
+        """``(linedef, t, snapped point)`` for the wall nearest a raw click.
+
+        Hit-testing runs on the RAW click and only the *projection* is snapped.
+        Snapping the click first looks equivalent but is not: on a wall that is
+        not itself grid-aligned — x=200 with a 16-unit grid, say — the snapped
+        click misses the wall by 8 units and the nearest line is then the one
+        the click happened to be near, i.e. the wrong wall, or nothing at all.
+        Here the tolerance is measured against what the author actually did,
+        and the grid lands on the wall rather than beside it.
+        """
+        best = None
+        for li in range(len(self.lines)):
+            hit = self._line_param(li, x, y)
+            if hit is None or hit[1] > STAIR_POINT_TOL:
+                continue
+            if best is None or hit[1] < best[0]:
+                ld = self.lines[li]
+                v1, v2 = self.verts[ld.v1], self.verts[ld.v2]
+                t = hit[0]
+                px = v1.x + (v2.x - v1.x) * t
+                py = v1.y + (v2.y - v1.y) * t
+                best = (li, t, self.snap(px, py))
+        return best
+
+    def _split_span(self, li: int, near: tuple[float, float],
+                    far: tuple[float, float]) -> tuple[int, int, int]:
+        """Cut linedef ``li`` so the sub-span ``near..far`` is one linedef.
+
+        Returns ``(linedef, v_near, v_far)``.  A point that already coincides
+        with a wall endpoint reuses that vertex instead of splitting, so a
+        staircase that starts at a corner does not leave a zero-length linedef
+        behind.  The two halves ``split_line_at`` leaves behind: the first keeps
+        the original index, the second is APPENDED at the tail of the list, so
+        the caller cannot assume the second half sits next to the first.
+        """
+        eps = 1e-3
+        near_t = self._line_param(li, *near)
+        if near_t is None:
+            raise ValueError("лестница: точка не на стене")
+        if near_t[0] <= eps:
+            v_near = self.lines[li].v1
+        else:
+            v_near = self.split_line_at(li, *near)
+            li = len(self.lines) - 1
+        far_t = self._line_param(li, *far)
+        if far_t is None:
+            raise ValueError("лестница: точка не на стене")
+        if far_t[0] >= 1.0 - eps:
+            v_far = self.lines[li].v2
+        else:
+            v_far = self.split_line_at(li, *far)
+            # lines[li] is now near..far — the span itself — and the rest of
+            # the wall has been pushed to the tail.
+        return li, v_near, v_far
+
+    def _stair_edge(self, v1: int, v2: int, front: int, back: int,
+                    face_tex: str) -> int:
+        """Append a linedef between two vertices with explicit sides.
+
+        Textures: ``mid`` on both sides (the line still walls off whatever is
+        behind it) and ``face_tex`` on the ``upper``/``lower`` slots of the
+        FRONT side, so the step lip reads as a face in the 2D overlay and in
+        the 3D lower lip without the author hunting for a texture name.
+        """
+        if v1 == v2:
+            raise ValueError("лестница: вырожденное ребро")
+        mid = self.cur_line_mid
+        front_side = self._new_side(front, mid)
+        self.sides[front_side].upper = face_tex
+        self.sides[front_side].lower = face_tex
+        back_side = -1
+        if back >= 0:
+            back_side = self._new_side(back, mid)
+            self.sides[back_side].upper = face_tex
+            self.sides[back_side].lower = face_tex
+        self.lines.append(LineDef(v1, v2, front=front_side, back=back_side))
+        return len(self.lines) - 1
+
+    def _stair_open_rails(self, rails: list[int]) -> bool:
+        """Turn each rail into a portal to the sector behind it, when there is one.
+
+        ``v1 -> v2`` of a rail runs along the staircase's own sense, so its
+        right-hand normal (below) points AWAY from the tread — the tread owns
+        ``front``, the neighbour owns ``back``.  Probing both sides is what
+        tells us whether the neighbour exists at all: void on that side means
+        the rail stays one-sided, i.e. a solid wall, which is exactly what the
+        map had before the staircase.
+
+        The orientation argument depends on the polygon bookkeeping of
+        ``SectorMap._ensure_polys``, so it is spelled out here rather than
+        left to be rediscovered: ``_ensure_polys`` runs a *destructive* greedy
+        walk over each sector's outgoing edges (front gives ``v1 -> v2``, back
+        gives ``v2 -> v1``) and DISCARDS a path that does not close, popping the
+        edges it consumed on the way.  Two consequences shape the whole tool:
+
+        * a chord (a new edge between two vertices of an existing sector) gives
+          one vertex a second outgoing edge, the walk can wander off into the
+          chord and eat the sector's real contour — which turns the sector into
+          void.  So the staircase's ends are sub-spans of existing walls (the
+          contour there is unchanged) and every new vertex is touched only by
+          the staircase's own edges, whose directed graph is a clean cycle per
+          tread.
+        * the two rails ARE chords of whatever sector sits beside the staircase,
+          so each of them injects a short 2-cycle (``L_i -> L_{i+1}`` and back).
+          That cycle is walked, found too short (``len(path) < 3``) and dropped
+          — having consumed nothing else.  The neighbour's own contour is
+          untouched.  ``build_stair`` then re-checks every previously alive
+          sector and rolls the whole thing back if this reasoning ever stops
+          holding on a real map.
+        """
+        sm = self.sm
+        sm.invalidate()
+        opened = False
+        for li in rails:
+            ld = self.lines[li]
+            if ld.back >= 0:
+                continue
+            v1, v2 = self.verts[ld.v1], self.verts[ld.v2]
+            mx, my = (v1.x + v2.x) / 2, (v1.y + v2.y) / 2
+            dx, dy = v2.x - v1.x, v2.y - v1.y
+            ln = math.hypot(dx, dy)
+            if ln <= 1e-9:
+                continue
+            # right-hand normal of v1 -> v2 in a y-down world
+            nx, ny = dy / ln, -dx / ln
+            eps = max(1.0, ln * 0.01)
+            outside = sm.find_sector_at(mx + nx * eps, my + ny * eps)
+            if outside < 0:
+                outside = sm.find_sector_at(mx - nx * eps, my - ny * eps)
+            if outside < 0 or outside == self.sides[ld.front].sector:
+                continue
+            side = self._new_side(outside)
+            self.sides[side].upper = STAIR_FACE_TEX
+            self.sides[side].lower = STAIR_FACE_TEX
+            ld.back = side
+            sm.invalidate()
+            opened = True
+        return opened
+
+    def _stair_piece(self, plan: dict, solid_rails: bool) -> tuple[dict | None, list[str]]:
+        """Build one attempted staircase; ``(None, [reason])`` on failure.
+
+        Mutates the map, so the caller owns the rollback: everything here runs
+        inside a single history batch and the caller restores the snapshot if
+        this returns an error.
+        """
+        sm = self.sm
+        # ── the two end walls become the staircase's first and last tread edge
+        mid_a, a_near, a_far = self._split_span(plan["line_a"], plan["a_near"],
+                                                 plan["a_far"])
+        mid_b, b_near, b_far = self._split_span(plan["line_b"], plan["b_near"],
+                                                 plan["b_far"])
+        # Order along the staircase.  The far point of the first wall pairs
+        # with the near point of the second one, which is the only pairing that
+        # survives both end walls: the tread owns the BACK side of each end
+        # wall, so its contour runs v2 -> v1 there, i.e. against the wall's own
+        # direction.  Pairing the other way makes one of the two ends close its
+        # contour in the wrong direction, and a directed contour that does not
+        # close is void (see _stair_open_rails).
+        p0, pn = a_far, b_near
+        q0, qn = a_near, b_far
+
+        p_start, p_end = self.verts[p0], self.verts[pn]
+        q_start, q_end = self.verts[q0], self.verts[qn]
+        n = plan["steps"]
+
+        def interp(a: Vertex, b: Vertex, t: float) -> tuple[float, float]:
+            return (a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+
+        # Rail/interior vertices. treads 0 and n-1 reuse the wall vertices.
+        p_idx = [p0] + [self._stair_vertex(*interp(p_start, p_end, i / n))
+                        for i in range(1, n)] + [pn]
+        q_idx = [q0] + [self._stair_vertex(*interp(q_start, q_end, i / n))
+                        for i in range(1, n)] + [qn]
+
+        self._record()
+        for i in range(n):
+            self.sectors.append(Sector(floor_h=plan["floors"][i],
+                                       ceil_h=plan["ceil_h"],
+                                       floor_tex=plan["floor_tex"],
+                                       ceil_tex=plan["ceil_tex"],
+                                       light=plan["light"]))
+        first = len(self.sectors) - n
+        self._after_mutate()
+
+        # End walls: keep the outer side as front, hand the back to the tread.
+        for li, tread in ((mid_a, first), (mid_b, first + n - 1)):
+            ld = self.lines[li]
+            side = self._new_side(tread)
+            self.sides[side].upper = STAIR_FACE_TEX
+            self.sides[side].lower = STAIR_FACE_TEX
+            ld.back = side
+        self._after_mutate()
+
+        # Interior risers (a back-facing lip) and the two rails per tread.
+        rails: list[int] = []
+        for i in range(n - 1):
+            # Riser between tread i (below) and tread i+1 (above), as an edge
+            # q_{i+1} -> p_{i+1}.  The LOWER tread owns it as FRONT: tread i's
+            # contour reaches p_{i+1} along its p-rail and then has to leave
+            # via the riser, i.e. p_{i+1} -> q_{i+1}.  The UPPER tread therefore
+            # sees the same directed edge through its BACK side, which
+            # _ensure_polys records as q_{i+1} -> p_{i+1} — exactly the first
+            # hop of tread i+1's contour.  Getting this backwards leaves both
+            # treads with a vertex whose edges only point into it, and
+            # _ensure_polys drops the open contour, i.e. a staircase with a
+            # hole in it.
+            self._stair_edge(q_idx[i + 1], p_idx[i + 1], first + i, first + i + 1,
+                             STAIR_FACE_TEX)
+        for i in range(n):
+            # Rail along p: v1 -> v2 runs tread-backwards, i.e. along the
+            # staircase's own sense, so the tread's front side is p_{i+1}->p_i.
+            rails.append(self._stair_edge(p_idx[i + 1], p_idx[i], first + i, -1,
+                                          STAIR_FACE_TEX))
+            rails.append(self._stair_edge(q_idx[i], q_idx[i + 1], first + i, -1,
+                                          STAIR_FACE_TEX))
+        self._after_mutate()
+
+        if not solid_rails:
+            self._stair_open_rails(rails)
+
+        sm.invalidate()
+        lost = self._stair_lost_sectors(plan["alive_before"], first)
+        if lost:
+            return None, ["лестница: сборка разорвала контур сектора "
+                          f"{lost} — откат"]
+        bad = [i for i in range(first, len(self.sectors))
+               if not sm.has_polygon(i)]
+        if bad:
+            return None, [f"лестница: ступень {bad[0] - first} не замкнулась "
+                          "в контур — откат"]
+        return {"steps": n, "rise": plan["max_rise"], "sectors": list(
+            range(first, len(self.sectors))), "rails_open": (
+                not solid_rails and any(self.lines[li].back >= 0 for li in rails))}, []
+
+    def _stair_vertex(self, x: float, y: float) -> int:
+        self.verts.append(Vertex(x, y))
+        return len(self.verts) - 1
+
+    def _stair_lost_sectors(self, alive_before: set[int], first_new: int) -> list[int]:
+        """Sectors that had a closed contour and lost it (existing ones only)."""
+        sm = self.sm
+        return sorted(i for i in alive_before
+                      if i < first_new and not sm.has_polygon(i))
+
+    def build_stair(self, pts, rise: int = STAIR_RISE_DEFAULT) -> tuple[dict | None, list[str]]:
+        """Build a staircase from four points: two on one wall, two on another.
+
+        ``pts`` are world coordinates as clicked.  Points are snapped first, so
+        a click near a wall lands exactly on the grid the split writes to —
+        ``split_line_at`` snaps again, and a point that was already snapped is
+        a fixed point of that.
+
+        Returns ``(info, errors)``.  On error the map is byte-identical to what
+        it was: the build is wrapped in one history batch, and a failed
+        attempt is rolled back through ``make_diff`` before the next try, so a
+        rejected staircase leaves neither geometry nor an undo entry behind.
+        """
+        plan, errs = self._stair_plan(pts, rise)
+        if errs:
+            return None, errs
+        before = self.sm.to_json()
+        self.begin_batch()
+        try:
+            info, errs = self._stair_piece(plan, solid_rails=False)
+            if errs:
+                # Retry with solid rails: the open rails are chords of the
+                # neighbouring sector and may have eaten its contour.  Solid
+                # rails touch nobody, so if THIS fails the staircase is not
+                # placeable here and the map is restored untouched.
+                self._stair_rollback(before)
+                info, errs = self._stair_piece(plan, solid_rails=True)
+                if errs:
+                    self._stair_rollback(before)
+                    info = None
+        finally:
+            self.end_batch()
+        if errs:
+            return None, errs
+        self._after_mutate()
+        info["solid_rails"] = not info["rails_open"]
+        return info, []
+
+    def _stair_rollback(self, snapshot: dict) -> None:
+        """Restore the working map to ``snapshot`` without touching history.
+
+        Called from inside the history batch, so the diff that ``end_batch``
+        eventually records is computed against the same snapshot and comes out
+        empty: a failed staircase is not an undoable edit.
+        """
+        self._apply_diff(make_diff(snapshot, self.sm.to_json()), forward=False)
+
+    def _stair_plan(self, pts, rise: int) -> tuple[dict | None, list[str]]:
+        """Validate the four points and work out heights — no mutation."""
+        if len(pts) != 4:
+            return None, ["лестница: нужно 4 точки"]
+        raw = [(float(p[0]), float(p[1])) for p in pts]
+        hits = [self._nearest_stair_hit(x, y) for x, y in raw]
+        if any(h is None for h in hits):
+            return None, ["лестница: каждая точка должна лежать на стене"]
+        snapped = [h[2] for h in hits]
+        if len(set(snapped)) < 4:
+            return None, ["лестница: точки должны быть различны"]
+        # The click order is not part of the contract: try all three ways of
+        # splitting four points into two pairs and keep the first that yields
+        # two DIFFERENT walls.  ("first two on one wall" is tried first so the
+        # documented click order still behaves as written.)  Each hit carries
+        # its own line parameter, so _stair_geometry can order the two points
+        # on a wall by the wall's own direction.
+        for pair_a, pair_b in (((0, 1), (2, 3)), ((0, 2), (1, 3)),
+                               ((0, 3), (1, 2))):
+            ia, ja = hits[pair_a[0]][0], hits[pair_a[1]][0]
+            ib, jb = hits[pair_b[0]][0], hits[pair_b[1]][0]
+            # both points of a pair must sit on the SAME wall, and the two
+            # walls must differ
+            if ia != ja or ib != jb or ia == ib:
+                continue
+            return self._stair_geometry(
+                ia, (hits[pair_a[0]][1], snapped[pair_a[0]]),
+                (hits[pair_a[1]][1], snapped[pair_a[1]]),
+                ib, (hits[pair_b[0]][1], snapped[pair_b[0]]),
+                (hits[pair_b[1]][1], snapped[pair_b[1]]), rise)
+        return None, ["лестница: нужно две точки на одной стене и две на другой"]
+
+    def _stair_geometry(self, la: int, a0: tuple, a1: tuple,
+                        lb: int, b0: tuple, b1: tuple,
+                        rise: int) -> tuple[dict | None, list[str]]:
+        for li in (la, lb):
+            ld = self.lines[li]
+            if ld.two_sided:
+                return None, [f"лестница: край (лайндеф {li}) — проём между "
+                              "секторами, нужен край сектора (односторонняя "
+                              "стена)"]
+        sec_a = self.sides[self.lines[la].front].sector
+        sec_b = self.sides[self.lines[lb].front].sector
+        a, b = self.sectors[sec_a], self.sectors[sec_b]
+        try:
+            want = max(STAIR_RISE_MIN, min(STAIR_RISE_MAX, int(rise)))
+        except (TypeError, ValueError):
+            want = STAIR_RISE_DEFAULT
+        delta = int(b.floor_h) - int(a.floor_h)
+        if delta == 0:
+            return None, ["лестница: полы секторов на одной высоте"]
+        steps = max(1, math.ceil(abs(delta) / want))
+        if steps > STAIR_MAX_STEPS:
+            return None, [f"лестница: {steps} ступеней больше предела "
+                          f"{STAIR_MAX_STEPS} — проверьте точки"]
+        # Round every step to the SAME grid the editor snaps to, so a chain of
+        # risers lands on the author's grid instead of on 3.7-pixel offsets,
+        # and force the last tread onto the upper sector's floor: ceil() can
+        # leave one unit short, which would leave the top tread a step short
+        # of the room it leads into.
+        floors = [int(round(a.floor_h + delta * (i + 1) / steps / GRID_DEFAULT))
+                  * GRID_DEFAULT for i in range(steps)]
+        floors[-1] = int(b.floor_h)
+        base = int(a.floor_h)
+        max_rise = max(abs(floors[i] - (base if i == 0 else floors[i - 1]))
+                       for i in range(len(floors)))
+        if max_rise > STAIR_RISE_MAX:
+            return None, [f"лестница: перепад {max_rise} превышает "
+                          f"STEP_HEIGHT={STAIR_RISE_MAX}"]
+        ceil_h, _ = clamp_sector_heights(int(a.ceil_h), int(b.ceil_h))
+        # Treads take the light of the end they sit closer to, so the staircase
+        # reads as a ramp out of one room into the other.
+        span_h = abs(delta)
+        light = int(round((int(a.light) * (span_h - abs(floors[0] - base))
+                           + int(b.light) * abs(floors[0] - base)) / span_h))
+        self.sm.invalidate()
+        alive_before = {i for i in range(len(self.sectors))
+                        if self.sm.has_polygon(i)}
+        # Order the two points on each wall along its own direction.  The only
+        # pairing that survives both end walls is far-of-A to near-of-B (see
+        # _stair_piece); check the resulting quad is simple before mutating.
+        # Each point arrives as ``(t, (x, y))``, hence the [1] everywhere the
+        # coordinates are wanted and the [0] where the order matters.
+        a_near, a_far = (a0, a1) if a0[0] <= a1[0] else (a1, a0)
+        b_near, b_far = (b0, b1) if b0[0] <= b1[0] else (b1, b0)
+        rail1 = (a_far[1], b_near[1])
+        rail2 = (a_near[1], b_far[1])
+        if _stair_segments_cross(*rail1, *rail2):
+            return None, ["лестница: стены перекрещиваются — поменяйте местами "
+                          "точки или разверните одну стену (Flip)"]
+        run = math.hypot(rail1[0][0] - rail2[0][0], rail1[0][1] - rail2[0][1])
+        if run < STAIR_MIN_RUN:
+            return None, [f"лестница: точки слишком близко ({run:.0f})"]
+        reach = math.hypot(rail1[0][0] - rail1[1][0], rail1[0][1] - rail1[1][1])
+        if reach < STAIR_MIN_RUN:
+            return None, [f"лестница: стены на расстоянии {reach:.0f} — "
+                          "слишком близко друг к другу"]
+        stride = reach / steps
+        if stride < STAIR_MIN_RUN:
+            return None, [f"лестница: {steps} ступеней на {reach:.0f} — подступ "
+                          f"{stride:.0f} меньше минимума {STAIR_MIN_RUN:.0f}"]
+        return {"line_a": la, "line_b": lb,
+                "a_near": a_near[1], "a_far": a_far[1],
+                "b_near": b_near[1], "b_far": b_far[1],
+                "steps": steps, "floors": floors, "ceil_h": ceil_h,
+                "floor_tex": a.floor_tex, "ceil_tex": a.ceil_tex,
+                "light": light, "max_rise": max_rise,
+                "low": min(int(a.floor_h), int(b.floor_h)),
+                "high": max(int(a.floor_h), int(b.floor_h)),
+                "span": run, "reach": reach,
+                "alive_before": alive_before}, []
 
     # ── thing operations ──────────────────────────────────────────────
     def add_thing(self, x: float, y: float, typ: str = "player1") -> int:

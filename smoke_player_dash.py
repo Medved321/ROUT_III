@@ -22,7 +22,7 @@ from server.game_data import (
     DASH_COOLDOWN_TICKS, DASH_SPEED_MULT, DASH_TICKS,
     MAX_MOVE_STEP_PX, MOVE_SPEED_PX, TICK_INTERVAL,
 )
-from shared.components import Dash, Player, Position, Velocity
+from shared.components import Dash, Player, Position, Velocity, WeaponComponent
 from shared.protocol import (
     INPUT_FLAG_DASH, decode_player_input, encode_player_input,
 )
@@ -37,7 +37,9 @@ from smoke_sector_server import _strip_map
 # ---------------------------------------------------------------------------
 
 def test_flags_roundtrip():
-    assert PROTOCOL_VERSION == 7, PROTOCOL_VERSION
+    # 8: the player record also carries the fire decision (fire_seq/fire_ready);
+    # PLAYER_INPUT itself is unchanged, still just flags
+    assert PROTOCOL_VERSION == 8, PROTOCOL_VERSION
     assert INPUT_FLAG_DASH == 0x01, INPUT_FLAG_DASH
 
     # the packet grew by exactly the flags byte: 8 -> 9
@@ -291,14 +293,28 @@ def test_state_reporting():
     server._apply_input(world, eid, None, 1, 0, 0.0, True, 1, INPUT_FLAG_DASH)
     assert pl.state == 3, pl.state
 
-    # after the dash expires, the old 0/2 states come back
+    # after the dash expires, the state returns to idle
     for _ in range(DASH_TICKS + 2):
         _drive(world, eid, 1, 0, 1, server=server)
     assert _comp(world, eid, Dash).ticks == 0
     assert pl.state == 0, pl.state
+
+    # A held fire button in PLAYER_INPUT carries no trigger any more: the only
+    # path to a shot is the reliable FIRE intent, so input alone must not
+    # publish the shooting state (fire-intent-single-path, 1.3).
     server._apply_input(world, eid, None, 1, 0, 0.0, True, 1, 0)
+    assert pl.state == 0, "ввод выставил state=2 без созданного выстрела"
+
+    # ...but a real shot does, and only for one tick
+    from server.weapons import handle_shoot, apply_weapon_switch
+    wp = _comp(world, eid, WeaponComponent)
+    wp.ammo['pstl'] = 10
+    apply_weapon_switch(world, eid, 1)
+    handle_shoot(world, eid)
     assert pl.state == 2, pl.state
-    print("7. state 3 only while dashing, priority over shooting OK")
+    world.update()
+    assert pl.state == 0, "пульс стрельбы не погас за тик"
+    print("7. state 3 only while dashing; 2 only after a real shot OK")
 
 
 # ---------------------------------------------------------------------------

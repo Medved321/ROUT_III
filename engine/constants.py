@@ -222,6 +222,30 @@ DECAL_LIFETIME = 1800
 SCORCH_LIFETIME = 1800
 BLOOD_LIFETIME = 1800
 
+# Effect surface budget (effect-surface-budget).  A projected effect radius is
+# unbounded in principle -- an effect that ends up inside the camera projects to
+# tens of thousands of pixels -- so anything that *allocates* a surface for an
+# effect has to be told where to stop.
+# Near plane for effect projection, world units.  Dash dust is spawned within
+# ~5 units of the player, so the plane has to stay above that or the dust stops
+# being visible.  It is applied by the projection itself (viewport.project_point,
+# sector_render.project_object) and only to the *scale*: the floor line and the
+# depth test keep the true distance, so an effect at your feet stays on its own
+# floor.
+EFFECT_NEAR_DIST = 8.0
+# Largest radius (px) that may be cached as a blend surface.  256 -> 512x512,
+# i.e. 1 MiB per surface.  Anything bigger is drawn as a clipped primitive.
+CIRCLE_MAX_R = 256
+# Radius ladder step: neighbouring keys differ by 1.25, so a growing puff
+# changes size by at most ~11% and the cache stops missing every frame.
+CIRCLE_RADIUS_STEP = 1.25
+# Pixel budget per circle cache (smoke, scorch).  A count cap alone allowed 64
+# multi-hundred-MB surfaces; this is the real memory bound.
+CIRCLE_CACHE_PX = 1 << 20
+# Cap for the degraded (no model provider) enemy/bot stand-in surfaces, which
+# are otherwise sized straight from the projection.
+FALLBACK_SPRITE_MAX = 1024
+
 # Dash feedback (movement cue, deliberately independent of the gore amount)
 DASH_FX_BURST = 9            # puffs thrown out when a dash starts
 DASH_FX_TRAIL = 2            # puffs per trail emission while dashing

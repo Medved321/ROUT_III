@@ -85,7 +85,7 @@ class ConnectScreen:
     def draw(self, surface) -> None:
         surface.fill(BG)
 
-        title = self.title_font.render("DOOM SHOOTER", True, ACCENT)
+        title = self.title_font.render("ROUT III SHOOTER", True, ACCENT)
         surface.blit(title, ((self.width - title.get_width()) // 2, 30))
 
         subtitle = self.subtitle_font.render("ПОДКЛЮЧЕНИЕ К СЕРВЕРУ", True, TEXT)

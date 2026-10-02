@@ -264,10 +264,10 @@ ENEMY_MODELS = {
         _p('body', 0.34, w=0.78, h=0.30),
         _p('head', 0.40, r=0.13, x=0.42),
         _p('jaw', 0.32, w=0.12, h=0.05, x=0.50, detail=2, tone='bone'),
-        _p('leg_quad', 0.17, x=-0.30, tone='dark'),
-        _p('leg_quad', 0.17, x=-0.10, tone='dark'),
-        _p('leg_quad', 0.17, x=0.14, tone='dark'),
-        _p('leg_quad', 0.17, x=0.32, tone='dark'),
+        _p('leg_quad', 0.17, w=0.05, h=0.30, x=-0.30, tone='dark'),
+        _p('leg_quad', 0.17, w=0.05, h=0.30, x=-0.10, tone='dark'),
+        _p('leg_quad', 0.17, w=0.05, h=0.30, x=0.14, tone='dark'),
+        _p('leg_quad', 0.17, w=0.05, h=0.30, x=0.32, tone='dark'),
         _p('tail', 0.44, h=0.22, x=-0.44, detail=2, tone='dark'),
     ]),
     'pinkie': _model('pinkie', 'quadruped', 0.78, [
@@ -275,20 +275,20 @@ ENEMY_MODELS = {
         _p('head', 0.46, r=0.14, x=0.36),
         _p('head', 0.34, r=0.11, x=-0.30, detail=2),
         _p('jaw', 0.38, w=0.12, h=0.05, x=0.44, detail=2, tone='bone'),
-        _p('leg_quad', 0.18, x=-0.28, tone='dark'),
-        _p('leg_quad', 0.18, x=-0.08, tone='dark'),
-        _p('leg_quad', 0.18, x=0.12, tone='dark'),
-        _p('leg_quad', 0.18, x=0.30, tone='dark'),
+        _p('leg_quad', 0.18, w=0.055, h=0.32, x=-0.28, tone='dark'),
+        _p('leg_quad', 0.18, w=0.055, h=0.32, x=-0.08, tone='dark'),
+        _p('leg_quad', 0.18, w=0.055, h=0.32, x=0.12, tone='dark'),
+        _p('leg_quad', 0.18, w=0.055, h=0.32, x=0.30, tone='dark'),
         _p('tail', 0.46, h=0.20, x=-0.42, detail=2, tone='dark'),
     ]),
     'arachnotron': _model('arachnotron', 'quadruped', 1.10, [
         _p('body', 0.42, w=1.02, h=0.42),
         _p('head', 0.50, r=0.14, x=0.52),
         _p('jaw', 0.42, w=0.14, h=0.05, x=0.60, detail=2, tone='bone'),
-        _p('leg_quad', 0.21, x=-0.44, tone='dark'),
-        _p('leg_quad', 0.21, x=-0.16, tone='dark'),
-        _p('leg_quad', 0.21, x=0.18, tone='dark'),
-        _p('leg_quad', 0.21, x=0.44, tone='dark'),
+        _p('leg_quad', 0.21, w=0.07, h=0.38, x=-0.44, tone='dark'),
+        _p('leg_quad', 0.21, w=0.07, h=0.38, x=-0.16, tone='dark'),
+        _p('leg_quad', 0.21, w=0.07, h=0.38, x=0.18, tone='dark'),
+        _p('leg_quad', 0.21, w=0.07, h=0.38, x=0.44, tone='dark'),
         _p('spike', 0.80, r=0.05, detail=2, tone='accent'),
         _p('spike', 0.60, r=0.04, x=-0.30, detail=3, tone='accent'),
     ]),
@@ -296,10 +296,10 @@ ENEMY_MODELS = {
         _p('body', 0.40, w=1.44, h=0.56),
         _p('head', 0.52, r=0.17, x=0.74),
         _p('jaw', 0.42, w=0.18, h=0.07, x=0.86, detail=2, tone='bone'),
-        _p('leg_quad', 0.20, x=-0.60, tone='dark'),
-        _p('leg_quad', 0.20, x=-0.22, tone='dark'),
-        _p('leg_quad', 0.20, x=0.24, tone='dark'),
-        _p('leg_quad', 0.20, x=0.58, tone='dark'),
+        _p('leg_quad', 0.20, w=0.09, h=0.38, x=-0.60, tone='dark'),
+        _p('leg_quad', 0.20, w=0.09, h=0.38, x=-0.22, tone='dark'),
+        _p('leg_quad', 0.20, w=0.09, h=0.38, x=0.24, tone='dark'),
+        _p('leg_quad', 0.20, w=0.09, h=0.38, x=0.58, tone='dark'),
         _p('spike', 0.86, r=0.06, detail=1, tone='accent'),
         _p('spike', 0.70, r=0.05, x=-0.34, detail=2, tone='accent'),
         _p('eye', 0.52, r=0.08, x=0.74, detail=3, tone='eye'),
@@ -445,12 +445,15 @@ def _mod(px, py):
     return int(px), int(py)
 
 
-def _paint(surf, model, view, frame, state, detail, lift=0.0, pal=None):
-    """Draw one model frame onto ``surf`` (already sized for the model).
+def _paint(surf, model, view, frame, state, detail, body_h=None, feet=None,
+           cx=None, pal=None):
+    """Draw one model frame onto ``surf``.
 
-    ``lift`` is the model's hover offset as a fraction of the box: the body is
-    raised off the bottom edge by that much, so the caller can align the box
-    bottom to the floor and get a floater for free.
+    ``body_h``, ``feet`` and ``cx`` are the painter's geometry and belong to
+    :func:`_fit_box`: the silhouette has to land on the requested size and on
+    the floor line, which is not something the box the caller happens to
+    allocate can give.  They default to the box itself for a plain fill, which
+    is only what the fit probe wants.
     """
     W, H = surf.get_size()
     if W < 2 or H < 2:
@@ -461,11 +464,10 @@ def _paint(surf, model, view, frame, state, detail, lift=0.0, pal=None):
     back = math.cos(th) < 0.0
     fwd = math.cos(th)          # +1 face-on, 0 profile, -1 from behind
     lat = math.sin(th)          # which way the model's nose points on screen
-    cx = W / 2.0
-    # Body height is the box minus the hover gap, so a floater's silhouette
-    # keeps the size the caller asked for and only its baseline moves.
-    body_h = H * max(0.4, 1.0 - float(lift))
-    feet = H - 1.0 - float(lift) * H
+    if cx is None:
+        cx = W / 2.0
+    body_h = H if body_h is None else body_h
+    feet = H - 1.0 if feet is None else feet
 
     state = ANIM_GEOMETRY.get(state, state)
     n = model.frames(state)
@@ -514,8 +516,12 @@ def _paint(surf, model, view, frame, state, detail, lift=0.0, pal=None):
         pxi, pyi = _mod(px + sx, py)
 
         if kind == 'leg':
+            # Centred on ``y`` like every other part (``leg_quad`` is, and a
+            # leg of length h at height y/2 has to stand on the floor): drawn
+            # upward from ``y`` instead, the whole biped class hovered a fifth
+            # of its box above the floor line and looked small against it.
             lh = max(1, int(hpx * (1.0 - 0.45 * fall)))
-            pygame.draw.rect(surf, col, (pxi - wpx // 2, pyi - lh, wpx, lh))
+            pygame.draw.rect(surf, col, (pxi - wpx // 2, pyi - lh // 2, wpx, lh))
         elif kind == 'arm':
             if back:
                 continue
@@ -690,8 +696,75 @@ def cache_stats():
     }
 
 
-def _build(model, view, frame, state, w, h, detail):
-    """Paint one model frame.
+# ---------------------------------------------------------------------------
+# Silhouette fit: measured, because a part stack does not fill its own box
+# ---------------------------------------------------------------------------
+
+#: Reference box height for the fit probe.  The probe is a cold-path paint that
+#: is thrown away (it never reaches the surface cache), so it is sized for
+#: accuracy rather than speed.
+_FIT_H = 128
+_FIT = {}
+
+
+def _fit(model, view, detail):
+    """Measured silhouette extent of one model frame, in body-height units.
+
+    ``part.y`` is a height above the floor, and a stack of them does not fill
+    the box it is handed: a dog's head tops out at 0.53 of it, a mancubus at
+    0.71, a soldier at 0.77, and a type's parts can sit off the centre line
+    too.  The shortfall is a property of the descriptor *and* of the view and
+    the detail level, so it is measured rather than declared -- there is no
+    per-type constant to write down that stays true.
+
+    Returns ``(height, width, x_offset, bottom_gap)``, all as fractions of
+    ``_FIT_H``.  ``bottom_gap`` is the air between the floor line and the
+    lowest pixel of the silhouette, i.e. how far the drawing has to slide down
+    to stand on the floor.
+    """
+    key = (model.etype, int(view), int(detail))
+    got = _FIT.get(key)
+    if got is not None:
+        return got
+    surf = pygame.Surface((max(4, int(round(_FIT_H * model.w))), _FIT_H),
+                          pygame.SRCALPHA)
+    _paint(surf, model, int(view), 0, 'idle', int(detail))
+    r = surf.get_bounding_rect()
+    if r.width < 1 or r.height < 1:
+        got = (1.0, 1.0, 0.0, 0.0)
+    else:
+        got = (r.height / _FIT_H,
+               r.width / _FIT_H,
+               (r.x + r.width / 2.0) - surf.get_width() / 2.0,
+               (_FIT_H - 1) - (r.y + r.height - 1))
+        got = (got[0], got[1], got[2] / _FIT_H, got[3] / _FIT_H)
+    _FIT[key] = got
+    return got
+
+
+def _fit_box(model, h, view, detail, anchor):
+    """Box size and painter geometry for a silhouette ``h`` px tall.
+
+    The model is scaled **uniformly**, so the authored proportions survive and
+    only its size is corrected to the projection: a uniform scale of the whole
+    silhouette cannot change its shape, which stretching the part stack would.
+    The box is then the silhouette plus a pixel of slack, so nothing is
+    clipped, and the floor line is where the engine bottom-aligns every type.
+    """
+    span, wide, off_x, bottom_gap = _fit(model, view, detail)
+    body_h = h / max(1e-3, span)
+    # A floater keeps air under itself so the engine can bottom-align every
+    # type at one line; the gap is the same fraction it was before the fit.
+    hover = int(round(h * anchor / max(0.4, 1.0 - anchor)))
+    box_h = h + 1 + hover
+    box_w = 2 + int(round(wide * body_h))
+    floor = box_h - 1 - hover
+    return (box_w, box_h, body_h, floor + bottom_gap * body_h,
+            box_w / 2.0 - off_x * body_h)
+
+
+def _build(model, view, frame, state, h, detail):
+    """Paint one model frame, sized so its silhouette is ``h`` px tall.
 
     A floating type's surface is *taller* than its body by the hover offset,
     with the offset as transparent space at the bottom.  That is what lets the
@@ -700,9 +773,10 @@ def _build(model, view, frame, state, w, h, detail):
     the renderer.  The visible body is still ``h`` pixels tall either way.
     """
     anchor = min(0.6, max(0.0, float(model.anchor)))
-    box_h = int(round(h / max(0.4, 1.0 - anchor)))
-    surf = pygame.Surface((max(2, w), max(2, box_h)), pygame.SRCALPHA)
-    _paint(surf, model, view, frame, state, detail, lift=anchor)
+    bw, bh, body_h, feet, cx = _fit_box(model, h, view, detail, anchor)
+    surf = pygame.Surface((max(2, bw), max(2, bh)), pygame.SRCALPHA)
+    _paint(surf, model, view, frame, state, detail, body_h=body_h, feet=feet,
+           cx=cx)
     return surf
 
 
@@ -715,23 +789,22 @@ def get_enemy_surface(etype, h, frame=0, state='idle', view=0, detail=MAX_DETAIL
                       col=None):
     """SRCALPHA surface for one enemy, cached by its full identity.
 
-    ``h`` is the pixel height the model occupies on screen; the width follows
-    the model's own silhouette ratio, so a wide type is drawn wide without the
-    engine needing to know that ratio.  ``h`` is snapped to :data:`SIZE_STEPS`
-    so the cache stays bounded; the caller scales the surface to the exact
-    height it needs (or draws it at the rung, which is within a few pixels).
+    ``h`` is the pixel height the silhouette occupies on screen -- the
+    projection's own number, in screen pixels.  ``h`` is snapped up to
+    :data:`SIZE_STEPS` so the cache stays bounded; the caller blits the
+    surface as-is, which is safe because a rung is never below the requested
+    height, and the model's own fit puts the silhouette exactly on it.
     """
     h = size_bucket(h)
     model = model_for(etype)
-    w = max(2, int(round(h * model.w)))
-    key = ('e', etype, col, w, h, int(frame), state, int(view), int(detail))
+    key = ('e', etype, col, h, int(frame), state, int(view), int(detail))
     surf = _lookup(key)
     if surf is not None:
         return surf
     if col is not None:
         model = EnemyModel(**{**model.__dict__, 'pal': palette_for(col)})
-    surf = _build(model, int(view), int(frame), state, w, h, int(detail))
-    _store(key, surf, w * h)
+    surf = _build(model, int(view), int(frame), state, h, int(detail))
+    _store(key, surf, surf.get_width() * surf.get_height())
     return surf
 
 
@@ -739,22 +812,31 @@ def get_corpse_surface(etype, h, col=None, detail=MIN_DETAIL):
     """Lying body of a dead enemy: the same silhouette, flattened and dimmed.
 
     Built from the model's own death frame in profile view, so a corpse is
-    recognisable as the thing that died and stays inside one palette.
+    recognisable as the thing that died and stays inside one palette.  The
+    flattening is applied to the *silhouette*: scaling the whole surface
+    instead mixed in however much transparent padding the box happened to
+    carry, so the corpse's proportions came from the box rather than from the
+    type -- a squat mass and a long quadruped ended up the same shape.
     """
     h = size_bucket(h)
     model = model_for(etype)
     ch = max(3, int(h * 0.34))
-    cw = max(6, int(ch * 2.6))
-    key = ('c', etype, col, cw, ch, detail)
+    key = ('c', etype, col, ch, detail)
     surf = _lookup(key)
     if surf is not None:
         return surf
     stand_h = int(ch * 2.8)
     stand = get_enemy_surface(etype, stand_h, frame=model.frames('death') - 1,
                               state='death', view=2, detail=detail, col=col)
-    body = pygame.transform.scale(stand, (cw, ch))
+    rect = stand.get_bounding_rect()
+    if rect.width < 1 or rect.height < 1:
+        rect = pygame.Rect(0, 0, stand.get_width(), stand.get_height())
+    body = stand.subsurface(rect).copy()
+    own = rect.width / float(rect.height)
+    cw = max(6, int(round(ch * min(3.0, max(1.4, 1.7 * own)))))
+    body = pygame.transform.scale(body, (cw, ch))
     body.fill((96, 88, 96, 255), special_flags=pygame.BLEND_RGBA_MULT)
-    _store(key, body, cw * ch)
+    _store(key, body, body.get_width() * body.get_height())
     return body
 
 

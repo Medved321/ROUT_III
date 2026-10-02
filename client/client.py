@@ -119,6 +119,21 @@ class GameClient:
         # Time-based cooldown gate (shared tick tempo + one tick slack) so a
         # shown shot is never rejected by the server's cooldown.
         self._next_fire_time: float = 0.0
+        # A click is a one-shot intent and lives exactly one frame, so a press
+        # landing inside a closed gate would be gone by the next opening. It is
+        # latched here and consumed once at the next opening, exactly like the
+        # dash edge below.
+        self._fire_intent_pending: bool = False
+        # Authoritative fire decision from the snapshot: the last accepted fire
+        # intent the server acknowledged, and the cooldown it reports. The
+        # weapon animation is driven from these, not from the key press.
+        self._server_fire_seq: int = 0
+        self._server_fire_ready: int = 0
+        # Intents sent but not yet answered by the server. ``fire_seq`` counts
+        # accepted intents, so this is the gap between what was sent and what
+        # came back — the client cannot call a shot refused before the server
+        # has actually decided it.
+        self._fire_undecided: int = 0
         # Dash intent is a one-shot pulse waiting for the next input packet.
         self._dash_pending: bool = False
         self._server_angle: float | None = None
@@ -751,6 +766,61 @@ class GameClient:
             return 0
         return int(left * FPS_60 + 0.5)
 
+    def _fire_anim_frames_from_server(self, ticks: int) -> int:
+        """Server cooldown ticks -> weapon animation frames (60 fps equivalent).
+
+        The renderer works in frames at 60 fps (``gs.w_tmr``, ``info['f']``), so
+        the authoritative tick countdown is converted once, here.
+        """
+        if ticks <= 0:
+            return 0
+        return int(ticks * TICK_INTERVAL * FPS_60 + 0.5)
+
+    def _sync_fire_anim(self, fire_seq: int, fire_ready: int, fire_reason: int,
+                        wpn: int, now: float) -> None:
+        """Reconcile the predicted recoil with the server's fire decision.
+
+        The recoil *starts* on the local intent so the weapon does not feel
+        laggy, but the server decides whether a shot happened at all:
+
+        * ``fire_seq`` jumps -> intents were accepted; the recoil runs for the
+          ``fire_ready`` ticks the server reports.  This also covers the reverse
+          case — a snapshot lost between two shots — where the jump is the first
+          sign the shot happened at all.
+        * ``fire_reason`` != 0 with the sequence number unchanged -> the server
+          refused an intent of ours.  The predicted recoil was a phantom, so it
+          is cut.  Reason is what makes this safe: an unchanged ``fire_seq`` on
+          its own is ambiguous between "refused" and "the ack is still in
+          flight", and cutting on the latter would truncate a real shot.
+        * neither -> nothing decided yet, the prediction is left alone.
+        """
+        self._server_fire_ready = fire_ready
+        if fire_seq > self._server_fire_seq:
+            # intents accepted since the last snapshot. The gap is clamped:
+            # after a respawn the server's counter can legitimately be ahead of
+            # anything this client sent, and a negative "undecided" would then
+            # swallow a later refusal.
+            self._fire_undecided = max(
+                0, self._fire_undecided - (fire_seq - self._server_fire_seq))
+            self._server_fire_seq = fire_seq
+            if fire_ready <= 0:
+                return
+            # A confirmation for the weapon the player already swapped away
+            # from must not resurrect its recoil on the new gun.
+            if self._fire_anim_wpn != -1 and self._fire_anim_wpn != wpn:
+                return
+            self._fire_anim_until = max(
+                self._fire_anim_until, now + fire_ready * TICK_INTERVAL)
+            self._fire_anim_wpn = wpn
+            return
+        if fire_reason and self._fire_undecided > 0:
+            # this refusal answers one of our intents: the recoil it predicted
+            # never became a shot, so it must not keep playing (an empty
+            # magazine held down would flash forever otherwise)
+            self._fire_undecided -= 1
+            self._fire_anim_until = 0.0
+            self._fire_anim_wpn = -1
+
     def _process_input(self) -> None:
         self.input_handler.update()
 
@@ -765,15 +835,20 @@ class GameClient:
         # Fire tempo uses the shared tick cooldown (converted to seconds) plus
         # one tick of slack, so the client never fires faster than the server
         # allows and a shown shot is never rejected by the server's cooldown.
+        #
+        # The press edge is latched BEFORE the gate is consulted: the edge is
+        # rebuilt by InputHandler.update() on every frame, so a click inside a
+        # closed gate would otherwise be gone by the next opening — that is the
+        # "every other click does nothing" defect.
+        if self.input_handler.shoot_pressed:
+            self._fire_intent_pending = True
+
         wpn = self.input_handler.weapon_id
         if 0 <= wpn < len(WPN):
             info = WPN[wpn]
-            akey = info.get('a')
-            has_ammo = akey is None or self.local_ammo.get(akey, 0) >= info.get('cost', 1)
             if (
-                has_ammo
-                and now >= self._next_fire_time
-                and (self.input_handler.shoot or self.input_handler.shoot_pressed)
+                now >= self._next_fire_time
+                and (self.input_handler.shoot or self._fire_intent_pending)
             ):
                 ticks = wpn_cooldown_ticks(int(info['f']))
                 # The +1 tick of slack belongs to the gate only: the animation
@@ -781,10 +856,14 @@ class GameClient:
                 self._next_fire_time = now + ticks * TICK_INTERVAL + TICK_INTERVAL
                 self._fire_anim_until = now + ticks * TICK_INTERVAL
                 self._fire_anim_wpn = wpn
-                # A fresh click intent goes reliably (FIRE), held fire stays
-                # in the unreliable PLAYER_INPUT channel.
-                if self.input_handler.shoot_pressed:
-                    self.network.send_fire(wpn)
+                self._fire_intent_pending = False
+                # The reliable FIRE is the single path to a shot, so every gate
+                # opening sends an intent — held fire included. Ammo is not
+                # checked here on purpose: the server is the only authority and
+                # refuses an empty weapon with an explicit reason (see
+                # handle_shoot's FireResult), which the client then reflects.
+                self._fire_undecided += 1
+                self.network.send_fire(wpn)
 
         # A weapon switch drops the running animation: the other gun's recoil
         # must not keep playing (and counting down) on the new one.
@@ -830,6 +909,13 @@ class GameClient:
                 # (cooldown, no movement input) must not flash, and the effect
                 # then arrives exactly when the body starts moving.
                 self.local_state = p.get("state", 0)
+                # Fire decision from the snapshot: drives the local recoil's
+                # length instead of the key press, so a refused intent cannot
+                # leave a phantom shot behind.
+                self._sync_fire_anim(
+                    p.get("fire_seq", 0), p.get("fire_ready", 0),
+                    p.get("fire_reason", 0), self.local_weapon, now,
+                )
                 break
 
         # Reconcile the predicted angle toward the server angle once the
@@ -856,6 +942,10 @@ class GameClient:
             self.local_weapon, self.local_ammo,
             self._fire_anim_frames(time.monotonic()),
             self.mode, self.impacts, self.local_state,
+            # clock.get_fps() is the rolling average over the frames just
+            # drawn, which is what a readout should show: an instantaneous
+            # 1/frame_ms would flicker on every slow frame.
+            self.renderer.clock.get_fps(),
         )
         self.bridge.render()
         pygame.display.flip()

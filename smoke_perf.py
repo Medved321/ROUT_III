@@ -244,13 +244,17 @@ def test_particle_cache_and_limits():
     particles._SMOKE_SURFACES.clear()
     particles._SCORCH_SURFACES.clear()
 
+    # Far enough that the puff fits the cached-surface cap (a nearby one goes
+    # through the clipped primitive instead -- see smoke_effect_surfaces.py).
     gs.particles = [{
-        "x": 340.0, "y": 320.0, "vx": 0.0, "vy": 0.0, "life": 20, "max_life": 30,
+        "x": 360.0, "y": 320.0, "vx": 0.0, "vy": 0.0, "life": 20, "max_life": 30,
         "col": (180, 180, 180), "size": 8, "z": 10, "zv": 0.0, "smoke": True,
     }]
     for _ in range(3):
         particles.draw_particles(z_b)
     assert len(particles._SMOKE_SURFACES) == 1, len(particles._SMOKE_SURFACES)
+    assert max(max(s.get_size()) for s in particles._SMOKE_SURFACES.values()) \
+        <= const.CIRCLE_MAX_R * 2, "cached puff exceeded the radius cap"
 
     # Same cached surface object reused across frames.
     surf = particles._cached_circle_surface(particles._SMOKE_SURFACES, 64, (180, 180, 180))

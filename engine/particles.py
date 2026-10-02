@@ -1,36 +1,89 @@
-import math, random, pygame
-from engine.constants import (TILE, BLOCK_TILES, MAX_PARTICLES, MAX_DECALS, MAX_WEATHER, EYE_H,
+import math, random, bisect, pygame
+from engine.constants import (TILE, BLOCK_TILES, MAX_PARTICLES, MAX_DECALS, MAX_WEATHER,
     PARTICLE_SIZE_MIN, PARTICLE_SIZE_MAX, PARTICLE_FRICTION, PARTICLE_GRAVITY,
     SMOKE_FLOAT, SMOKE_DRAG, SPARK_SPEED_MIN_FACTOR,
     DECAL_LIFETIME, SCORCH_LIFETIME, BLOOD_LIFETIME, DECAL_OCCLUSION_INTERVAL,
-    DASH_FX_BURST, DASH_FX_TRAIL)
+    DASH_FX_BURST, DASH_FX_TRAIL, CIRCLE_MAX_R,
+    CIRCLE_RADIUS_STEP, CIRCLE_CACHE_PX)
 from engine import constants as const
 from engine import game_state as gs
 from engine.framebuffer import depth_col
+from engine.viewport import project_point
 
 
-# Cached blend surfaces for smoke and scorch, keyed by (size, color). Capped in
-# count (cleared on overflow) so heavy effect scenes never allocate a new
-# Surface per effect per frame.
+# Blend surfaces for smoke and scorch, keyed by (radius, colour).  Bounded by
+# entry count *and* by total pixels: a projected effect radius is unbounded in
+# principle, so a count cap alone is not a memory bound.
 _SMOKE_SURFACES = {}
 _SCORCH_SURFACES = {}
 _SURFACE_CACHE_MAX = 64
+
+# Radius ladder for the cached circles (effect-surface-budget).  Built once:
+# radius changes every frame as an effect moves, and an exact radius would make
+# the cache miss constantly and re-allocate nearly every entry per frame.
+_RADIUS_LADDER = []
+_ladder_r = 1
+while _ladder_r < CIRCLE_MAX_R:
+    _RADIUS_LADDER.append(int(_ladder_r))
+    _ladder_r *= CIRCLE_RADIUS_STEP
+_RADIUS_LADDER.append(CIRCLE_MAX_R)
 
 # Frame counter used to throttle the per-decal wall-occlusion ray march.
 _decal_occlusion_tick = 0
 
 
+def _circle_radius(r):
+    """Nearest step of the radius ladder, clamped to the surface cap.
+
+    Both ends matter: the top because anything bigger is drawn as a primitive
+    (see ``_draw_soft_circle``), the bottom because radius 0 has no circle.
+    """
+    r = int(r)
+    if r <= _RADIUS_LADDER[0]:
+        return _RADIUS_LADDER[0]
+    if r >= _RADIUS_LADDER[-1]:
+        return _RADIUS_LADDER[-1]
+    i = bisect.bisect_left(_RADIUS_LADDER, r)
+    lo, hi = _RADIUS_LADDER[i - 1], _RADIUS_LADDER[i]
+    return lo if r - lo <= hi - r else hi
+
+
 def _cached_circle_surface(cache, size, col):
-    key = (int(size), tuple(col))
+    key = (_circle_radius(size), tuple(col))
     surf = cache.get(key)
     if surf is None:
-        if len(cache) >= _SURFACE_CACHE_MAX:
+        px = key[0] * key[0] * 4
+        # Measured from the entries themselves rather than from a counter: a
+        # counter can drift out of sync with reality, this cannot.
+        cached = sum(s.get_width() * s.get_height() for s in cache.values())
+        if len(cache) >= _SURFACE_CACHE_MAX or cached + px > CIRCLE_CACHE_PX:
             cache.clear()
         r = key[0]
         surf = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
         pygame.draw.circle(surf, (*key[1], 255), (r, r), r)
         cache[key] = surf
     return surf
+
+
+def _draw_soft_circle(cache, cx, cy, r, col, alpha):
+    """Alpha-blended filled circle, centred on (cx, cy).
+
+    A cached blend surface while the radius fits the cache, a direct primitive
+    once it does not.  The primitive path exists because SDL clips draws to the
+    screen and allocates nothing, while a surface cannot be sized from a
+    projected radius that reaches tens of thousands of pixels when an effect
+    ends up inside the camera.  Its alpha is folded into the colour exactly like
+    the opaque-particle branch does, which is imperceptible on a circle that
+    already covers most of the frame.
+    """
+    if r > CIRCLE_MAX_R:
+        k = alpha / 255.0
+        pygame.draw.circle(gs.screen, tuple(int(c * k) for c in col[:3]), (cx, cy), r)
+        return
+    s = _cached_circle_surface(cache, r, col)
+    s.set_alpha(alpha)
+    off = s.get_width() // 2
+    gs.screen.blit(s, (cx - off, cy - off))
 
 
 def _effect_limit(base):
@@ -230,39 +283,35 @@ def update_particles():
 def draw_particles(z_b, vh=None, vy=0):
     if vh is None:
         vh = const.H
-    focal = int((const.W / 2) / math.tan(const.FOV / 2)) if const.FOV > 0.001 else const.W
-    pitch_off = -int(gs.pitch * focal)
     for p in gs.particles:
-        edx, edy = p['x'] - gs.px, p['y'] - gs.py
-        dst = math.sqrt(edx ** 2 + edy ** 2)
-        if dst < 2: continue
-        ang = math.atan2(edy, edx) - gs.pa
-        while ang > math.pi: ang -= 2 * math.pi
-        while ang < -math.pi: ang += 2 * math.pi
-        if abs(ang) < 1.2:
-            sx = int((0.5 * (ang / (const.FOV / 2)) + 0.5) * const.W)
-            sh = int((TILE * focal) / (dst + 0.1))
-            idx = depth_col(z_b, sx, const.W)
-            if idx >= 0 and z_b[idx] > dst:
-                sz = max(1, int(p['size'] * sh / 64))
-                z_off = int(p['z'] * sh / 64)
-                alpha = int(255 * p['life'] / p['max_life'])
-                c = tuple(min(255, int(c * alpha // 255)) for c in p['col'])
-                base_y = vy + vh // 2 + pitch_off + sh // 2 - z_off
-                if c[0] or c[1] or c[2]:
-                    if p.get('spark'):
-                        sz = max(1, sz // 2)
-                        pygame.draw.circle(gs.screen, (255, 255, 255), (sx, base_y), sz)
-                        pygame.draw.circle(gs.screen, (255, 255, 200, 0), (sx, base_y), sz + 1, 1)
-                    elif p.get('smoke'):
-                        sz = int(sz * (1 + 0.5 * (1 - p['life'] / p['max_life'])))
-                        alpha_smoke = int(120 * p['life'] / p['max_life'])
-                        if alpha_smoke > 2:
-                            s = _cached_circle_surface(_SMOKE_SURFACES, sz, p['col'])
-                            s.set_alpha(alpha_smoke)
-                            gs.screen.blit(s, (sx - sz, base_y - sz))
-                    else:
-                        pygame.draw.circle(gs.screen, c, (sx, base_y), sz)
+        if math.hypot(p['x'] - gs.px, p['y'] - gs.py) > gs.view_dist:
+            continue
+        proj = project_point(p['x'], p['y'], TILE, vh, vy)
+        if proj is None:
+            continue
+        sx, sh, ground_y, perp = proj
+        idx = depth_col(z_b, sx, const.W)
+        # `perp` is the metric z_b holds (rd = d*cos(ra - pa)).  Testing the
+        # radial distance instead made every off-axis effect fail against a
+        # wall that does not actually cover it, so dust blinked out next to
+        # walls and at the edges of the screen.
+        if idx >= 0 and z_b[idx] > perp:
+            sz = max(1, int(p['size'] * sh / 64))
+            base_y = int(ground_y - p['z'] * sh / 64)
+            alpha = int(255 * p['life'] / p['max_life'])
+            c = tuple(min(255, int(c * alpha // 255)) for c in p['col'])
+            if c[0] or c[1] or c[2]:
+                if p.get('spark'):
+                    sz = max(1, sz // 2)
+                    pygame.draw.circle(gs.screen, (255, 255, 255), (sx, base_y), sz)
+                    pygame.draw.circle(gs.screen, (255, 255, 200, 0), (sx, base_y), sz + 1, 1)
+                elif p.get('smoke'):
+                    sz = int(sz * (1 + 0.5 * (1 - p['life'] / p['max_life'])))
+                    alpha_smoke = int(120 * p['life'] / p['max_life'])
+                    if alpha_smoke > 2:
+                        _draw_soft_circle(_SMOKE_SURFACES, sx, base_y, sz, p['col'], alpha_smoke)
+                else:
+                    pygame.draw.circle(gs.screen, c, (sx, base_y), sz)
 
 
 def draw_weather():
@@ -285,11 +334,13 @@ def draw_weather():
                 pygame.draw.circle(gs.screen, (200, 220, 255, alpha//2), (int(p['x'])-1, int(p['y'])-1), int(sz)-1)
 
 
-def draw_decals(vh=const.H, vy=0):
+def draw_decals(vh=None, vy=0):
+    # `vh` defaults to None, not to const.H: a default argument is evaluated at
+    # import time, and const.H is rewritten on every window resize.
+    if vh is None:
+        vh = const.H
     global _decal_occlusion_tick
     _decal_occlusion_tick += 1
-    focal = int((const.W / 2) / math.tan(const.FOV / 2)) if const.FOV > 0.001 else const.W
-    pitch_off = -int(gs.pitch * focal)
     for d in gs.decals:
         edx, edy = d['x'] - gs.px, d['y'] - gs.py
         dst = math.sqrt(edx ** 2 + edy ** 2)
@@ -312,31 +363,24 @@ def draw_decals(vh=const.H, vy=0):
         else:
             occluded = d.get('_occ', False)
         if occluded: continue
-        ang = math.atan2(edy, edx) - gs.pa
-        while ang > math.pi: ang -= 2 * math.pi
-        while ang < -math.pi: ang += 2 * math.pi
-        if abs(ang) < 1.2:
-            sx = int((0.5 * (ang / (const.FOV / 2)) + 0.5) * const.W)
-            sh = int((TILE * focal) / (dst + 0.1))
-            sz = max(1, int(d['size'] * sh / 64))
-            # World Z offset: keep decals fixed in world space as player moves vertically
-            if d['type'] == 'hole':
-                wz = d.get('hit_z', TILE)
-            else:
-                wz = TILE
-            z_off = -int((gs.pz + EYE_H - wz) * focal / (dst + 0.1))
-            if d['type'] == 'hole':
-                if 'pitch' in d:
-                    cy = vy + vh // 2 + pitch_off + z_off + int(d['pitch'] * sh)
-                else:
-                    cy = vy + vh // 2 + pitch_off + z_off
-                pygame.draw.circle(gs.screen, d['col'], (sx, cy), max(1, sz))
-            elif d['type'] == 'scorch':
-                cy = vy + vh // 2 + pitch_off + z_off + sh // 2
-                ss = max(1, sz)
-                s = _cached_circle_surface(_SCORCH_SURFACES, ss, d['col'])
-                s.set_alpha(100)
-                gs.screen.blit(s, (sx - ss, cy - ss))
-            elif d['type'] == 'blood':
-                cy = vy + vh // 2 + pitch_off + z_off + sh // 2
-                pygame.draw.ellipse(gs.screen, d['col'], (sx - sz, cy - sz // 2, sz * 2, sz))
+        proj = project_point(d['x'], d['y'], TILE, vh, vy)
+        if proj is None: continue
+        sx, sh, ground_y, _perp = proj
+        sz = max(1, int(d['size'] * sh / 64))
+        # World Z of the decal itself: a bullet hole sits where the shot landed,
+        # scorch and blood sit on the floor.
+        if d['type'] == 'hole':
+            wz = d.get('hit_z', TILE)
+        else:
+            wz = 0
+        cy = int(ground_y - wz * sh / 64)
+        if d['type'] == 'hole':
+            if 'pitch' in d:
+                cy += int(d['pitch'] * sh)
+            pygame.draw.circle(gs.screen, d['col'], (sx, cy), max(1, sz))
+        elif d['type'] == 'scorch':
+            cy += sh // 2
+            _draw_soft_circle(_SCORCH_SURFACES, sx, cy, max(1, sz), d['col'], 100)
+        elif d['type'] == 'blood':
+            cy += sh // 2
+            pygame.draw.ellipse(gs.screen, d['col'], (sx - sz, cy - sz // 2, sz * 2, sz))

@@ -14,7 +14,7 @@ import time
 import pygame
 
 from client.sector_editor import (
-    SectorEditor, new_room, save_mt1_with_bsp,
+    STAIR_RISE_DEFAULT, SectorEditor, new_room, save_mt1_with_bsp,
 )
 from client.map_editor import ENEMY_NAMES, ITEM_NAMES
 from client.ui_layout import clip_tail, ellipsize, fit_width, layout_row
@@ -38,7 +38,11 @@ MAPS_DIR = os.path.join(
 FLAT_PALETTE = ["floor", "ceiling", "lava", "bridge", "platform"]
 THING_SPECIAL = [("player1", (90, 220, 90)), ("exit", (240, 160, 40))]
 TOOL_NAMES = {"select": "Выбор", "vertex": "Вершина", "line": "Линия",
-              "sector": "Сектор", "thing": "Вещь"}
+              "sector": "Сектор", "thing": "Вещь", "stair": "Лестница"}
+# Tool keys are assigned to the first six number keys, so adding a tool must not
+# silently renumber the others: the mapping is explicit for exactly that reason.
+TOOL_KEYS = {pygame.K_1: "select", pygame.K_2: "vertex", pygame.K_3: "line",
+             pygame.K_4: "sector", pygame.K_5: "thing", pygame.K_6: "stair"}
 
 # 2D overlay for each linedef kind: impassable wall, walkable step, portal
 LINE_KINDS = {
@@ -94,6 +98,9 @@ class SectorEditorScreen:
         self.contour: list[int] = []
         self.precious: tuple[int, float, float] | None = None
         self._drag_v: int | None = None
+        # staircase input: four world points, two per wall, then build
+        self.stair_pts: list[tuple[float, float]] = []
+        self.stair_rise = STAIR_RISE_DEFAULT
         self._pan = False
         self._pre: tuple[float, float] = (0.0, 0.0)
         self._prop_text = ""
@@ -165,11 +172,18 @@ class SectorEditorScreen:
         x = self.panel.x + 6
         w = self.panel.width - 12
         y = self.panel.y + 34
-        per = (w - 16) // 5
-        self._tool_buttons = {}
-        for i, key in enumerate(TOOL_NAMES):
-            self._tool_buttons[key] = pygame.Rect(x + i * (per + 4), y, per, 30)
-        y += 38
+        # Tool buttons wrap instead of being squeezed into a fixed 5-wide
+        # grid: a label that no longer fits its own box is a label the player
+        # cannot read, and `per = (w - 16) // 5` had no way to say so.  The row
+        # height comes back from layout_row, so the block below is pushed down
+        # by however many rows were actually used.
+        tools = [(key, fit_width(TOOL_NAMES[key], self.tiny_font, 6))
+                 for key in TOOL_NAMES]
+        tlayout = layout_row(tools, height=30, y=y, margin=0, gap=4,
+                             canvas_width=w, min_width=40)
+        self._tool_buttons = {key: rect.move(x, 0)
+                              for key, rect in tlayout["rects"].items()}
+        y += tlayout["height"] + 8
         self._prop_rect = pygame.Rect(x, y, w, 148)
         self._palette_label_y = self._prop_rect.y + self._prop_rect.height + 8
         # contextual block: wall textures for a two-sided linedef, otherwise
@@ -450,6 +464,15 @@ class SectorEditorScreen:
                 self.map_name += event.unicode
             return None
         if k == pygame.K_ESCAPE:
+            # Esc consumes half-finished tool input before it leaves the
+            # screen: backing out of a staircase with three points already
+            # placed should not silently throw them away, and the second Esc
+            # still goes back.
+            if self.stair_pts or self.contour or self.precious is not None:
+                self._reset_tool_state()
+                self.status = "Ввод инструмента сброшен"
+                self._dirty()
+                return None
             return "back"
         if k == pygame.K_F5:
             if self.editor.validate():
@@ -473,9 +496,10 @@ class SectorEditorScreen:
         if k == pygame.K_f:
             self.frame_around()
             return None
-        tool = {pygame.K_1: "select", pygame.K_2: "vertex", pygame.K_3: "line",
-                pygame.K_4: "sector", pygame.K_5: "thing"}.get(k)
+        tool = TOOL_KEYS.get(k)
         if tool:
+            if self.tool != tool:
+                self._reset_tool_state()
             self.tool = tool
             return None
         if k == pygame.K_RETURN and self.tool == "sector" and self.contour:
@@ -521,7 +545,43 @@ class SectorEditorScreen:
             self.editor.add_thing(wx, wy, self.thing_type)
             self._dirty()
             return
+        if self.tool == "stair":
+            self._stair_click(wx, wy)
+            return
         self._pick(wx, wy)
+
+    # ── stairs ───────────────────────────────────────────────────────
+    def _reset_tool_state(self) -> None:
+        """Drop half-finished tool input when the tool changes.
+
+        A pending contour or a half-collected staircase belongs to the tool
+        that is being left: keeping it means the next tool's first click is
+        interpreted as the second half of the previous one.
+        """
+        self.contour = []
+        self.precious = None
+        self._drag_v = None
+        self.stair_pts = []
+
+    def _stair_click(self, wx: float, wy: float) -> None:
+        """Collect two points per wall, then build on the fourth."""
+        if len(self.stair_pts) == 4:
+            self.stair_pts = []
+        self.stair_pts.append((wx, wy))
+        self._dirty()
+        if len(self.stair_pts) < 4:
+            self.status = (f"Лестница: {len(self.stair_pts)}/4 точек — по две "
+                           "на одной стене и две на другой")
+            return
+        info, errs = self.editor.build_stair(self.stair_pts, self.stair_rise)
+        self.stair_pts = []
+        if errs:
+            self.status = errs[0]
+            return
+        self._dirty()
+        rails = "проёмы" if info["rails_open"] else "сплошные стены"
+        self.status = (f"Лестница: {info['steps']} ступ. по {info['rise']} "
+                       f"({info['low']}→{info['high']}), бок {rails}")
 
     def _panel_down(self, pos) -> str | None:
         for key, rect in self.buttons.items():
@@ -529,6 +589,8 @@ class SectorEditorScreen:
                 return self._button(key)
         for key, rect in self._tool_buttons.items():
             if rect.collidepoint(pos):
+                if self.tool != key:
+                    self._reset_tool_state()
                 self.tool = key
                 return None
         for name, (rect, _col) in self._base_chips.items():

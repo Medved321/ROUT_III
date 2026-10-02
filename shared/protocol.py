@@ -218,8 +218,13 @@ def encode_world_state(
     body = b""
     for p in players:
         ammo = p.get("ammo", {})
+        # fire_seq: last ACCEPTED fire intent (monotonic), fire_ready: ticks
+        # left before this player's weapon can fire again, fire_reason: why the
+        # last processed intent was not accepted (0 = accepted).  Together they
+        # are the server's decision about the fire intent, so a refused shot is
+        # visible instead of being dropped in silence (fire-intent-single-path).
         body += struct.pack(
-            "!BfffBBBBBBBB",
+            "!BfffBBBBBBBBIBB",
             p["id"],
             p["x"], p["y"], p["angle"],
             p["health"],
@@ -227,6 +232,9 @@ def encode_world_state(
             p.get("wpn", 1),
             ammo.get("pstl", 0), ammo.get("shl", 0),
             ammo.get("slg", 0), ammo.get("rck", 0), ammo.get("BFG", 0),
+            p.get("fire_seq", 0) & 0xFFFFFFFF,
+            p.get("fire_ready", 0) & 0xFF,
+            p.get("fire_reason", 0) & 0xFF,
         )
         body += _encode_string(p.get("name", ""))
     # Enemies
@@ -279,15 +287,17 @@ def decode_world_state(data: bytes) -> tuple[int, list[dict], list[dict], list[d
     players = []
     offset = 4
     for _ in range(count):
-        pid, x, y, angle, hp, state, wpn, ap, ash, asg, ark, abfg = struct.unpack(
-            "!BfffBBBBBBBB", data[offset:offset + 21]
+        pid, x, y, angle, hp, state, wpn, ap, ash, asg, ark, abfg, fire_seq, fire_ready, fire_reason = struct.unpack(
+            "!BfffBBBBBBBBIBB", data[offset:offset + 27]
         )
-        offset += 21
+        offset += 27
         name, offset = _decode_string(data, offset)
         players.append({
             "id": pid, "x": x, "y": y, "angle": angle,
             "health": hp, "state": state, "name": name, "wpn": wpn,
             "ammo": {"pstl": ap, "shl": ash, "slg": asg, "rck": ark, "BFG": abfg},
+            "fire_seq": fire_seq, "fire_ready": fire_ready,
+            "fire_reason": fire_reason,
         })
     # Enemies
     e_count = struct.unpack("!H", data[offset:offset + 2])[0]

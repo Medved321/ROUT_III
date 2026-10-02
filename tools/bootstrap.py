@@ -75,6 +75,21 @@ def _probe(candidate: list[str] | tuple[str, ...]) -> tuple[tuple[int, int], boo
         return None
 
 
+def candidate_list() -> list[list[str] | tuple[str, ...]]:
+    """Interpreters to try, best first.
+
+    ``sys.executable`` leads, so a launcher that already resolved a suitable
+    interpreter does not send us hunting again: on Linux the names in
+    PY_CANDIDATES (``py``, ``python``) usually do not exist at all, while the
+    interpreter is reachable only as ``python3``.
+    """
+    candidates: list[list[str] | tuple[str, ...]] = []
+    if sys.executable:
+        candidates.append([sys.executable])
+    candidates.extend(PY_CANDIDATES)
+    return candidates
+
+
 def find_python() -> list[str] | None:
     """First interpreter that satisfies the project requirements.
 
@@ -84,7 +99,7 @@ def find_python() -> list[str] | None:
     hang.
     """
     _REJECTIONS.clear()
-    for candidate in PY_CANDIDATES:
+    for candidate in candidate_list():
         info = _probe(candidate)
         if info is None:
             continue

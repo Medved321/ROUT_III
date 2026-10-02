@@ -5,10 +5,11 @@ try:
 except Exception:
     np = None
     _HAVE_NP = False
-from engine.constants import SCALE, TILE, FOV, TEX_W, WPN, ENEMY_DB, EYE_H, CAM_Z, ENEMY_GAME_HEIGHTS
+from engine.constants import SCALE, TILE, FOV, TEX_W, WPN, ENEMY_DB, EYE_H, CAM_Z, ENEMY_GAME_HEIGHTS, FALLBACK_SPRITE_MAX
 from engine import constants as const
 from engine import game_state as gs
 from engine.framebuffer import depth_col
+from engine.viewport import ensure_hud_fonts, ui_px, ui_scale, project_point
 from engine.particles import draw_particles, draw_decals, draw_weather
 from engine.particles import update_particles, update_decals, update_weather
 from engine.map_utils import get_t, _player_in_any_sector
@@ -36,7 +37,7 @@ def _brighter(rgb, f=0.42):
 
 
 def _blank_sprite(size):
-    size = max(1, int(size))
+    size = max(1, min(int(size), FALLBACK_SPRITE_MAX))
     surf = _BLANK_SPRITES.get(size)
     if surf is None:
         surf = pygame.Surface((size, size), pygame.SRCALPHA)
@@ -180,8 +181,41 @@ _SSG_FILES = {
     3: 'skins/dwust_3.png', 4: 'skins/dwust_4.png', 5: 'skins/dwust_5.png', 6: 'skins/dwust_6.png'
 }
 _ssg_frames = {}
-_SSG_SCALE = {1: 1.5, 2: 1.3, '23': 1.3, '233': 0.87, 3: 2.2, 4: 1.3, 5: 1.3, 6: 1.3}
 _wpn_sprites = {}
+
+# Weapon view models are normalised to one height per weapon, expressed in
+# reference-window layout units (REF_H = 700) and multiplied by ui_scale().
+# The loaders used to bake a literal 3.0x/2.5x/1.33x into each PNG, so the
+# weapons spanned 17%..119% of the window height -- the rifle overflowed a 700px
+# window outright and every one of them was only correct at the single size it
+# was tuned at.
+WPN_TARGET_H = {
+    'CHAINSAW': 230, 'PISTOL': 250, 'SHOTGUN': 250,
+    'RIFLE': 280, 'BFG': 220, 'SSG': 216,
+}
+_wpn_fitted = {}
+_WPN_FITTED_MAX = 64
+
+
+def _fit_wpn(key, img, target_h):
+    """`img` scaled to `target_h`, preserving aspect ratio.
+
+    Keyed by (frame, target height): a resize misses once and re-fits, a steady
+    window is a dict hit.  No per-frame transform, which is the point -- the
+    weapon blit is on the hot path every frame.
+    """
+    ck = (key, target_h)
+    surf = _wpn_fitted.get(ck)
+    if surf is None:
+        iw, ih = img.get_width(), img.get_height()
+        if iw < 1 or ih < 1 or target_h < 1:
+            surf = img
+        else:
+            surf = pygame.transform.scale(img, (max(1, int(iw * target_h / ih)), target_h))
+        if len(_wpn_fitted) >= _WPN_FITTED_MAX:
+            _wpn_fitted.clear()
+        _wpn_fitted[ck] = surf
+    return surf
 
 # Compose a skin path from the base assets dir (not CWD).
 def _skin_path(rel):
@@ -191,16 +225,13 @@ def _skin_path(rel):
 def _get_ssg(i):
     if i not in _ssg_frames:
         try:
-            img = pygame.image.load(_skin_path(_SSG_FILES[i])).convert_alpha()
-            s = _SSG_SCALE[i]
-            if s != 1.0:
-                w, h = int(img.get_width() * s), int(img.get_height() * s)
-                if w > 0 and h > 0:
-                    img = pygame.transform.scale(img, (w, h))
-            _ssg_frames[i] = img
+            # Stored at native resolution: the per-frame multipliers in
+            # _SSG_SCALE were absolute pixel results, not proportions, so they
+            # had no meaning at any other window size.  _fit_wpn() now normalises
+            # every frame of a weapon to one target height.
+            _ssg_frames[i] = pygame.image.load(_skin_path(_SSG_FILES[i])).convert_alpha()
         except:
-            surf = pygame.Surface((1, 1))
-            _ssg_frames[i] = surf
+            _ssg_frames[i] = pygame.Surface((1, 1))
     return _ssg_frames[i]
 
 
@@ -220,13 +251,8 @@ _CHAINSAW_FIRE = None
 def _load_pistol():
     global _PISTOL_IDLE, _PISTOL_FIRE
     try:
-        img1 = pygame.image.load(_skin_path('skins/pistol_1.png')).convert_alpha()
-        img2 = pygame.image.load(_skin_path('skins/pistol_2.png')).convert_alpha()
-        s = 3.0
-        w, h = int(img1.get_width() * s), int(img1.get_height() * s)
-        _PISTOL_IDLE = pygame.transform.scale(img1, (w, h)) if w > 0 and h > 0 else img1
-        w, h = int(img2.get_width() * s), int(img2.get_height() * s)
-        _PISTOL_FIRE = pygame.transform.scale(img2, (w, h)) if w > 0 and h > 0 else img2
+        _PISTOL_IDLE = pygame.image.load(_skin_path('skins/pistol_1.png')).convert_alpha()
+        _PISTOL_FIRE = pygame.image.load(_skin_path('skins/pistol_2.png')).convert_alpha()
     except:
         _PISTOL_IDLE = pygame.Surface((1, 1))
         _PISTOL_FIRE = pygame.Surface((1, 1))
@@ -234,13 +260,8 @@ def _load_pistol():
 def _load_rifle():
     global _RIFLE_IDLE, _RIFLE_FIRE
     try:
-        img1 = pygame.image.load(_skin_path('skins/riffle_1.png')).convert_alpha()
-        img2 = pygame.image.load(_skin_path('skins/riffle_2.png')).convert_alpha()
-        s = 3.0
-        w, h = int(img1.get_width() * s), int(img1.get_height() * s)
-        _RIFLE_IDLE = pygame.transform.scale(img1, (w, h)) if w > 0 and h > 0 else img1
-        w, h = int(img2.get_width() * s), int(img2.get_height() * s)
-        _RIFLE_FIRE = pygame.transform.scale(img2, (w, h)) if w > 0 and h > 0 else img2
+        _RIFLE_IDLE = pygame.image.load(_skin_path('skins/riffle_1.png')).convert_alpha()
+        _RIFLE_FIRE = pygame.image.load(_skin_path('skins/riffle_2.png')).convert_alpha()
     except:
         _RIFLE_IDLE = pygame.Surface((1, 1))
         _RIFLE_FIRE = pygame.Surface((1, 1))
@@ -248,16 +269,9 @@ def _load_rifle():
 def _load_shotgun():
     global _SHOTGUN_IDLE, _SHOTGUN_FIRE, _SHOTGUN_RECOIL
     try:
-        img1 = pygame.image.load(_skin_path('skins/shootgun_1.png')).convert_alpha()
-        img2 = pygame.image.load(_skin_path('skins/shootgun_2.png')).convert_alpha()
-        img3 = pygame.image.load(_skin_path('skins/shootgun_3.png')).convert_alpha()
-        s1, s2, s3 = 3.0, 2.5, round(2.0 / 1.5, 2)
-        w, h = int(img1.get_width() * s1), int(img1.get_height() * s1)
-        _SHOTGUN_IDLE = pygame.transform.scale(img1, (w, h)) if w > 0 and h > 0 else img1
-        w, h = int(img2.get_width() * s2), int(img2.get_height() * s2)
-        _SHOTGUN_FIRE = pygame.transform.scale(img2, (w, h)) if w > 0 and h > 0 else img2
-        w, h = int(img3.get_width() * s3), int(img3.get_height() * s3)
-        _SHOTGUN_RECOIL = pygame.transform.scale(img3, (w, h)) if w > 0 and h > 0 else img3
+        _SHOTGUN_IDLE = pygame.image.load(_skin_path('skins/shootgun_1.png')).convert_alpha()
+        _SHOTGUN_FIRE = pygame.image.load(_skin_path('skins/shootgun_2.png')).convert_alpha()
+        _SHOTGUN_RECOIL = pygame.image.load(_skin_path('skins/shootgun_3.png')).convert_alpha()
     except:
         _SHOTGUN_IDLE = _SHOTGUN_FIRE = _SHOTGUN_RECOIL = pygame.Surface((1, 1))
 
@@ -265,13 +279,8 @@ def _load_shotgun():
 def _load_chainsaw():
     global _CHAINSAW_IDLE, _CHAINSAW_FIRE
     try:
-        img1 = pygame.image.load(_skin_path('skins/chainsaw_1.png')).convert_alpha()
-        img2 = pygame.image.load(_skin_path('skins/chainsaw_2.png')).convert_alpha()
-        s = 3.0
-        w, h = int(img1.get_width() * s), int(img1.get_height() * s)
-        _CHAINSAW_IDLE = pygame.transform.scale(img1, (w, h)) if w > 0 and h > 0 else img1
-        w, h = int(img2.get_width() * s), int(img2.get_height() * s)
-        _CHAINSAW_FIRE = pygame.transform.scale(img2, (w, h)) if w > 0 and h > 0 else img2
+        _CHAINSAW_IDLE = pygame.image.load(_skin_path('skins/chainsaw_1.png')).convert_alpha()
+        _CHAINSAW_FIRE = pygame.image.load(_skin_path('skins/chainsaw_2.png')).convert_alpha()
     except:
         _CHAINSAW_IDLE = _CHAINSAW_FIRE = pygame.Surface((1, 1))
 
@@ -297,7 +306,7 @@ def draw_wpn(idx, tmr, fire, bob):
                     sw = int(spr.get_width() * scale)
                     sh_s = int(spr.get_height() * scale)
                     bx = const.W // 2 - sw // 2
-                    by = const.H - sh_s - 20 + bob
+                    by = const.H - sh_s - ui_px(20) + bob
                     gs.screen.blit(pygame.transform.scale(spr, (sw, sh_s)), (bx, by))
             else:
                 model_name = wdef.get('model')
@@ -307,17 +316,19 @@ def draw_wpn(idx, tmr, fire, bob):
                     if voxels:
                         spr, _ = render_voxel_facing(voxels, palette, 30, 64)
                         if spr:
-                            scale_f = 6
-                            sw = spr.get_width() * scale_f
-                            sh = spr.get_height() * scale_f
+                            # Fraction of the window, like the hand sprite above,
+                            # so a voxel model is not a fixed pixel block either.
+                            scale_f = min(const.W * 0.3 / spr.get_width(), const.H * 0.4 / spr.get_height())
+                            sw = max(1, int(spr.get_width() * scale_f))
+                            sh = max(1, int(spr.get_height() * scale_f))
                             bx = const.W // 2 - sw // 2
-                            by = const.H - sh - 30 + bob
+                            by = const.H - sh - ui_px(30) + bob
                             gs.screen.blit(pygame.transform.scale(spr, (sw, sh)), (bx, by))
                 else:
                     col = wdef.get('color', (200, 200, 100))
-                    sz = 80
+                    sz = ui_px(80)
                     bx = const.W // 2 - sz // 2
-                    by = const.H - sz - 30 + bob
+                    by = const.H - sz - ui_px(30) + bob
                     pygame.draw.rect(gs.screen, col, (bx, by, sz, sz))
                     pygame.draw.rect(gs.screen, (255, 255, 255), (bx, by, sz, sz), 2)
         return
@@ -328,77 +339,89 @@ def draw_wpn(idx, tmr, fire, bob):
     # tuned to one weapon's tempo. Clamped: a switch or a slack gate can hand
     # us a tmr larger than this weapon's f.
     p = (min(max(tmr / info['f'], 0.0), 1.0) if info['f'] else 0.0) if tmr > 0 else 0.0
-    rcl = math.sin(p * math.pi) * 100 if tmr > 0 else 0
-    wx, wy = const.W // 2, _RY + _RH - 230 + rcl + bob
+    rcl = math.sin(p * math.pi) * ui_px(100) if tmr > 0 else 0
     wn = info['n']
+    # Every frame of a weapon lands on the same bottom gap above the screen
+    # edge, in layout units -- the gun no longer grows out of the window at
+    # 4K nor swallows it at 640x480.
+    gap = ui_px(30)
+    wx = const.W // 2
+    target_h = ui_px(WPN_TARGET_H.get(wn, 250))
+
+    def _blit(key, img, off=0):
+        surf = _fit_wpn(key, img, target_h)
+        gs.screen.blit(surf, (wx - surf.get_width() // 2, _RY + _RH - gap - surf.get_height() + rcl + bob + off))
 
     if wn == 'CHAINSAW':
         if _CHAINSAW_IDLE is None:
             _load_chainsaw()
-        shake = random.randint(-8, 8) if fire else 0
+        shake = random.randint(-ui_px(8), ui_px(8)) if fire else 0
         img = _CHAINSAW_FIRE if fire else _CHAINSAW_IDLE
-        gw, gh = img.get_size()
-        gs.screen.blit(img, (wx - gw // 2 + shake, wy + 200 - gh))
-
+        surf = _fit_wpn(('CHAINSAW', fire), img, target_h)
+        gs.screen.blit(surf, (wx - surf.get_width() // 2 + shake,
+                              _RY + _RH - gap - surf.get_height() + rcl + bob))
     elif wn == 'PISTOL':
         if _PISTOL_IDLE is None:
             _load_pistol()
-        img = _PISTOL_FIRE if fire else _PISTOL_IDLE
-        gw, gh = img.get_size()
-        gs.screen.blit(img, (wx - gw // 2, wy + 200 - gh))
+        _blit(('PISTOL', fire), _PISTOL_FIRE if fire else _PISTOL_IDLE)
     elif wn == 'SHOTGUN':
         if _SHOTGUN_IDLE is None:
             _load_shotgun()
         if p > 0.5:
-            img = _SHOTGUN_FIRE
+            img, frame = _SHOTGUN_FIRE, 'fire'
         elif p > 0.0:
-            img = _SHOTGUN_RECOIL
+            img, frame = _SHOTGUN_RECOIL, 'recoil'
         else:
-            img = _SHOTGUN_IDLE
-        gw, gh = img.get_size()
-        gs.screen.blit(img, (wx - gw // 2, wy + 200 - gh))
+            img, frame = _SHOTGUN_IDLE, 'idle'
+        _blit(('SHOTGUN', frame), img)
     elif wn == 'RIFLE':
         if _RIFLE_IDLE is None:
             _load_rifle()
-        img = _RIFLE_FIRE if fire else _RIFLE_IDLE
-        gw, gh = img.get_size()
-        gs.screen.blit(img, (wx - gw // 2, wy + 200 - gh))
+        _blit(('RIFLE', fire), _RIFLE_FIRE if fire else _RIFLE_IDLE)
 
     elif wn == 'BFG':
         glow = 255 if fire else 100
-        pygame.draw.rect(gs.screen, (0, 40, 0), (wx - 100, wy - 60, 200, 220))
-        pygame.draw.rect(gs.screen, (0, 70, 0), (wx - 80, wy - 40, 160, 180))
+        # Drawn from primitives, so every offset below is a layout unit too.
+        # wy is the muzzle reference point the shape was authored against.
+        u = ui_px
+        wy = _RY + _RH - gap + rcl + bob - u(160)
+        pygame.draw.rect(gs.screen, (0, 40, 0), (wx - u(100), wy, u(200), u(220)))
+        pygame.draw.rect(gs.screen, (0, 70, 0), (wx - u(80), wy + u(20), u(160), u(180)))
         pygame.draw.polygon(gs.screen, (0, 100, 0), [
-            (wx - 55, wy - 40), (wx + 55, wy - 40),
-            (wx + 80, wy - 100), (wx + 60, wy - 120),
-            (wx - 60, wy - 120), (wx - 80, wy - 100)
+            (wx - u(55), wy + u(20)), (wx + u(55), wy + u(20)),
+            (wx + u(80), wy - u(60)), (wx + u(60), wy - u(80)),
+            (wx - u(60), wy - u(80)), (wx - u(80), wy - u(60))
         ])
         pg = min(glow + 155, 255)
-        pygame.draw.circle(gs.screen, (0, pg, 0), (wx, wy - 105), 50)
-        pygame.draw.circle(gs.screen, (pg, 255, pg), (wx, wy - 105), 28)
-        pygame.draw.circle(gs.screen, (255, 255, 255), (wx, wy - 105), 12)
-        pygame.draw.rect(gs.screen, (60, 40, 20), (wx - 22, wy + 150, 44, 36))
+        pygame.draw.circle(gs.screen, (0, pg, 0), (wx, wy - u(65)), u(50))
+        pygame.draw.circle(gs.screen, (pg, 255, pg), (wx, wy - u(65)), u(28))
+        pygame.draw.circle(gs.screen, (255, 255, 255), (wx, wy - u(65)), u(12))
+        pygame.draw.rect(gs.screen, (60, 40, 20), (wx - u(22), wy + u(150), u(44), u(36)))
 
     elif wn == 'SSG':
         # seven frames over eighths of the cooldown (the old 66/56/46/36/26/16/8
         # thresholds at f=75 are 0.88/0.75/0.61/0.48/0.35/0.21/0.11)
         if p > 7 / 8:
-            f = _get_ssg(2)
+            k = 2
         elif p > 6 / 8:
-            f = _get_ssg('23')
+            k = '23'
         elif p > 5 / 8:
-            f = _get_ssg('233')
+            k = '233'
         elif p > 4 / 8:
-            f = _get_ssg(3)
+            k = 3
         elif p > 3 / 8:
-            f = _get_ssg(4)
+            k = 4
         elif p > 2 / 8:
-            f = _get_ssg(5)
+            k = 5
         elif p > 1 / 8:
-            f = _get_ssg(6)
+            k = 6
         else:
-            f = _get_ssg(1)
-        gs.screen.blit(f, (const.W // 2 - f.get_width() // 2, _RY + _RH - f.get_height() + bob))
+            k = 1
+        # The pump is told by the frames themselves, so SSG keeps no recoil
+        # offset -- only bob, exactly as before.
+        surf = _fit_wpn(('SSG', k), _get_ssg(k), target_h)
+        gs.screen.blit(surf, (wx - surf.get_width() // 2,
+                              _RY + _RH - gap - surf.get_height() + bob))
 
 
 
@@ -434,7 +457,7 @@ _GHOST_SPRITES = {}
 
 
 def _ghost_sprite(size):
-    size = max(4, int(size))
+    size = max(4, min(int(size), FALLBACK_SPRITE_MAX))
     surf = _GHOST_SPRITES.get(size)
     if surf is None:
         surf = pygame.Surface((size, size), pygame.SRCALPHA)
@@ -836,7 +859,8 @@ def draw_dash_streaks(rh=None, ry=None):
         if x + w > const.W:
             w = const.W - x
         y = int(rh * yn)
-        surf.fill((col[0], col[1], col[2], a), (x, y, w, th))
+        # Thickness is a layout unit too: at 4K a literal 2px line is invisible.
+        surf.fill((col[0], col[1], col[2], a), (x, y, w, ui_px(th)))
     gs.screen.blit(surf, (0, ry))
 
 
@@ -844,6 +868,10 @@ def render(vh=None, vy=None):
     global _RH, _RY
     _RH = vh if vh is not None else const.H
     _RY = vy if vy is not None else 0
+    # The HUD fonts are sized in layout units, so they depend on the window and
+    # must be re-resolved on every frame -- cheap: one scale compute and a dict
+    # lookup, and the cache keeps a single pair alive between resizes.
+    ensure_hud_fonts()
     curr_t = pygame.time.get_ticks()
     # Content providers, resolved once per frame (updating_engine 2.3): the
     # per-sprite / per-wall call sites must not pay an attribute lookup chain
@@ -929,12 +957,29 @@ def render(vh=None, vy=None):
                     if tile == 'C' and (cur_tx, cur_ty) in gs.bridge_open:
                         prev_tx, prev_ty = cur_tx, cur_ty
                         continue
-                    hit_x, hit_y = test_x, test_y
+                    # Texel from the EXACT crossing of the crossed tile
+                    # plane: the 6-unit step leaves test_x/test_y up to 6
+                    # units past the face, so the texel used to depend on the
+                    # player's position and view angle. Phase is unchanged.
                     if cur_tx != prev_tx:
                         side = 0
+                        bx = ((prev_tx + 1) * TILE) if cur_tx > prev_tx \
+                            else (cur_tx * TILE)
+                        if c != 0.0:
+                            hit_y = gs.py + s * ((bx - gs.px) / c)
+                            hit_x = bx
+                        else:
+                            hit_x, hit_y = test_x, test_y
                         tex_x = int((hit_y - cur_ty * TILE) / TILE * TEX_W) % TEX_W
                     else:
                         side = 1
+                        by = ((prev_ty + 1) * TILE) if cur_ty > prev_ty \
+                            else (cur_ty * TILE)
+                        if s != 0.0:
+                            hit_x = gs.px + c * ((by - gs.py) / s)
+                            hit_y = by
+                        else:
+                            hit_x, hit_y = test_x, test_y
                         tex_x = int((hit_x - cur_tx * TILE) / TILE * TEX_W) % TEX_W
                     break
                 prev_tx, prev_ty = cur_tx, cur_ty
@@ -1411,29 +1456,25 @@ def render(vh=None, vy=None):
                     if nm_y > _RY - 10:
                         gs.screen.blit(nm_surf, (nm_x, nm_y))
 
-    # Floor glow when standing on F/E/L tiles
+    # Floor glow when standing on F/E/L tiles. The band is a layout unit: as a
+    # literal 40px it was 8.3% of a 480px window and 1.9% of a 2160px one, so
+    # the cue vanished at exactly the resolutions where the window was readable.
     pt_x, pt_y = int(gs.px // TILE), int(gs.py // TILE)
     if 0 <= pt_y < gs.M_SZ and 0 <= pt_x < gs.M_SZ:
         ft = gs.MAP[pt_y][pt_x]
-        if ft == 'F':
-            ov = pygame.Surface((const.W, 40))
-            ov.set_alpha(80)
-            ov.fill((200, 150, 20))
-            gs.screen.blit(ov, (0, _RY + _RH - 40))
-        elif ft == 'E':
-            ov = pygame.Surface((const.W, 40))
-            ov.set_alpha(60)
-            ov.fill((60, 180, 220))
-            gs.screen.blit(ov, (0, _RY + _RH - 40))
-        elif ft == 'L':
-            ov = pygame.Surface((const.W, 40))
-            ov.set_alpha(60)
-            ov.fill((200, 50, 5))
-            gs.screen.blit(ov, (0, _RY + _RH - 40))
-            ov2 = pygame.Surface((const.W, 80))
+        glow_h = ui_px(40)
+        if ft in ('F', 'E', 'L'):
+            col, alpha = {'F': ((200, 150, 20), 80), 'E': ((60, 180, 220), 60), 'L': ((200, 50, 5), 60)}[ft]
+            ov = pygame.Surface((const.W, glow_h))
+            ov.set_alpha(alpha)
+            ov.fill(col)
+            gs.screen.blit(ov, (0, _RY + _RH - glow_h))
+        if ft == 'L':
+            glow_h2 = ui_px(80)
+            ov2 = pygame.Surface((const.W, glow_h2))
             ov2.set_alpha(30)
             ov2.fill((200, 80, 10))
-            gs.screen.blit(ov2, (0, _RY + _RH - 80))
+            gs.screen.blit(ov2, (0, _RY + _RH - glow_h2))
 
     # Advance the effect pools before drawing them. The spawns live in the
     # client bridge, but stepping the TTL here keeps render() the single
@@ -1533,7 +1574,7 @@ def render(vh=None, vy=None):
     # Elevator prompt
     if gs.elevator_prompt:
         msg = gs.sm_font.render("ELEVATOR: PRESS ENTER", True, (0, 255, 255))
-        gs.screen.blit(msg, (const.W // 2 - msg.get_width() // 2, _RY + _RH // 2 - 80))
+        gs.screen.blit(msg, (const.W // 2 - msg.get_width() // 2, _RY + _RH // 2 - ui_px(80)))
 
     # Update explored tiles (fog of war) — always track
     radius = 8
@@ -1548,9 +1589,11 @@ def render(vh=None, vy=None):
                     gs.explored[ny][nx] = True
 
     if gs.show_minimap and gs.M_SZ > 0 and explore_sz > 0:
-        ms = 5
+        ms = ui_px(5)
+        mm_ox, mm_oy = ui_px(10), ui_px(10)
+        mm_r = max(1, ui_px(3))
         draw_sz = min(gs.M_SZ, explore_sz)
-        pygame.draw.rect(gs.screen, (0, 0, 0), (10, 10, draw_sz * ms, draw_sz * ms))
+        pygame.draw.rect(gs.screen, (0, 0, 0), (mm_ox, mm_oy, draw_sz * ms, draw_sz * ms))
         for y in range(draw_sz):
             for x in range(draw_sz):
                 if not gs.explored[y][x]:
@@ -1559,12 +1602,12 @@ def render(vh=None, vy=None):
                 if tile == 'S':
                     continue
                 if tile == '.':
-                    pygame.draw.rect(gs.screen, (25, 25, 30), (10 + x * ms, 10 + y * ms, ms, ms))
+                    pygame.draw.rect(gs.screen, (25, 25, 30), (mm_ox + x * ms, mm_oy + y * ms, ms, ms))
                 elif tile == '#':
-                    pygame.draw.rect(gs.screen, (100, 100, 100), (10 + x * ms, 10 + y * ms, ms, ms))
+                    pygame.draw.rect(gs.screen, (100, 100, 100), (mm_ox + x * ms, mm_oy + y * ms, ms, ms))
                 elif tile in ('F', 'E'):
                     c = (60, 180, 220) if tile == 'E' else (200, 150, 0)
-                    pygame.draw.rect(gs.screen, c, (10 + x * ms, 10 + y * ms, ms, ms))
+                    pygame.draw.rect(gs.screen, c, (mm_ox + x * ms, mm_oy + y * ms, ms, ms))
                 elif tile in ('R', 'Y', 'B', 'T', 'W', 'D', 'M', 'I', 'P', 'H', 'V', 'C', 'Q', 'L', 'K'):
                     c = {'R': (180, 40, 40), 'Y': (180, 180, 40), 'B': (40, 40, 180),
                          'T': (130, 130, 140), 'W': (120, 80, 40),
@@ -1572,34 +1615,36 @@ def render(vh=None, vy=None):
                          'M': (140, 30, 30), 'I': (90, 110, 85), 'P': (170, 80, 50),
                          'H': (100, 80, 60), 'V': (100, 200, 100), 'C': (140, 100, 60),
                          'Q': (60, 180, 200), 'L': (200, 80, 0), 'K': (200, 50, 200)}.get(tile, (100, 100, 100))
-                    pygame.draw.rect(gs.screen, c, (10 + x * ms, 10 + y * ms, ms, ms))
-        pygame.draw.circle(gs.screen, (0, 255, 0), (10 + gs.px / TILE * ms, 10 + gs.py / TILE * ms), 3)
+                    pygame.draw.rect(gs.screen, c, (mm_ox + x * ms, mm_oy + y * ms, ms, ms))
+        pygame.draw.circle(gs.screen, (0, 255, 0), (mm_ox + gs.px / TILE * ms, mm_oy + gs.py / TILE * ms), mm_r)
         for bot in gs.bots:
             bc = bot.get('col', (255, 40, 40))
-            pygame.draw.circle(gs.screen, bc, (10 + bot['x'] / TILE * ms, 10 + bot['y'] / TILE * ms), 3)
-        kx = 10 + gs.M_SZ * ms + 5
-        ky = 10
+            pygame.draw.circle(gs.screen, bc, (mm_ox + bot['x'] / TILE * ms, mm_oy + bot['y'] / TILE * ms), mm_r)
+        kx = mm_ox + gs.M_SZ * ms + ui_px(5)
+        ky = mm_oy
+        mm_pitch = ui_px(15)
         if gs.p['keys']['R'] > 0:
-            gs.screen.blit(gs.sm_font.render(f"R:{gs.p['keys']['R']}", True, (255, 50, 50)), (kx, ky)); ky += 15
+            gs.screen.blit(gs.sm_font.render(f"R:{gs.p['keys']['R']}", True, (255, 50, 50)), (kx, ky)); ky += mm_pitch
         if gs.p['keys']['Y'] > 0:
-            gs.screen.blit(gs.sm_font.render(f"Y:{gs.p['keys']['Y']}", True, (255, 255, 50)), (kx, ky)); ky += 15
+            gs.screen.blit(gs.sm_font.render(f"Y:{gs.p['keys']['Y']}", True, (255, 255, 50)), (kx, ky)); ky += mm_pitch
         if gs.p['keys']['B'] > 0:
-            gs.screen.blit(gs.sm_font.render(f"B:{gs.p['keys']['B']}", True, (50, 50, 255)), (kx, ky)); ky += 15
+            gs.screen.blit(gs.sm_font.render(f"B:{gs.p['keys']['B']}", True, (50, 50, 255)), (kx, ky)); ky += mm_pitch
         if gs.secrets_total > 0:
             gs.screen.blit(gs.sm_font.render(f"SEC: {gs.secrets_found}/{gs.secrets_total}", True, (100, 200, 100)), (kx, ky))
 
-    # Speedrun timer
-    mins = int(gs.speedrun_timer // 60)
-    secs = int(gs.speedrun_timer % 60)
-    tenths = int((gs.speedrun_timer * 10) % 10)
-    gs.screen.blit(gs.sm_font.render(f"{mins:02}:{secs:02}.{tenths}", True, (200, 200, 200)), (const.W - 130, 85))
+    # Frame-rate readout, top edge of the screen.  The engine has no clock,
+    # so gs.fps is whatever the client measured for the frame being drawn.
+    # Hidden while it is 0 (unmeasured) rather than claiming "0 FPS".
+    if gs.fps > 0.0:
+        _fps = gs.sm_font.render(f"{gs.fps:.0f} FPS", True, (200, 200, 200))
+        gs.screen.blit(_fps, (const.W - ui_px(20) - _fps.get_width(), ui_px(64)))
 
     if gs.wave_msg_timer > 0:
         gs.wave_msg_timer -= 1
         alpha = min(255, gs.wave_msg_timer * 8)
         msg = gs.font.render(f"WAVE {gs.rounds}", True, (255, 255, 0))
         msg.set_alpha(alpha)
-        gs.screen.blit(msg, (const.W // 2 - msg.get_width() // 2, _RY + _RH // 2 - 100))
+        gs.screen.blit(msg, (const.W // 2 - msg.get_width() // 2, _RY + _RH // 2 - ui_px(100)))
 
     if gs.show_key_msg > 0:
         gs.show_key_msg -= 1
@@ -1610,9 +1655,9 @@ def render(vh=None, vy=None):
 
     # Replay indicator
     if gs.replay_mode == 'record':
-        gs.screen.blit(gs.sm_font.render("REC", True, (255, 50, 50)), (10, _RY + _RH - 20))
+        gs.screen.blit(gs.sm_font.render("REC", True, (255, 50, 50)), (ui_px(10), _RY + _RH - ui_px(20)))
     elif gs.replay_mode == 'playback':
-        gs.screen.blit(gs.sm_font.render(f"PLAY ({gs.replay_index}/{len(gs.replay_data)})", True, (50, 255, 50)), (10, _RY + _RH - 20))
+        gs.screen.blit(gs.sm_font.render(f"PLAY ({gs.replay_index}/{len(gs.replay_data)})", True, (50, 255, 50)), (ui_px(10), _RY + _RH - ui_px(20)))
 
     # Armor display
     arm = gs.p.get('armor')
@@ -1620,34 +1665,38 @@ def render(vh=None, vy=None):
     if arm:
         arm_color = (50, 200, 50) if arm['type'] == 'green' else (50, 50, 200)
         arm_str = f" ARM:{arm['value']}%"
-        gs.screen.blit(gs.sm_font.render(f"ARMOR {arm['value']}", True, arm_color), (410, _RY + _RH - 20))
+        gs.screen.blit(gs.sm_font.render(f"ARMOR {arm['value']}", True, arm_color), (ui_px(410), _RY + _RH - ui_px(20)))
 
     # Deathmatch frag display
     if gs.lvl_type == 'deathmatch':
         f1 = gs.dm_frags.get('p1', 0)
         f2 = gs.dm_frags.get('p2', 0)
         bot_total = sum(b.get('frags', 0) for b in gs.bots)
-        dm_x = 20 + (gs.M_SZ * 5 + 10 if gs.show_minimap else 0)
+        # Clears the minimap by the same scaled metrics the minimap used, not by
+        # the literal 5px tiles it was written against.
+        dm_x = ui_px(20 + (gs.M_SZ * ui_px(5) / ui_scale() + 10 if gs.show_minimap else 0))
+        dm_pitch = ui_px(14)
         if gs.dm_team_mode:
             rs, bs = gs.dm_team_scores['red'], gs.dm_team_scores['blue']
-            gs.screen.blit(gs.sm_font.render(f"TEAMS  RED:{rs}  BLUE:{bs}", True, (255, 200, 0)), (dm_x, 10))
-            yy = 24
+            gs.screen.blit(gs.sm_font.render(f"TEAMS  RED:{rs}  BLUE:{bs}", True, (255, 200, 0)), (dm_x, ui_px(10)))
+            yy = ui_px(24)
             for b in gs.bots:
                 bc = b.get('col', (200, 40, 40))
                 team_c = 'R' if b.get('team') == 'red' else 'B'
                 gs.screen.blit(gs.sm_font.render(f"{team_c}{b.get('id',0)} {b.get('type','?')[:3].upper()}  F:{b.get('frags',0)}  HP:{b['hp']}", True, bc), (dm_x, yy))
-                yy += 14
+                yy += dm_pitch
         else:
-            gs.screen.blit(gs.sm_font.render(f"P1:{f1}  P2:{f2}  BOTS:{bot_total}", True, (255, 200, 0)), (dm_x, 10))
-            yy = 24
+            gs.screen.blit(gs.sm_font.render(f"P1:{f1}  P2:{f2}  BOTS:{bot_total}", True, (255, 200, 0)), (dm_x, ui_px(10)))
+            yy = ui_px(24)
             for b in gs.bots:
                 bc = b.get('col', (200, 40, 40))
-                gs.screen.blit(gs.sm_font.render(f"B{b.get('id',0)} {b.get('type','?')[:3].upper()}  F:{b.get('frags',0)}  HP:{b['hp']}  const.W:{b.get('wpn',1)}", True, bc), (dm_x, yy))
-                yy += 14
+                gs.screen.blit(gs.sm_font.render(f"B{b.get('id',0)} {b.get('type','?')[:3].upper()}  F:{b.get('frags',0)}  HP:{b['hp']}  WPN:{b.get('wpn',1)}", True, bc), (dm_x, yy))
+                yy += dm_pitch
         if gs.dm_timer > 0:
             mins, secs = divmod(gs.dm_timer // 60, 60)
             timer_col = (255, 100, 100) if gs.dm_timer < 180 * 60 else (200, 200, 200)
-            gs.screen.blit(gs.font.render(f"{mins}:{secs:02d}", True, timer_col), (const.W // 2 - 30, 10))
+            _tmr2 = gs.font.render(f"{mins}:{secs:02d}", True, timer_col)
+            gs.screen.blit(_tmr2, (const.W // 2 - _tmr2.get_width() // 2, ui_px(10)))
         # Game over screen
         if gs.dm_game_over:
             overlay = pygame.Surface((const.W, const.H), pygame.SRCALPHA)
@@ -1658,7 +1707,10 @@ def render(vh=None, vy=None):
             gs.screen.blit(gs.sm_font.render("Press ENTER to restart", True, (150, 150, 150)), (const.W // 2 - 80, const.H // 2 + 20))
 
     # ── HUD ──
-    hud_bh = 100
+    # Every size below is a layout unit of the reference window (1000x700),
+    # converted to pixels by ui_px().  Authoring them as literal pixels is what
+    # made the HUD 20.8% of a 480px window and 4.6% of a 2160px one.
+    hud_bh = ui_px(100)
     hud_by = _RY + _RH - hud_bh
     pygame.draw.rect(gs.screen, (15, 15, 20), (0, hud_by, const.W, hud_bh))
     pygame.draw.rect(gs.screen, (100, 100, 100), (0, hud_by, const.W, hud_bh), 1)
@@ -1670,7 +1722,7 @@ def render(vh=None, vy=None):
     arm_type = arm['type'] if arm else None
 
     # ── Square face, big and expressive ──
-    face_sz = 52
+    face_sz = ui_px(52)
     face_x, face_y = const.W // 2, hud_by + hud_bh // 2
     face_rect = pygame.Rect(face_x - face_sz // 2, face_y - face_sz // 2, face_sz, face_sz)
     blink = (int(curr_t * 0.003) % 200) < 3
@@ -1694,129 +1746,141 @@ def render(vh=None, vy=None):
 
     fd = gs.face_dir
     cx = face_x    # head stays centered
-    cy = face_y - 1
-    feat_off = fd * 3   # features shift to show turning
+    cy = face_y - ui_px(1)
+    feat_off = fd * ui_px(3)   # features shift to show turning
 
     # Head — rounded rect, no frame (centered)
-    head_r = 6
-    pygame.draw.rect(gs.screen, skin, (cx - 19, cy - 20, 38, 38), border_radius=head_r)
+    head_r = ui_px(6)
+    head_w, head_h = ui_px(38), ui_px(38)
+    pygame.draw.rect(gs.screen, skin,
+                     (cx - head_w // 2, cy - head_h // 2, head_w, head_h),
+                     border_radius=head_r)
+    brow_w = ui_px(4)
+    lw_thin = ui_px(1)
+    lw_mid = ui_px(2)
+    lw_thick = ui_px(3)
 
     # ── Eyebrows ──
     brow_col = (50, 35, 25) if phase != 'dead' else (100, 100, 100)
     fex = cx + feat_off  # shifted features X
     if phase in ('critical', 'hurt'):
-        pygame.draw.line(gs.screen, brow_col, (fex - 14, cy - 16), (fex - 5, cy - 11), 4)
-        pygame.draw.line(gs.screen, brow_col, (fex + 14, cy - 16), (fex + 5, cy - 11), 4)
+        pygame.draw.line(gs.screen, brow_col, (fex - ui_px(14), cy - ui_px(16)), (fex - ui_px(5), cy - ui_px(11)), brow_w)
+        pygame.draw.line(gs.screen, brow_col, (fex + ui_px(14), cy - ui_px(16)), (fex + ui_px(5), cy - ui_px(11)), brow_w)
     elif phase == 'worried':
-        pygame.draw.line(gs.screen, brow_col, (fex - 13, cy - 14), (fex - 4, cy - 14), 4)
-        pygame.draw.line(gs.screen, brow_col, (fex + 13, cy - 14), (fex + 4, cy - 14), 4)
+        pygame.draw.line(gs.screen, brow_col, (fex - ui_px(13), cy - ui_px(14)), (fex - ui_px(4), cy - ui_px(14)), brow_w)
+        pygame.draw.line(gs.screen, brow_col, (fex + ui_px(13), cy - ui_px(14)), (fex + ui_px(4), cy - ui_px(14)), brow_w)
     elif phase == 'relaxed':
-        pygame.draw.line(gs.screen, brow_col, (fex - 13, cy - 15), (fex - 4, cy - 15), 4)
-        pygame.draw.line(gs.screen, brow_col, (fex + 13, cy - 15), (fex + 4, cy - 15), 4)
+        pygame.draw.line(gs.screen, brow_col, (fex - ui_px(13), cy - ui_px(15)), (fex - ui_px(4), cy - ui_px(15)), brow_w)
+        pygame.draw.line(gs.screen, brow_col, (fex + ui_px(13), cy - ui_px(15)), (fex + ui_px(4), cy - ui_px(15)), brow_w)
     elif phase == 'calm':
-        pygame.draw.line(gs.screen, brow_col, (fex - 13, cy - 15), (fex - 4, cy - 14), 4)
-        pygame.draw.line(gs.screen, brow_col, (fex + 13, cy - 15), (fex + 4, cy - 14), 4)
+        pygame.draw.line(gs.screen, brow_col, (fex - ui_px(13), cy - ui_px(15)), (fex - ui_px(4), cy - ui_px(14)), brow_w)
+        pygame.draw.line(gs.screen, brow_col, (fex + ui_px(13), cy - ui_px(15)), (fex + ui_px(4), cy - ui_px(14)), brow_w)
     elif phase == 'happy':
-        pygame.draw.line(gs.screen, brow_col, (fex - 13, cy - 16), (fex - 4, cy - 15), 4)
-        pygame.draw.line(gs.screen, brow_col, (fex + 13, cy - 16), (fex + 4, cy - 15), 4)
+        pygame.draw.line(gs.screen, brow_col, (fex - ui_px(13), cy - ui_px(16)), (fex - ui_px(4), cy - ui_px(15)), brow_w)
+        pygame.draw.line(gs.screen, brow_col, (fex + ui_px(13), cy - ui_px(16)), (fex + ui_px(4), cy - ui_px(15)), brow_w)
     elif phase == 'ecstatic':
-        pygame.draw.line(gs.screen, brow_col, (fex - 13, cy - 18), (fex - 4, cy - 16), 4)
-        pygame.draw.line(gs.screen, brow_col, (fex + 13, cy - 18), (fex + 4, cy - 16), 4)
+        pygame.draw.line(gs.screen, brow_col, (fex - ui_px(13), cy - ui_px(18)), (fex - ui_px(4), cy - ui_px(16)), brow_w)
+        pygame.draw.line(gs.screen, brow_col, (fex + ui_px(13), cy - ui_px(18)), (fex + ui_px(4), cy - ui_px(16)), brow_w)
 
     # ── Eyes ──
-    e_y = cy - 4
+    e_y = cy - ui_px(4)
     # Pupil offset: when fd != 0, pupils shift to edge for side-glance
-    pupil_off = fd * 2
+    pupil_off = fd * ui_px(2)
+    ew, eh = ui_px(9), ui_px(5)
+    pw, ph = ui_px(4), ui_px(3)
+    px0 = fex - ui_px(7) + pupil_off
+    px1 = fex + ui_px(6) + pupil_off
     if not blink and phase != 'dead':
         if phase == 'ecstatic':
             # Wide open eyes
-            pygame.draw.rect(gs.screen, (255, 255, 255), (fex - 10, e_y - 3, 9, 7))
-            pygame.draw.rect(gs.screen, (255, 255, 255), (fex + 3, e_y - 3, 9, 7))
-            pygame.draw.rect(gs.screen, (30, 15, 5), (fex - 7 + pupil_off, e_y - 1, 4, 3))
-            pygame.draw.rect(gs.screen, (30, 15, 5), (fex + 6 + pupil_off, e_y - 1, 4, 3))
-            pygame.draw.circle(gs.screen, (255, 255, 200), (fex - 8 + pupil_off, e_y - 3), 2)
-            pygame.draw.circle(gs.screen, (255, 255, 200), (fex + 5 + pupil_off, e_y - 3), 2)
+            pygame.draw.rect(gs.screen, (255, 255, 255), (fex - ui_px(10), e_y - ui_px(3), ew, ui_px(7)))
+            pygame.draw.rect(gs.screen, (255, 255, 255), (fex + ui_px(3), e_y - ui_px(3), ew, ui_px(7)))
+            pygame.draw.rect(gs.screen, (30, 15, 5), (px0, e_y - ui_px(1), pw, ph))
+            pygame.draw.rect(gs.screen, (30, 15, 5), (px1, e_y - ui_px(1), pw, ph))
+            pygame.draw.circle(gs.screen, (255, 255, 200), (px0 - ui_px(1), e_y - ui_px(3)), ui_px(2))
+            pygame.draw.circle(gs.screen, (255, 255, 200), (px1 - ui_px(1), e_y - ui_px(3)), ui_px(2))
         elif phase == 'happy':
-            pygame.draw.rect(gs.screen, (255, 255, 255), (fex - 10, e_y + 1, 9, 3))
-            pygame.draw.rect(gs.screen, (255, 255, 255), (fex + 3, e_y + 1, 9, 3))
-            pygame.draw.rect(gs.screen, (30, 15, 5), (fex - 7 + pupil_off, e_y + 1, 4, 2))
-            pygame.draw.rect(gs.screen, (30, 15, 5), (fex + 6 + pupil_off, e_y + 1, 4, 2))
+            pygame.draw.rect(gs.screen, (255, 255, 255), (fex - ui_px(10), e_y + ui_px(1), ew, ui_px(3)))
+            pygame.draw.rect(gs.screen, (255, 255, 255), (fex + ui_px(3), e_y + ui_px(1), ew, ui_px(3)))
+            pygame.draw.rect(gs.screen, (30, 15, 5), (px0, e_y + ui_px(1), pw, ui_px(2)))
+            pygame.draw.rect(gs.screen, (30, 15, 5), (px1, e_y + ui_px(1), pw, ui_px(2)))
         else:
-            pygame.draw.rect(gs.screen, (255, 255, 255), (fex - 10, e_y - 2, 9, 5))
-            pygame.draw.rect(gs.screen, (255, 255, 255), (fex + 3, e_y - 2, 9, 5))
-            pygame.draw.rect(gs.screen, (30, 15, 5), (fex - 7 + pupil_off, e_y - 1, 4, 3))
-            pygame.draw.rect(gs.screen, (30, 15, 5), (fex + 6 + pupil_off, e_y - 1, 4, 3))
+            pygame.draw.rect(gs.screen, (255, 255, 255), (fex - ui_px(10), e_y - ui_px(2), ew, eh))
+            pygame.draw.rect(gs.screen, (255, 255, 255), (fex + ui_px(3), e_y - ui_px(2), ew, eh))
+            pygame.draw.rect(gs.screen, (30, 15, 5), (px0, e_y - ui_px(1), pw, ph))
+            pygame.draw.rect(gs.screen, (30, 15, 5), (px1, e_y - ui_px(1), pw, ph))
         if phase in ('critical', 'hurt'):
-            pygame.draw.line(gs.screen, (200, 0, 0), (fex - 10, e_y - 4), (fex + 2, e_y - 4), 1)
-            pygame.draw.line(gs.screen, (200, 0, 0), (fex + 3, e_y - 4), (fex + 14, e_y - 4), 1)
+            pygame.draw.line(gs.screen, (200, 0, 0), (fex - ui_px(10), e_y - ui_px(4)), (fex + ui_px(2), e_y - ui_px(4)), lw_thin)
+            pygame.draw.line(gs.screen, (200, 0, 0), (fex + ui_px(3), e_y - ui_px(4)), (fex + ui_px(14), e_y - ui_px(4)), lw_thin)
             if phase == 'critical':
-                pygame.draw.line(gs.screen, (200, 0, 0), (fex - 12, e_y + 4), (fex + 12, e_y + 4), 1)
+                pygame.draw.line(gs.screen, (200, 0, 0), (fex - ui_px(12), e_y + ui_px(4)), (fex + ui_px(12), e_y + ui_px(4)), lw_thin)
     elif phase == 'dead':
-        pygame.draw.line(gs.screen, (150, 0, 0), (fex - 9, e_y - 3), (fex - 1, e_y + 3), 2)
-        pygame.draw.line(gs.screen, (150, 0, 0), (fex - 1, e_y - 3), (fex - 9, e_y + 3), 2)
-        pygame.draw.line(gs.screen, (150, 0, 0), (fex + 3, e_y - 3), (fex + 11, e_y + 3), 2)
-        pygame.draw.line(gs.screen, (150, 0, 0), (fex + 11, e_y - 3), (fex + 3, e_y + 3), 2)
+        pygame.draw.line(gs.screen, (150, 0, 0), (fex - ui_px(9), e_y - ui_px(3)), (fex - ui_px(1), e_y + ui_px(3)), lw_mid)
+        pygame.draw.line(gs.screen, (150, 0, 0), (fex - ui_px(1), e_y - ui_px(3)), (fex - ui_px(9), e_y + ui_px(3)), lw_mid)
+        pygame.draw.line(gs.screen, (150, 0, 0), (fex + ui_px(3), e_y - ui_px(3)), (fex + ui_px(11), e_y + ui_px(3)), lw_mid)
+        pygame.draw.line(gs.screen, (150, 0, 0), (fex + ui_px(11), e_y - ui_px(3)), (fex + ui_px(3), e_y + ui_px(3)), lw_mid)
     else:
-        pygame.draw.line(gs.screen, brow_col, (fex - 8, e_y), (fex + 1, e_y), 2)
-        pygame.draw.line(gs.screen, brow_col, (fex + 3, e_y), (fex + 12, e_y), 2)
+        pygame.draw.line(gs.screen, brow_col, (fex - ui_px(8), e_y), (fex + ui_px(1), e_y), lw_mid)
+        pygame.draw.line(gs.screen, brow_col, (fex + ui_px(3), e_y), (fex + ui_px(12), e_y), lw_mid)
 
     # ── Nose ──
     if phase != 'dead':
-        pygame.draw.line(gs.screen, brow_col, (fex, cy - 2), (fex, cy + 4), 2)
-        pygame.draw.line(gs.screen, brow_col, (fex, cy + 4), (fex + 3, cy + 2), 2)
+        pygame.draw.line(gs.screen, brow_col, (fex, cy - ui_px(2)), (fex, cy + ui_px(4)), lw_mid)
+        pygame.draw.line(gs.screen, brow_col, (fex, cy + ui_px(4)), (fex + ui_px(3), cy + ui_px(2)), lw_mid)
 
     # ── Mouth ──
-    m_y = cy + 10
+    m_y = cy + ui_px(10)
     if phase == 'dead':
-        pygame.draw.line(gs.screen, (100, 100, 100), (fex - 8, m_y + 2), (fex + 8, m_y + 2), 2)
+        pygame.draw.line(gs.screen, (100, 100, 100), (fex - ui_px(8), m_y + ui_px(2)), (fex + ui_px(8), m_y + ui_px(2)), lw_mid)
     elif phase == 'ecstatic':
-        pygame.draw.arc(gs.screen, (220, 220, 220), (fex - 11, m_y - 7, 22, 14), math.pi + 0.05, 2 * math.pi - 0.05, 3)
-        pygame.draw.arc(gs.screen, (255, 255, 255), (fex - 9, m_y - 5, 18, 10), math.pi + 0.05, 2 * math.pi - 0.05, 2)
+        pygame.draw.arc(gs.screen, (220, 220, 220), (fex - ui_px(11), m_y - ui_px(7), ui_px(22), ui_px(14)), math.pi + 0.05, 2 * math.pi - 0.05, lw_thick)
+        pygame.draw.arc(gs.screen, (255, 255, 255), (fex - ui_px(9), m_y - ui_px(5), ui_px(18), ui_px(10)), math.pi + 0.05, 2 * math.pi - 0.05, lw_mid)
     elif phase == 'happy':
-        pygame.draw.arc(gs.screen, (200, 200, 200), (fex - 9, m_y - 5, 18, 12), math.pi + 0.1, 2 * math.pi - 0.1, 3)
-        pygame.draw.arc(gs.screen, (255, 255, 255), (fex - 7, m_y - 3, 14, 8), math.pi + 0.1, 2 * math.pi - 0.1, 2)
+        pygame.draw.arc(gs.screen, (200, 200, 200), (fex - ui_px(9), m_y - ui_px(5), ui_px(18), ui_px(12)), math.pi + 0.1, 2 * math.pi - 0.1, lw_thick)
+        pygame.draw.arc(gs.screen, (255, 255, 255), (fex - ui_px(7), m_y - ui_px(3), ui_px(14), ui_px(8)), math.pi + 0.1, 2 * math.pi - 0.1, lw_mid)
     elif phase == 'relaxed':
-        pygame.draw.line(gs.screen, (180, 180, 180), (fex - 6, m_y + 1), (fex + 6, m_y + 1), 2)
-        pygame.draw.line(gs.screen, (200, 200, 200), (fex + 6, m_y + 1), (fex + 8, m_y + 2), 2)
+        pygame.draw.line(gs.screen, (180, 180, 180), (fex - ui_px(6), m_y + ui_px(1)), (fex + ui_px(6), m_y + ui_px(1)), lw_mid)
+        pygame.draw.line(gs.screen, (200, 200, 200), (fex + ui_px(6), m_y + ui_px(1)), (fex + ui_px(8), m_y + ui_px(2)), lw_mid)
     elif phase == 'calm':
-        pygame.draw.line(gs.screen, (180, 180, 180), (fex - 7, m_y + 1), (fex + 1, m_y), 2)
-        pygame.draw.line(gs.screen, (200, 200, 200), (fex + 1, m_y), (fex + 7, m_y + 1), 2)
+        pygame.draw.line(gs.screen, (180, 180, 180), (fex - ui_px(7), m_y + ui_px(1)), (fex + ui_px(1), m_y), lw_mid)
+        pygame.draw.line(gs.screen, (200, 200, 200), (fex + ui_px(1), m_y), (fex + ui_px(7), m_y + ui_px(1)), lw_mid)
     elif phase == 'worried':
-        pygame.draw.line(gs.screen, (160, 160, 160), (fex - 7, m_y + 2), (fex + 7, m_y + 2), 3)
+        pygame.draw.line(gs.screen, (160, 160, 160), (fex - ui_px(7), m_y + ui_px(2)), (fex + ui_px(7), m_y + ui_px(2)), lw_thick)
     elif phase == 'hurt':
-        pygame.draw.arc(gs.screen, (180, 40, 40), (fex - 8, m_y - 2, 16, 10), math.pi + 0.15, 2 * math.pi - 0.15, 3)
-        pygame.draw.line(gs.screen, (180, 0, 0), (fex - 4, m_y + 7), (fex - 4, m_y + 11), 2)
-        pygame.draw.line(gs.screen, (180, 0, 0), (fex + 4, m_y + 7), (fex + 4, m_y + 10), 2)
+        pygame.draw.arc(gs.screen, (180, 40, 40), (fex - ui_px(8), m_y - ui_px(2), ui_px(16), ui_px(10)), math.pi + 0.15, 2 * math.pi - 0.15, lw_thick)
+        pygame.draw.line(gs.screen, (180, 0, 0), (fex - ui_px(4), m_y + ui_px(7)), (fex - ui_px(4), m_y + ui_px(11)), lw_mid)
+        pygame.draw.line(gs.screen, (180, 0, 0), (fex + ui_px(4), m_y + ui_px(7)), (fex + ui_px(4), m_y + ui_px(10)), lw_mid)
     elif phase == 'critical':
-        pygame.draw.arc(gs.screen, (180, 20, 20), (fex - 9, m_y - 2, 18, 12), math.pi + 0.2, 2 * math.pi - 0.2, 3)
-        pygame.draw.line(gs.screen, (180, 0, 0), (fex - 5, m_y + 8), (fex - 5, m_y + 13), 2)
-        pygame.draw.line(gs.screen, (180, 0, 0), (fex + 5, m_y + 8), (fex + 5, m_y + 12), 2)
-        pygame.draw.line(gs.screen, (180, 0, 0), (fex - 1, m_y + 9), (fex - 1, m_y + 12), 2)
+        pygame.draw.arc(gs.screen, (180, 20, 20), (fex - ui_px(9), m_y - ui_px(2), ui_px(18), ui_px(12)), math.pi + 0.2, 2 * math.pi - 0.2, lw_thick)
+        pygame.draw.line(gs.screen, (180, 0, 0), (fex - ui_px(5), m_y + ui_px(8)), (fex - ui_px(5), m_y + ui_px(13)), lw_mid)
+        pygame.draw.line(gs.screen, (180, 0, 0), (fex + ui_px(5), m_y + ui_px(8)), (fex + ui_px(5), m_y + ui_px(12)), lw_mid)
+        pygame.draw.line(gs.screen, (180, 0, 0), (fex - ui_px(1), m_y + ui_px(9)), (fex - ui_px(1), m_y + ui_px(12)), lw_mid)
 
     # ── Left: HP + thin bar + stats ──
-    lx = 12
+    lx = ui_px(12)
     hp_col = (0, 220, 0) if hp > 50 else ((220, 220, 0) if hp > 25 else (220, 0, 0))
     hp_str = f"{hp}/{max_hp}"
-    gs.screen.blit(gs.font.render(hp_str, True, hp_col), (lx, hud_by + 4))
+    gs.screen.blit(gs.font.render(hp_str, True, hp_col), (lx, hud_by + ui_px(4)))
     # Stats (compact)
-    stats_y = hud_by + 14
+    stats_y = hud_by + ui_px(14)
+    pitch_stat = ui_px(12)
     gs.screen.blit(gs.sm_font.render(f"K:{gs.kills}", True, (180, 120, 120)), (lx, stats_y))
-    gs.screen.blit(gs.sm_font.render(f"I:{gs.items_picked}", True, (180, 180, 120)), (lx, stats_y + 12))
-    gs.screen.blit(gs.sm_font.render(f"S:{gs.secrets_found}/{gs.secrets_total}", True, (160, 160, 160)), (lx, stats_y + 24))
+    gs.screen.blit(gs.sm_font.render(f"I:{gs.items_picked}", True, (180, 180, 120)), (lx, stats_y + pitch_stat))
+    gs.screen.blit(gs.sm_font.render(f"S:{gs.secrets_found}/{gs.secrets_total}", True, (160, 160, 160)), (lx, stats_y + pitch_stat * 2))
     # Accuracy
     if gs.shots_fired > 0:
         acc = gs.shots_hit * 100 // gs.shots_fired
         acc_col = (100, 200, 100) if acc > 50 else ((200, 200, 100) if acc > 25 else (200, 100, 100))
-        gs.screen.blit(gs.sm_font.render(f"A:{acc}%", True, acc_col), (lx, stats_y + 36))
+        gs.screen.blit(gs.sm_font.render(f"A:{acc}%", True, acc_col), (lx, stats_y + pitch_stat * 3))
 
     # ── Right: Armor + weapon + ammo + kills count ──
-    rx = const.W - 120
+    rx = const.W - ui_px(120)
 
     # Armor value with type icon
     if arm_val > 0:
         arm_label = f"ARM {arm_val}"
         arm_col2 = (50, 220, 50) if arm_type == 'green' else ((50, 80, 220) if arm_type == 'blue' else (100, 100, 100))
-        gs.screen.blit(gs.font.render(arm_label, True, arm_col2), (rx, hud_by + 4))
+        gs.screen.blit(gs.font.render(arm_label, True, arm_col2), (rx, hud_by + ui_px(4)))
 
     if gs.p['wpn'] >= 100:
         cw_idx = gs.p['wpn'] - 100
@@ -1838,43 +1902,43 @@ def render(vh=None, vy=None):
     if gs.lvl_type == 'slaughter':
         amm = "INF"
 
-    wpn_y = hud_by + 28
-    gs.screen.blit(gs.sm_font.render(wpn_name, True, (210, 210, 210)), (rx + 2, wpn_y))
+    wpn_y = hud_by + ui_px(28)
+    gs.screen.blit(gs.sm_font.render(wpn_name, True, (210, 210, 210)), (rx + ui_px(2), wpn_y))
     if isinstance(amm, int):
         amc = {'pstl': (180, 180, 100), 'shl': (200, 120, 50), 'slg': (100, 200, 100), 'rck': (0, 200, 0), 'BFG': (0, 200, 50)}.get(amm_key if gs.p['wpn'] < 100 else 'pstl', (200, 200, 200))
         amm_str = f"{amm}"
-        gs.screen.blit(gs.font.render(amm_str, True, amc), (rx, wpn_y + 16))
+        gs.screen.blit(gs.font.render(amm_str, True, amc), (rx, wpn_y + ui_px(16)))
         # Thin ammo bar
         amm_max = {'pstl': 200, 'shl': 50, 'slg': 50, 'rck': 10, 'BFG': 10}.get(amm_key if gs.p['wpn'] < 100 else 'pstl', 100)
         if amm_max > 0:
             amm_frac = min(1.0, amm / amm_max)
-            abw, abh = 90, 4
-            pygame.draw.rect(gs.screen, (25, 25, 25), (rx, wpn_y + 38, abw, abh))
-            pygame.draw.rect(gs.screen, amc, (rx, wpn_y + 38, int(abw * amm_frac), abh))
+            abw, abh = ui_px(90), ui_px(4)
+            pygame.draw.rect(gs.screen, (25, 25, 25), (rx, wpn_y + ui_px(38), abw, abh))
+            pygame.draw.rect(gs.screen, amc, (rx, wpn_y + ui_px(38), int(abw * amm_frac), abh))
     # Remaining enemies
     ene_left = len(gs.enemies)
     if ene_left > 0:
         ene_col = (200, 100, 100) if ene_left > 5 else ((200, 200, 100) if ene_left > 1 else (200, 50, 50))
-        gs.screen.blit(gs.sm_font.render(f"ENE:{ene_left}", True, ene_col), (rx, wpn_y + 48))
+        gs.screen.blit(gs.sm_font.render(f"ENE:{ene_left}", True, ene_col), (rx, wpn_y + ui_px(48)))
 
     # ── Weapon slots (top area between panels) ──
     owned = sorted(gs.p['guns'])
-    slot_w = 30
-    slots_start = max(lx + 80, face_rect.left - len(owned) * slot_w - 8)
-    slot_y = hud_by + 8
+    slot_w = ui_px(30)
+    slots_start = max(lx + ui_px(80), face_rect.left - len(owned) * slot_w - ui_px(8))
+    slot_y = hud_by + ui_px(8)
     for i, w in enumerate(owned):
         wx = slots_start + i * slot_w
         wcol = (255, 255, 255) if w == gs.p['wpn'] else (120, 120, 120)
         lbl = str(w + 1) if w < 6 else f"C{w-99}"
         if w < 6:
-            pygame.draw.rect(gs.screen, WPN[w]['c'], (wx + 2, slot_y + 1, 6, 5))
+            pygame.draw.rect(gs.screen, WPN[w]['c'], (wx + ui_px(2), slot_y + ui_px(1), ui_px(6), ui_px(5)))
         lw = gs.sm_font.size(lbl)[0]
-        gs.screen.blit(gs.sm_font.render(lbl, True, wcol), (wx + (slot_w - lw) // 2, slot_y + 8))
+        gs.screen.blit(gs.sm_font.render(lbl, True, wcol), (wx + (slot_w - lw) // 2, slot_y + ui_px(8)))
         if w == gs.p['wpn']:
-            pygame.draw.rect(gs.screen, (255, 255, 255), (wx, slot_y, slot_w - 1, 22), 1)
+            pygame.draw.rect(gs.screen, (255, 255, 255), (wx, slot_y, slot_w - 1, ui_px(22)), 1)
 
     # ── Under face: mode / dmg / powerup / keys ──
-    bot_y = hud_by + hud_bh - 16
+    bot_y = hud_by + hud_bh - ui_px(16)
     mode_str = ""
     if gs.lvl_type == 'slaughter':
         mode_str = f"W:{gs.rounds}"
@@ -1889,31 +1953,42 @@ def render(vh=None, vy=None):
     else:
         mode_str = 'ENDLESS' if gs.lvl_type == 'endless' else 'EXIT'
     if mode_str:
-        gs.screen.blit(gs.sm_font.render(mode_str, True, (150, 150, 150)), (face_rect.centerx - 15, bot_y))
+        # Centred on the face by measuring the label: a blind offset drifts as
+        # soon as the string changes length ("ENDLESS" vs "EXIT").
+        lbl = gs.sm_font.render(mode_str, True, (150, 150, 150))
+        gs.screen.blit(lbl, (face_rect.centerx - lbl.get_width() // 2, bot_y))
     # Damage dealt/taken on the bottom line
-    gs.screen.blit(gs.sm_font.render(f"DMG:{gs.damage_dealt}d/{gs.damage_taken}t", True, (140, 140, 140)), (face_rect.centerx - 45, bot_y + 10))
+    lbl = gs.sm_font.render(f"DMG:{gs.damage_dealt}d/{gs.damage_taken}t", True, (140, 140, 140))
+    gs.screen.blit(lbl, (face_rect.centerx - lbl.get_width() // 2, bot_y + ui_px(10)))
     pu_str = f"{gs.p['powerup']}" if gs.p['powerup'] else ""
     if pu_str:
-        gs.screen.blit(gs.sm_font.render(pu_str, True, (255, 255, 0)), (face_rect.centerx - 15, hud_by + 2))
-    kx = face_rect.right + 8
+        lbl = gs.sm_font.render(pu_str, True, (255, 255, 0))
+        gs.screen.blit(lbl, (face_rect.centerx - lbl.get_width() // 2, hud_by + ui_px(2)))
+    kx = face_rect.right + ui_px(8)
+    key_pitch = ui_px(28)
     for kc, kv in sorted(gs.p.get('keys', {}).items()):
         if kv > 0:
             kcol = {'R': (255, 50, 50), 'Y': (255, 255, 50), 'B': (50, 50, 255)}.get(kc, (200, 200, 200))
             gs.screen.blit(gs.sm_font.render(f"{kc}:{kv}", True, kcol), (kx, bot_y))
-            kx += 28
+            kx += key_pitch
 
     # Cheat input display
     if gs.cheat_open:
-        pygame.draw.rect(gs.screen, (0, 0, 0), (0, _RY + _RH - 42, const.W, 42))
-        pygame.draw.rect(gs.screen, (100, 100, 100), (0, _RY + _RH - 42, const.W, 42), 1)
+        cheat_h = ui_px(42)
+        pygame.draw.rect(gs.screen, (0, 0, 0), (0, _RY + _RH - cheat_h, const.W, cheat_h))
+        pygame.draw.rect(gs.screen, (100, 100, 100), (0, _RY + _RH - cheat_h, const.W, cheat_h), 1)
         txt = f"CHEAT: {gs.cheat_buf}█"
-        gs.screen.blit(gs.font.render(txt, True, (255, 255, 0)), (30, _RY + _RH - 35))
+        gs.screen.blit(gs.font.render(txt, True, (255, 255, 0)), (ui_px(30), _RY + _RH - ui_px(35)))
 
-    # Crosshair
+    # Crosshair — centred on the screen, sized in layout units so it stays
+    # visible in 4K instead of shrinking to a 20px cross on 8.3 Mpx.
     if gs.show_crosshair:
         ch_x, ch_y = const.W // 2, const.H // 2
         ch_col = (255, 255, 255)
-        pygame.draw.line(gs.screen, ch_col, (ch_x - 10, ch_y), (ch_x - 3, ch_y), 2)
-        pygame.draw.line(gs.screen, ch_col, (ch_x + 3, ch_y), (ch_x + 10, ch_y), 2)
-        pygame.draw.line(gs.screen, ch_col, (ch_x, ch_y - 10), (ch_x, ch_y - 3), 2)
-        pygame.draw.line(gs.screen, ch_col, (ch_x, ch_y + 3), (ch_x, ch_y + 10), 2)
+        ch_arm = ui_px(10)
+        ch_gap = ui_px(3)
+        ch_w = ui_px(2)
+        pygame.draw.line(gs.screen, ch_col, (ch_x - ch_arm, ch_y), (ch_x - ch_gap, ch_y), ch_w)
+        pygame.draw.line(gs.screen, ch_col, (ch_x + ch_gap, ch_y), (ch_x + ch_arm, ch_y), ch_w)
+        pygame.draw.line(gs.screen, ch_col, (ch_x, ch_y - ch_arm), (ch_x, ch_y - ch_gap), ch_w)
+        pygame.draw.line(gs.screen, ch_col, (ch_x, ch_y + ch_gap), (ch_x, ch_y + ch_arm), ch_w)

@@ -14,7 +14,7 @@ from shared.map_data import GameMap
 from shared.sector_map import MAP_FORMAT_SECTOR, SectorMap
 from shared.releases import ReleaseStore, is_newer
 from shared.version import CLIENT_VERSION, PROTOCOL_VERSION
-from shared.combat import normalize_angle
+from shared.combat import normalize_angle, fire_reason_code
 from shared.protocol import INPUT_FLAG_DASH
 from server.game_world import GameWorld
 from server.game_data import (
@@ -79,6 +79,16 @@ class GameServer:
         for party in self.lobby.parties.values():
             w = party.world
             players = w.get_all_player_states()
+            # fire_seq/fire_reason live on the session (intents are numbered and decided
+            # per client), so they are stamped in here; fire_ready already came
+            # from the weapon component and counts down on its own.
+            for p in players:
+                sess = party.members.get(p["id"])
+                p["fire_seq"] = max(0, sess.last_fire_seq) if sess else 0
+                p["fire_reason"] = (
+                    fire_reason_code(sess.last_fire_result.reason)
+                    if sess and sess.last_fire_result else 0
+                )
             enemies = w.get_enemy_states()
             bullets = w.get_bullet_states()
             corpses = w.get_corpse_states()
@@ -264,10 +274,12 @@ class GameServer:
     def _on_player_fire(
         self, session: PlayerSession, fire_seq: int, weapon_id: int = 1
     ) -> None:
-        # Idempotent: the reliable channel may redeliver the same click intent.
+        # Idempotent: the reliable channel may redeliver the same intent. Only
+        # an accepted intent advances last_fire_seq, so a redelivery of a
+        # refused intent is refused again (no ammo is spent twice, and the
+        # decision the client sees stays truthful).
         if fire_seq == session.last_fire_seq:
             return
-        session.last_fire_seq = fire_seq
         party = self.lobby.find_party_of(session)
         if party is None:
             return
@@ -275,7 +287,10 @@ class GameServer:
         if entity_id is None:
             return
         apply_weapon_switch(party.world, entity_id, weapon_id)
-        weapons_handle_shoot(party.world, entity_id)
+        result = weapons_handle_shoot(party.world, entity_id)
+        if result.fired:
+            session.last_fire_seq = fire_seq
+        session.last_fire_result = result
 
     def _apply_input(
         self, world: GameWorld, entity_id: int, session: PlayerSession,
@@ -316,14 +331,16 @@ class GameServer:
         # weapon switch
         apply_weapon_switch(world, entity_id, weapon_id)
 
-        if shoot:
-            weapons_handle_shoot(world, entity_id)
-
+        # The `shoot` field is the HELD fire button and carries no trigger: the
+        # only path to a shot is the reliable FIRE intent, so the 25 Hz input
+        # channel cannot race it and no intent can be silently eaten by the
+        # weapon cooldown here.
         if pl:
-            # Assigned after handle_shoot(), which sets state = 2 itself. Dash
-            # wins over shooting: it is the more visible event, and no client
-            # renders the shooting state of other players.
-            pl.state = 3 if dashing else (2 if shoot else 0)
+            # Dash state is derived from the authoritative dash component, not
+            # from a key press, so a refused dash cannot flash. Shooting is not
+            # published from input at all: state = 2 is set by handle_shoot()
+            # only when a shot really happened.
+            pl.state = 3 if dashing else 0
 
     def _on_player_ping(self, session: PlayerSession, timestamp: float) -> None:
         session.last_ping = time.monotonic()

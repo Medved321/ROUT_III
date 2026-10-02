@@ -4,7 +4,7 @@ from __future__ import annotations
 import pygame
 
 from client.settings import SPEC, format_value, validate_size
-from client.ui_layout import clip_tail, ellipsize
+from client.ui_layout import clip_tail, ellipsize, text_width
 
 BG = (18, 18, 26)
 PANEL = (30, 34, 48)
@@ -31,6 +31,20 @@ BACK_H = 42
 HINT_BAND = 34
 BTN_PAD = 12
 VALUE_GAP = 12
+# Left padding of a row, and the gutter between the caption and the value. The
+# caption column is sized from the widest label that is actually in SPEC, so a
+# name is measured, never guessed and never cut on the default canvas.
+LABEL_PAD = 16
+LABEL_GAP = 14
+# Floor for the value column: a pathologically long caption must still leave the
+# arrows their room, and the value degrades to an ellipsis before the arrows do.
+VALUE_MIN_W = 120
+# The two steppers sit together at the right of the row. The insets are named
+# because their *gap* is what the caption and the value compete for: they used
+# to be 150/44 with a 72px dead gutter, which is exactly the room a caption needs.
+ARROW_W = 34
+ARROW_INSET_L = 118
+ARROW_INSET_R = 42
 FIELD_LABEL = "Размер окна (Ш×В, Enter — применить):"
 
 
@@ -49,6 +63,8 @@ class SettingsScreen:
 
         self.field_h = 34
         self.back_btn = pygame.Rect(0, 0, 200, 42)
+        # Measured once from the row font (see ``_label_needed``).
+        self._label_needed_px = None
         self._layout()
 
     def _layout(self) -> None:
@@ -102,10 +118,12 @@ class SettingsScreen:
         )
 
     def _left_arrow(self, rect: pygame.Rect) -> pygame.Rect:
-        return pygame.Rect(rect.right - 150, rect.y + 8, 34, rect.height - 16)
+        return pygame.Rect(rect.right - ARROW_INSET_L, rect.y + 8, ARROW_W,
+                           rect.height - 16)
 
     def _right_arrow(self, rect: pygame.Rect) -> pygame.Rect:
-        return pygame.Rect(rect.right - 44, rect.y + 8, 34, rect.height - 16)
+        return pygame.Rect(rect.right - ARROW_INSET_R, rect.y + 8, ARROW_W,
+                           rect.height - 16)
 
     def _ensure_visible(self) -> None:
         self._scroll = max(0, min(self._max_scroll, self._scroll))
@@ -119,20 +137,48 @@ class SettingsScreen:
         return self._editing and SPEC[self._selected]["key"] == CUSTOM_ROW_KEY
 
     def _value_rect(self, rect: pygame.Rect) -> pygame.Rect:
-        """The strip a row's value is drawn in: between the label on the left
-        and the arrow zone on the right, with a gutter on each side.
+        """The strip a row's value is drawn in: from the column split up to the
+        arrow zone, with a gutter on each side.
 
         Drawing used to place the value by its own width from ``rect.right-54``,
         so a long value (a 4K size, a long texture path) ran under the arrows
         and over the next row's label. The value is now cut to this band.
         """
-        left = self._left_arrow(rect).x - VALUE_GAP
-        return pygame.Rect(rect.x + 16, rect.y, max(0, left - rect.x - 16), rect.height)
+        left = self._split_x(rect)
+        return pygame.Rect(left, rect.y, max(0, self._arrow_zone_x(rect) - left),
+                           rect.height)
+
+    def _arrow_zone_x(self, rect: pygame.Rect) -> int:
+        """Left edge of the value column's right end, where the arrows begin."""
+        return self._left_arrow(rect).x - VALUE_GAP
+
+    def _label_needed(self) -> int:
+        """Width the widest caption in SPEC needs, measured in the row font."""
+        if self._label_needed_px is None:
+            self._label_needed_px = max(
+                text_width(spec["label"], self.font) for spec in SPEC)
+        return self._label_needed_px
+
+    def _split_x(self, rect: pygame.Rect) -> int:
+        """Where the value column starts; the caption owns everything left of it.
+
+        One split feeds both bands, and both are measured from the row's left
+        edge. Deriving the caption from the value's left edge instead (as the
+        code used to) collapses it to zero width, because the value band already
+        begins at the caption's left padding -- that is why every row used to
+        render as an empty panel with a pair of arrows and no name.
+        """
+        arrow_x = self._arrow_zone_x(rect)
+        usable = arrow_x - rect.x
+        wanted = LABEL_PAD + self._label_needed() + LABEL_GAP
+        cap = usable - VALUE_MIN_W
+        return rect.x + max(1, min(wanted, max(1, cap)))
 
     def _label_rect(self, rect: pygame.Rect) -> pygame.Rect:
-        """The strip a row's label is drawn in, ending where the value begins."""
-        return pygame.Rect(rect.x + 16, rect.y, max(0, self._value_rect(rect).x - rect.x - 16),
-                           rect.height)
+        """The strip a row's caption is drawn in, ending where the value begins."""
+        left = rect.x + LABEL_PAD
+        return pygame.Rect(left, rect.y,
+                           max(0, self._split_x(rect) - LABEL_GAP - left), rect.height)
 
     def _select(self, index: int) -> None:
         if index == self._selected:
