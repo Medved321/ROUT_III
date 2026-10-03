@@ -5,13 +5,15 @@ import logging
 import math
 import os
 import time
+from collections import deque
 
 import pygame
 
 from shared.map_data import GameMap
 from shared.sector_map import MAP_FORMAT_SECTOR, SectorMap
 from shared.combat import (
-    wpn_cooldown_ticks, TICK_INTERVAL, FPS_60, TAU, normalize_angle)
+    wpn_cooldown_ticks, TICK_INTERVAL, FPS_60, TAU, normalize_angle,
+    FIRE_REASON_CODES)
 from shared.protocol import INPUT_FLAG_DASH
 from client.raycaster import SCREEN_WIDTH, SCREEN_HEIGHT
 from client.renderer import Renderer
@@ -33,6 +35,16 @@ from client.updater import UpdateError, apply_update, default_releases_dir, rest
 logger = logging.getLogger(__name__)
 
 UPDATE_TIMEOUT = 30.0
+# How long a press stays queued while it waits for a gate opening: every press
+# is owed a shot, so the bound must cover a real burst (a 3 s wait is ten pistol
+# gates) and not just one. It still bounds the queue, so a stall (alt-tab, one
+# very long frame) cannot turn into an unbounded burst afterwards, and it keeps
+# a press the player has clearly moved on from from being fired minutes later.
+FIRE_INTENT_MAX_AGE = 3.0
+# The one refusal that does NOT consume the player's press: the weapon was still
+# hot, so the intent lost a race with the server's tick phase rather than being
+# declined. It is re-queued and paced by the server's own remaining cooldown.
+FIRE_REASON_COOLDOWN = FIRE_REASON_CODES['cooldown']
 
 
 def _angle_diff(a: float, b: float) -> float:
@@ -119,11 +131,16 @@ class GameClient:
         # Time-based cooldown gate (shared tick tempo + one tick slack) so a
         # shown shot is never rejected by the server's cooldown.
         self._next_fire_time: float = 0.0
-        # A click is a one-shot intent and lives exactly one frame, so a press
-        # landing inside a closed gate would be gone by the next opening. It is
-        # latched here and consumed once at the next opening, exactly like the
-        # dash edge below.
-        self._fire_intent_pending: bool = False
+        # A click is a one-shot intent and lives exactly one frame, so presses
+        # landing inside a closed gate would be gone by the next opening. They
+        # are latched here as a QUEUE, one entry per press, and consumed one per
+        # gate opening: a single latch flag collapsed every press of a fast
+        # clicker into one shot ("fires one click in ten"), while a queue makes
+        # each press fire exactly once, still limited by the weapon's tempo.
+        self._fire_press_queue: deque[float] = deque()
+        # Timestamp of the press the last sent intent was made from, so a
+        # cooldown refusal can hand that same press back to the queue.
+        self._fire_served_press_time: float | None = None
         # Authoritative fire decision from the snapshot: the last accepted fire
         # intent the server acknowledged, and the cooldown it reports. The
         # weapon animation is driven from these, not from the key press.
@@ -712,6 +729,7 @@ class GameClient:
         self.local_state = 0
         self._paused = False
         self._pause_bg = None
+        self._fire_press_queue.clear()
         self.input_handler.unlock_mouse()
         logger.info("Выход в меню")
 
@@ -792,6 +810,8 @@ class GameClient:
           is cut.  Reason is what makes this safe: an unchanged ``fire_seq`` on
           its own is ambiguous between "refused" and "the ack is still in
           flight", and cutting on the latter would truncate a real shot.
+          A ``cooldown`` refusal is the exception: the weapon was still hot, so
+          the press was not spent — it goes back into the queue.
         * neither -> nothing decided yet, the prediction is left alone.
         """
         self._server_fire_ready = fire_ready
@@ -803,6 +823,7 @@ class GameClient:
             self._fire_undecided = max(
                 0, self._fire_undecided - (fire_seq - self._server_fire_seq))
             self._server_fire_seq = fire_seq
+            self._fire_served_press_time = None
             if fire_ready <= 0:
                 return
             # A confirmation for the weapon the player already swapped away
@@ -820,6 +841,22 @@ class GameClient:
             self._fire_undecided -= 1
             self._fire_anim_until = 0.0
             self._fire_anim_wpn = -1
+            if fire_reason == FIRE_REASON_COOLDOWN:
+                # The client's gate and the server's tick are independent clocks,
+                # so one tick of slack does not always win the race: with real
+                # network jitter an intent arrives while the weapon is still hot.
+                # That press is not spent, so it is handed back with its ORIGINAL
+                # timestamp — a fresh one would make an endlessly refused press
+                # immortal — and the server's remaining cooldown moves the gate so
+                # the retry does not race the same tick again.
+                served = self._fire_served_press_time
+                self._fire_served_press_time = None
+                if served is not None:
+                    self._fire_press_queue.appendleft(served)
+                if fire_ready > 0:
+                    self._next_fire_time = max(
+                        self._next_fire_time,
+                        now + (fire_ready + 1) * TICK_INTERVAL)
 
     def _process_input(self) -> None:
         self.input_handler.update()
@@ -836,27 +873,49 @@ class GameClient:
         # one tick of slack, so the client never fires faster than the server
         # allows and a shown shot is never rejected by the server's cooldown.
         #
-        # The press edge is latched BEFORE the gate is consulted: the edge is
-        # rebuilt by InputHandler.update() on every frame, so a click inside a
-        # closed gate would otherwise be gone by the next opening — that is the
-        # "every other click does nothing" defect.
+        # The tempo comes from the weapon the SERVER has equipped
+        # (``local_weapon``, rewritten by every snapshot), never from the locally
+        # selected id. The two are not the same thing: the server honours
+        # apply_weapon_switch only for weapons the player owns and picks up
+        # weapons itself, so a gate built from the local id rate-limits against
+        # a weapon the server never fires with. Gating on the SSG's 1.30 s while
+        # the pistol is equipped swallows every press but one in four ("pressed
+        # at the cooldown, no shot"), and gating on the pistol's 0.30 s while the
+        # SSG is equipped gets 3 intents in 4 refused as cooldown, so the
+        # predicted recoil is cut and no shot is shown at all.
+        #
+        # Each press is latched as its own queue entry, served one per opening:
+        # the edge is rebuilt by InputHandler.update() every frame, so a press
+        # inside a closed gate would be gone by the next opening (a single latch
+        # flag kept only the FIRST press of a burst and dropped the rest, which
+        # is "one shot per ten clicks"). The queue makes every press fire
+        # exactly once, still at the weapon's real rate.
         if self.input_handler.shoot_pressed:
-            self._fire_intent_pending = True
+            self._fire_press_queue.append(now)
+        stale_before = now - FIRE_INTENT_MAX_AGE
+        while self._fire_press_queue and self._fire_press_queue[0] < stale_before:
+            self._fire_press_queue.popleft()
 
         wpn = self.input_handler.weapon_id
-        if 0 <= wpn < len(WPN):
-            info = WPN[wpn]
+        fired_wpn = self.local_weapon if 0 <= self.local_weapon < len(WPN) else wpn
+        if 0 <= fired_wpn < len(WPN):
+            info = WPN[fired_wpn]
             if (
                 now >= self._next_fire_time
-                and (self.input_handler.shoot or self._fire_intent_pending)
+                and (self.input_handler.shoot or self._fire_press_queue)
             ):
                 ticks = wpn_cooldown_ticks(int(info['f']))
                 # The +1 tick of slack belongs to the gate only: the animation
                 # must show the real cooldown, so it gets none.
                 self._next_fire_time = now + ticks * TICK_INTERVAL + TICK_INTERVAL
                 self._fire_anim_until = now + ticks * TICK_INTERVAL
-                self._fire_anim_wpn = wpn
-                self._fire_intent_pending = False
+                self._fire_anim_wpn = fired_wpn
+                # One queue entry is served per opening. A held button has no
+                # entry: it re-opens the gate by itself every time.
+                if self._fire_press_queue:
+                    self._fire_served_press_time = self._fire_press_queue.popleft()
+                else:
+                    self._fire_served_press_time = None
                 # The reliable FIRE is the single path to a shot, so every gate
                 # opening sends an intent — held fire included. Ammo is not
                 # checked here on purpose: the server is the only authority and
@@ -866,8 +925,9 @@ class GameClient:
                 self.network.send_fire(wpn)
 
         # A weapon switch drops the running animation: the other gun's recoil
-        # must not keep playing (and counting down) on the new one.
-        if self._fire_anim_wpn != -1 and self._fire_anim_wpn != wpn:
+        # must not keep playing (and counting down) on the new one. The owner is
+        # the server's weapon, the same id _sync_fire_anim confirms against.
+        if self._fire_anim_wpn != -1 and self._fire_anim_wpn != fired_wpn:
             self._fire_anim_until = 0.0
             self._fire_anim_wpn = -1
 

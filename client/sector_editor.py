@@ -820,17 +820,6 @@ class SectorEditor:
         t = max(0.0, min(1.0, t))
         return t, math.hypot(x - (v1.x + t * dx), y - (v1.y + t * dy))
 
-    def _nearest_stair_line(self, x: float, y: float) -> tuple[int, float] | None:
-        """Closest linedef within ``STAIR_POINT_TOL``, as ``(index, t)``."""
-        best: tuple[float, int, float] | None = None
-        for li in range(len(self.lines)):
-            hit = self._line_param(li, x, y)
-            if hit is None or hit[1] > STAIR_POINT_TOL:
-                continue
-            if best is None or hit[1] < best[0]:
-                best = (hit[1], li, hit[0])
-        return None if best is None else (best[1], best[2])
-
     def _nearest_stair_hit(self, x: float, y: float):
         """``(linedef, t, snapped point)`` for the wall nearest a raw click.
 
@@ -1064,8 +1053,10 @@ class SectorEditor:
             return None, [f"лестница: ступень {bad[0] - first} не замкнулась "
                           "в контур — откат"]
         return {"steps": n, "rise": plan["max_rise"], "sectors": list(
-            range(first, len(self.sectors))), "rails_open": (
-                not solid_rails and any(self.lines[li].back >= 0 for li in rails))}, []
+            range(first, len(self.sectors))), "low": plan["low"],
+            "high": plan["high"], "rails_open": (
+                not solid_rails
+                and any(self.lines[li].back >= 0 for li in rails))}, []
 
     def _stair_vertex(self, x: float, y: float) -> int:
         self.verts.append(Vertex(x, y))
@@ -1096,17 +1087,13 @@ class SectorEditor:
         before = self.sm.to_json()
         self.begin_batch()
         try:
-            info, errs = self._stair_piece(plan, solid_rails=False)
+            info, errs = self._stair_attempt(plan, before, solid_rails=False)
             if errs:
                 # Retry with solid rails: the open rails are chords of the
                 # neighbouring sector and may have eaten its contour.  Solid
                 # rails touch nobody, so if THIS fails the staircase is not
                 # placeable here and the map is restored untouched.
-                self._stair_rollback(before)
-                info, errs = self._stair_piece(plan, solid_rails=True)
-                if errs:
-                    self._stair_rollback(before)
-                    info = None
+                info, errs = self._stair_attempt(plan, before, solid_rails=True)
         finally:
             self.end_batch()
         if errs:
@@ -1114,6 +1101,24 @@ class SectorEditor:
         self._after_mutate()
         info["solid_rails"] = not info["rails_open"]
         return info, []
+
+    def _stair_attempt(self, plan: dict, before: dict, solid_rails: bool):
+        """One build attempt, rolled back to ``before`` however it ends.
+
+        The rollback is in a ``finally`` rather than on the error paths only:
+        ``_split_span`` raises on a point that is not on its line, and an
+        exception escaping the history batch would let ``end_batch`` record the
+        half-built staircase as a real, undoable edit -- the one outcome this
+        tool must never produce.
+        """
+        try:
+            info, errs = self._stair_piece(plan, solid_rails=solid_rails)
+            if errs:
+                self._stair_rollback(before)
+            return info, errs
+        except ValueError as exc:
+            self._stair_rollback(before)
+            return None, [str(exc)]
 
     def _stair_rollback(self, snapshot: dict) -> None:
         """Restore the working map to ``snapshot`` without touching history.
@@ -1179,14 +1184,27 @@ class SectorEditor:
         if steps > STAIR_MAX_STEPS:
             return None, [f"лестница: {steps} ступеней больше предела "
                           f"{STAIR_MAX_STEPS} — проверьте точки"]
-        # Round every step to the SAME grid the editor snaps to, so a chain of
-        # risers lands on the author's grid instead of on 3.7-pixel offsets,
-        # and force the last tread onto the upper sector's floor: ceil() can
-        # leave one unit short, which would leave the top tread a step short
-        # of the room it leads into.
-        floors = [int(round(a.floor_h + delta * (i + 1) / steps / GRID_DEFAULT))
-                  * GRID_DEFAULT for i in range(steps)]
-        floors[-1] = int(b.floor_h)
+        # Treads interpolate between the two room floors, and the phase is anchored on
+        # the UPPER room -- the tread next to it IS that room's floor.  Anchoring
+        # on the upper room is also what makes the result independent of which
+        # wall the author clicked first: the first two clicks pick the pairing,
+        # but they must not be able to shift every tread by one step.
+        #
+        # The heights are NOT snapped to the editor grid.  That grid governs
+        # 2D vertex positions; a floor height is free, and snapping it would
+        # quietly break the STEP_HEIGHT guarantee the whole tool exists for --
+        # a 64-unit gap over 3 steps wants treads at 21/43/64, and rounding
+        # those to the grid yields 16/48/64, i.e. a 32-unit riser that is a
+        # wall, not a step.
+        delta = int(b.floor_h) - int(a.floor_h)
+        ascending = delta >= 0
+        base_h = int(a.floor_h)
+        # frac runs 1/n..1 towards the upper room, whichever end that is, so
+        # the tread adjacent to the upper room lands exactly on its floor and
+        # the tread adjacent to the lower room is one riser up from its floor
+        floors = [base_h + int(round(delta * ((i + 1) / steps if ascending
+                                              else i / steps)))
+                  for i in range(steps)]
         base = int(a.floor_h)
         max_rise = max(abs(floors[i] - (base if i == 0 else floors[i - 1]))
                        for i in range(len(floors)))

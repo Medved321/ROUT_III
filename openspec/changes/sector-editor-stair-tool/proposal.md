@@ -60,8 +60,14 @@
   откатом при нарушении замкнутости контуров.
 
 > Capability объявлена как **Modified** (требование правится по отношению к
-> pending-change `advanced-sector-editor`, который её и вводит). Поэтому этот
-> change SHALL архивироваться **после** `advanced-sector-editor`.
+> pending-change `advanced-sector-editor`, который её и вводит). Дельта собрана
+> по последней редакции того же требования, поэтому этот change SHALL
+> архивироваться **после** `advanced-sector-editor`,
+> `sector-editor-delete-entities` и `sector-steps-and-solid-walls`: все три
+> правят `editor/sector-editor` (первый вводит capability, остальные добавляют к
+> ней `MODIFIED`-требования), и архивация раньше потеряла бы часть накопленных
+> правок. Проверено: `openspec validate` для этого change отказывает архивацию
+> с «target spec does not exist», пока `advanced-sector-editor` не применён.
 
 ## Impact
 

@@ -800,6 +800,7 @@ class SectorEditorScreen:
         try:
             sm = text_map.load(path, validate=False)
             self.editor = SectorEditor(sm)
+            self._reset_tool_state()
             self._set_sel()
             self.frame_around()
         except Exception as exc:
@@ -824,6 +825,7 @@ class SectorEditorScreen:
             return
         try:
             self.editor = SectorEditor(self.editor.sm.__class__.load(path))
+            self._reset_tool_state()
             self._set_sel()
             self.status = f"Загружено: {shown}"
             self.frame_around()
@@ -960,6 +962,40 @@ class SectorEditorScreen:
             txt = self.tiny_font.render(
                 f"Контур: {len(self.contour)} рёбер (Enter — создать)", True, CYAN)
             surface.blit(txt, (rect.x + 8, rect.y + 8))
+        if self.tool == "stair" and self.stair_pts:
+            self._draw_stair_preview(surface)
+
+    def _draw_stair_preview(self, surface) -> None:
+        """Show the collected points and pair them up before the build.
+
+        The two points already collected on one wall are joined, because that
+        pairing is the only thing the build is going to try: without the
+        rubber band the author cannot see WHICH wall a third click is being
+        added to, and a mistyped click is only discovered when all four are in.
+        """
+        rect = self.canvas
+        pts = list(self.stair_pts)
+        hover = self._mouse_world()
+        if hover is not None:
+            pts.append(hover)
+        scr_pts = [self._to_screen(x, y) for x, y in pts]
+        for i in range(0, len(pts) - 1, 2):
+            a, b = scr_pts[i], scr_pts[i + 1]
+            pygame.draw.line(surface, CYAN, a, b, 1)
+            for sx, sy in (a, b):
+                pygame.draw.circle(surface, CYAN, (sx, sy), 3)
+        if len(scr_pts) % 2 == 1:      # a lone point waiting for its partner
+            pygame.draw.circle(surface, MUTED, scr_pts[-1], 3)
+        txt = self.tiny_font.render(
+            f"Лестница: {len(self.stair_pts)}/4 точек "
+            f"(подъём {self.stair_rise}, Esc — сброс)", True, CYAN)
+        surface.blit(txt, (rect.x + 8, rect.y + 8))
+
+    def _mouse_world(self) -> tuple[float, float] | None:
+        """Cursor in world coordinates, or ``None`` when it left the canvas."""
+        if not self.canvas.collidepoint(pygame.mouse.get_pos()):
+            return None
+        return self._to_world(*pygame.mouse.get_pos())
 
     def _render_base(self, surf) -> None:
         z = self.zoom
@@ -1154,7 +1190,8 @@ class SectorEditorScreen:
                     self._fit(name, rect.width - 4), True, TEXT)
                 surface.blit(txt, (rect.x + 2, rect.y + 1))
         hint = self.tiny_font.render(
-            "1-5 — инструменты | G — сетка | F — кадр | F5 — играть", True, MUTED)
+            f"1-{len(TOOL_NAMES)} — инструменты | G — сетка | F — кадр | "
+            "F5 — играть", True, MUTED)
         surface.blit(hint, (x, self._hint_y))
         hint2 = self.tiny_font.render("CTRL+Z/Y отмена/повтор | ESC назад", True, MUTED)
         surface.blit(hint2, (x, self._hint_y + 14))

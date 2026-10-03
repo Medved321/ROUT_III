@@ -1,11 +1,14 @@
 """smoke_fire_intent.py — детерминированные проверки единственного пути выстрела.
 
 Покрытие (openspec changes/fire-intent-single-path):
-  1.1  фронт нажатия не теряется в закрытых вратах темпа (отдача была, выстрела нет)
+  1.1  фронт нажатия не терается в закрытых вратах темпа (отдача была, выстрела нет)
   1.2  PLAYER_INPUT не создаёт выстрел на сервере (единственный путь — FIRE)
   1.3  клики быстрее кулдауна: ровно одно открытие врат -> ровно один выстрел
   1.4  решение сервера доезжает в снимке мира (fire_seq + число тиков)
   1.5  клиент берёт таймер оружия из серверного решения, а не из своего нажатия
+  1.6  темп врат считается по оружию СЕРВЕРА, а не по локально выбранному
+  1.7  очередь нажатий: каждое нажатие = свой выстрел, ничего не схлопывается
+  1.8  отказ по cooldown возвращает нажатие в очередь (остальные отказы — нет)
 
 Сценарии детерминированные: без UDP, без pygame-окна, без живого сервера.
 
@@ -19,10 +22,13 @@ Baseline до правки (зафиксировано, чтобы отлича�
 """
 from __future__ import annotations
 
+from collections import deque
+
 from shared.combat import wpn_cooldown_ticks, TICK_INTERVAL
 
 PISTOL = 1          # f=16 -> 5 тиков -> врата 0.30 с
 RIFLE = 3           # f=8  -> 3 тика  -> врата 0.20 с
+SSG = 5             # f=75 -> 25 тиков -> врата 1.30 с
 
 
 def _gate_seconds(weapon_id: int) -> float:
@@ -92,7 +98,8 @@ def _client_stub(ammo: int = 200, weapon_id: int = PISTOL):
     c._next_fire_time = 0.0
     c._fire_anim_until = 0.0
     c._fire_anim_wpn = -1
-    c._fire_intent_pending = False
+    c._fire_press_queue = deque()
+    c._fire_served_press_time = None
     c._fire_undecided = 0
     c._server_fire_seq = 0
     c._server_fire_ready = 0
@@ -475,7 +482,6 @@ def test_recoil_follows_server_decision():
     c._fire_anim_wpn = -1
 
     # предсказание по интенту: отдача стартует сразу (так ощущается оружие)
-    c._fire_intent_pending = True
     _run_frames(c, clock, [(now, True, True)])
     assert c._fire_anim_until > now, c._fire_anim_until
     assert c._fire_undecided == 1, c._fire_undecided
@@ -538,7 +544,7 @@ def test_in_flight_intent_is_not_mistaken_for_refusal():
     c.local_weapon = 1
 
     # выстрел принят, отдача идёт
-    c._fire_intent_pending = True
+    c._fire_press_queue.append(now)
     _run_frames(c, clock, [(now, True, True)])
     c._sync_fire_anim(1, 4, 0, 1, now + 0.01)
     running = c._fire_anim_until
@@ -558,6 +564,168 @@ def test_in_flight_intent_is_not_mistaken_for_refusal():
     print("1.5 an in-flight intent does not cancel a real shot OK")
 
 
+def test_gate_tempo_follows_the_server_weapon():
+    """1.6 Темп врат — по оружию сервера, а не по локально выбранному.
+
+    Локальный выбор — только запрос на смену: сервер применяет его лишь для
+    оружия, которым игрок владеет, и сам выдаёт оружие при подборе. Если врата
+    считать по локальному id, клиент ограничивает темп чужим стволом: SSG
+    (врата 1.30 с) при пистолете на сервере съедает 3 нажатия из 4 — «нажимал по
+    кулдауну, выстрела не было». Обратный рассинхрон (пистолет локально, SSG на
+    сервере) даёт отказы по cooldown и срезанную отдачу.
+    """
+    c = _client_stub()
+    clock = _Clock()
+    c.input_handler.weapon_id = SSG      # игрок выбрал SSG локально...
+    c.local_weapon = PISTOL              # ...а сервер держит пистолет
+    fast_gate = _gate_seconds(PISTOL)
+
+    # 6 нажатий с интервалом 0.05 с: при пистолетных вратах каждое открытие
+    # пропускает их, при SSG-вратах (1.30 с) прошло бы 3 интента из 6.
+    # Кадры открытий считаются от времени ПРЕДЫДУЩЕГО кадра, а не от номинала:
+    # срок врат накапливает float-ошибку и стоит на 1 ulp выше сетки.
+    frames = [(0.10 + 0.05 * i, True, True) for i in range(6)]
+    t = 0.10 + fast_gate + 0.01
+    for _ in range(5):
+        frames.append((t, False, False))
+        t += fast_gate + 0.01
+    _run_frames(c, clock, frames)
+    assert len(c.network.fires) == 6, c.network.fires
+    # и ни один нажатый ствол не подменился: в FIRE уходит локальный выбор
+    assert c.network.fires[0] == SSG, c.network.fires
+
+    # Обратный рассинхрон: локально пистолет, на сервере SSG. Врата обязаны
+    # стать длинными, иначе интенты сыплются в отказ по cooldown.
+    c2 = _client_stub()
+    c2.input_handler.weapon_id = PISTOL
+    c2.local_weapon = SSG
+    clock2 = _Clock()
+    _run_frames(c2, clock2, [(0.10, True, True), (0.40, True, True)])
+    assert len(c2.network.fires) == 1, c2.network.fires
+    slow_gate = _gate_seconds(SSG)
+    _run_frames(c2, clock2, [(0.10 + slow_gate + 0.01, False, False)])
+    assert len(c2.network.fires) == 2, c2.network.fires
+    print("1.6 gate tempo follows the server's weapon OK")
+
+
+def test_every_press_gets_its_own_shot():
+    """1.7 Очередь нажатий: каждое нажатие = свой выстрел.
+
+    Было: одна защёлка на всё окно, поэтому из десяти нажатий в закрытых вратах
+    выстрел был один — «стреляет раз в 10 нажатий». Теперь у каждого нажатия
+    своя запись, и каждое открытие врат отдаёт ровно одно.
+    """
+    c = _client_stub()
+    clock = _Clock()
+    gate = _gate_seconds(PISTOL)
+    presses = 10
+
+    # десять нажатий за 0.2 с — все в первом закрытом окне врат
+    _run_frames(c, clock, [(0.05 + 0.02 * i, True, True) for i in range(presses)])
+    assert len(c.network.fires) == 1, c.network.fires
+    # девять нажатий ждут своей очереди, а не схлопнулись в один флаг
+    assert len(c._fire_press_queue) == presses - 1, len(c._fire_press_queue)
+
+    # каждое следующее открытие отдаёт ровно один отложенный выстрел
+    t = 0.05 + gate + 0.01
+    for k in range(1, presses):
+        _run_frames(c, clock, [(t, False, False)])
+        assert len(c.network.fires) == k + 1, (k, c.network.fires)
+        t += gate + 0.01
+    assert len(c.network.fires) == presses, c.network.fires
+
+    # очередь пуста, лишних выстрелов не появится
+    _run_frames(c, clock, [(t, False, False)])
+    assert len(c.network.fires) == presses, c.network.fires
+    print("1.7 every press fires once, queue is not coalesced OK")
+
+
+def test_stale_presses_do_not_burst():
+    """1.7 Давно нажатое не превращается в залп после фриза."""
+    from client.client import FIRE_INTENT_MAX_AGE
+
+    c = _client_stub()
+    clock = _Clock()
+    gate = _gate_seconds(PISTOL)
+
+    # нажатия копятся, потом клиент подвисает (alt-tab / длинный кадр)
+    _run_frames(c, clock, [(0.05 + 0.02 * i, True, True) for i in range(8)])
+    assert len(c.network.fires) == 1, c.network.fires
+    assert len(c._fire_press_queue) == 7, len(c._fire_press_queue)
+
+    last_press = 0.05 + 0.02 * 7
+    stale = last_press + FIRE_INTENT_MAX_AGE + 0.05
+    _run_frames(c, clock, [(stale, False, False)])
+    assert len(c._fire_press_queue) == 0, len(c._fire_press_queue)
+    # и залпа нет: следующее открытие врат не имеет ничего обслуживать
+    _run_frames(c, clock, [(stale + gate + 0.01, False, False)])
+    assert len(c.network.fires) == 1, c.network.fires
+    print("1.7 stale presses do not burst after a stall OK")
+
+
+def test_cooldown_refusal_returns_the_press():
+    """1.8 Отказ по cooldown возвращает нажатие; остальные отказы — нет.
+
+    Врата клиента и тики сервера — независимые часы, и запаса в один тик при
+    реальном джиттере не хватает: интент приходит, пока ствол горячий. Нажатие
+    не потрачено, поэтому оно возвращается в очередь и повторяется на
+    открытии, отодвинутом серверным остатком кулдауна. Отказ по патронам — это
+    решение, нажатие расходуется.
+    """
+    from shared.combat import fire_reason_code
+
+    c = _client_stub()
+    clock = _Clock()
+    gate = _gate_seconds(PISTOL)
+
+    _run_frames(c, clock, [(0.10, True, True)])
+    assert len(c.network.fires) == 1
+    served = c._fire_served_press_time
+    assert served is not None, "интент должен помнить своё нажатие"
+
+    # сервер отказал: ствол был горячий, и остаток кулдауна больше локальных врат
+    c._sync_fire_anim(0, 8, fire_reason_code('cooldown'), PISTOL, 0.11)
+    assert len(c._fire_press_queue) == 1, len(c._fire_press_queue)
+    assert c._fire_press_queue[0] == served, "нажатие возвращено с исходным штампом"
+    assert c._fire_undecided == 0, c._fire_undecided
+    assert c._fire_anim_until == 0.0, c._fire_anim_until
+
+    # остаток кулдауна отодвинул врата, поэтому мгновенный повтор не бьёт снова
+    ready_gate = 0.11 + (8 + 1) * TICK_INTERVAL
+    assert c._next_fire_time == ready_gate, (c._next_fire_time, ready_gate)
+    _run_frames(c, clock, [(0.10 + gate + 0.01, False, False)])
+    assert len(c.network.fires) == 1, "повтор ушёл в горячий ствол"
+    _run_frames(c, clock, [(ready_gate + 0.01, False, False)])
+    assert len(c.network.fires) == 2, c.network.fires
+    assert c._fire_served_press_time == served
+
+    # локальный срок позже серверного — остаётся локальный (max, а не min)
+    refusal_now = ready_gate + 0.02
+    c._sync_fire_anim(1, 1, fire_reason_code('cooldown'), PISTOL, refusal_now)
+    implied = refusal_now + 2 * TICK_INTERVAL
+    local = ready_gate + 0.01 + gate
+    assert c._next_fire_time >= implied, (c._next_fire_time, implied)
+    assert abs(c._next_fire_time - local) < 1e-9, (c._next_fire_time, local)
+
+    # отказ по патронам нажатие не возвращает
+    t = ready_gate + 0.01 + gate + 0.01
+    _run_frames(c, clock, [(t, True, True)])
+    assert len(c.network.fires) == 3, c.network.fires
+    c._sync_fire_anim(1, 3, fire_reason_code('no_ammo'), PISTOL, t + 0.01)
+    assert len(c._fire_press_queue) == 0, len(c._fire_press_queue)
+
+    # вечно отклоняемое нажатие не бессмертно: штамп стареет и оно уходит
+    from client.client import FIRE_INTENT_MAX_AGE
+
+    t += gate + 0.01
+    _run_frames(c, clock, [(t, True, True)])
+    c._sync_fire_anim(1, 3, fire_reason_code('cooldown'), PISTOL, t + 0.01)
+    assert len(c._fire_press_queue) == 1, len(c._fire_press_queue)
+    _run_frames(c, clock, [(t + FIRE_INTENT_MAX_AGE + 0.06, False, False)])
+    assert len(c._fire_press_queue) == 0, len(c._fire_press_queue)
+    print("1.8 a cooldown refusal re-queues the press, others consume it OK")
+
+
 if __name__ == '__main__':
     test_client_edge_survives_closed_gate()
     test_client_held_fire_sends_every_gate()
@@ -571,4 +739,8 @@ if __name__ == '__main__':
     test_local_weapon_timer_comes_from_server()
     test_recoil_follows_server_decision()
     test_in_flight_intent_is_not_mistaken_for_refusal()
+    test_gate_tempo_follows_the_server_weapon()
+    test_every_press_gets_its_own_shot()
+    test_stale_presses_do_not_burst()
+    test_cooldown_refusal_returns_the_press()
     print("ALL FIRE INTENT SMOKE TESTS PASSED")
