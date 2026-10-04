@@ -35,15 +35,13 @@ from client.updater import UpdateError, apply_update, default_releases_dir, rest
 logger = logging.getLogger(__name__)
 
 UPDATE_TIMEOUT = 30.0
-# How long a press stays queued while it waits for a gate opening: every press
-# is owed a shot, so the bound must cover a real burst (a 3 s wait is ten pistol
-# gates) and not just one. It still bounds the queue, so a stall (alt-tab, one
-# very long frame) cannot turn into an unbounded burst afterwards, and it keeps
-# a press the player has clearly moved on from from being fired minutes later.
-FIRE_INTENT_MAX_AGE = 3.0
-# The one refusal that does NOT consume the player's press: the weapon was still
-# hot, so the intent lost a race with the server's tick phase rather than being
-# declined. It is re-queued and paced by the server's own remaining cooldown.
+# The client's fire pace comes from the server's own tick cooldown plus one tick
+# of slack, so an intent is sent on a gate opening only — and only while the
+# button is actually down. A click that lands on a closed gate is eaten, the way
+# a hot weapon eats a click in any shooter: there is no queue of pending shots,
+# so nothing can grow with the click rate and nothing fires minutes after the
+# player let go (the SSG's 1.30 s gate against a 10 Hz clicker used to queue ~39
+# shots for three seconds).
 FIRE_REASON_COOLDOWN = FIRE_REASON_CODES['cooldown']
 
 
@@ -131,26 +129,31 @@ class GameClient:
         # Time-based cooldown gate (shared tick tempo + one tick slack) so a
         # shown shot is never rejected by the server's cooldown.
         self._next_fire_time: float = 0.0
-        # A click is a one-shot intent and lives exactly one frame, so presses
-        # landing inside a closed gate would be gone by the next opening. They
-        # are latched here as a QUEUE, one entry per press, and consumed one per
-        # gate opening: a single latch flag collapsed every press of a fast
-        # clicker into one shot ("fires one click in ten"), while a queue makes
-        # each press fire exactly once, still limited by the weapon's tempo.
-        self._fire_press_queue: deque[float] = deque()
-        # Timestamp of the press the last sent intent was made from, so a
-        # cooldown refusal can hand that same press back to the queue.
-        self._fire_served_press_time: float | None = None
+        # A click that lands on a closed gate is remembered for exactly one
+        # opening — no more. It is a bool and not a queue on purpose: a queue
+        # grows with the click rate and drains at the weapon's rate, so a slow
+        # weapon (SSG, 1.30 s) turns a three-second burst into ~39 shots fired
+        # long after the player let go. One buffered press keeps every click
+        # meaningful on a weapon whose gate is longer than the click interval
+        # (the shotgun's gate is 0.90 s, i.e. ~9 clicks at 10 Hz) and still has
+        # nothing that can accumulate. Held fire never needs it: holding is one
+        # intent per opening, which is auto-fire at the weapon's real rate.
+        self._fire_press_buffered: bool = False
+        #
+        # Sent intents the server has not decided yet, oldest first: just their
+        # own fire_seq. The server's decision is addressed to ONE of them, so
+        # they have to be kept apart: the snapshot repeats the same
+        # (fire_seq, fire_reason) pair in every tick until the next intent is
+        # decided, and a decision must be spent on its own intent, never on
+        # whatever is newest at the time. Order is the reliable channel's
+        # delivery order, which is what makes the attribution in
+        # _sync_fire_anim unambiguous.
+        self._fire_pending: deque[int] = deque()
         # Authoritative fire decision from the snapshot: the last accepted fire
         # intent the server acknowledged, and the cooldown it reports. The
         # weapon animation is driven from these, not from the key press.
         self._server_fire_seq: int = 0
         self._server_fire_ready: int = 0
-        # Intents sent but not yet answered by the server. ``fire_seq`` counts
-        # accepted intents, so this is the gap between what was sent and what
-        # came back — the client cannot call a shot refused before the server
-        # has actually decided it.
-        self._fire_undecided: int = 0
         # Dash intent is a one-shot pulse waiting for the next input packet.
         self._dash_pending: bool = False
         self._server_angle: float | None = None
@@ -411,6 +414,16 @@ class GameClient:
                     if event.key in (pygame.K_n, pygame.K_ESCAPE):
                         self._remember_skipped(offer.version)
                         return False
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    me = self._menu_events([event])
+                    if me:
+                        ev = me[0]
+                        mx, my = ev.pos
+                        if 40 <= mx <= 200 and 170 <= my <= 190:
+                            return True
+                        if 200 <= mx <= 300 and 170 <= my <= 190:
+                            self._remember_skipped(offer.version)
+                            return False
             ui = self.renderer.ui
             ui.fill((12, 12, 24))
             title = self.renderer.hud_font.render("Доступно обновление", True, (240, 240, 120))
@@ -436,13 +449,14 @@ class GameClient:
             for event in events:
                 if event.type == pygame.QUIT:
                     self.running = False
+            mevents = self._menu_events(events)
             self._apply_resizes(events)
 
             self.lobby_screen.set_state(
                 self.network.party_list,
                 self.network.last_error or "Выберите партию или создайте новую",
             )
-            action = self.lobby_screen.handle(self._menu_events(events))
+            action = self.lobby_screen.handle(mevents)
             if action == "create":
                 name = self.lobby_screen.player_name or "Player"
                 mode = self.lobby_screen.create_mode
@@ -499,9 +513,10 @@ class GameClient:
             for event in events:
                 if event.type == pygame.QUIT:
                     self.running = False
+            mevents = self._menu_events(events)
             self._apply_resizes(events)
             screen = self._active_editor
-            action = screen.handle(self._menu_events(events))
+            action = screen.handle(mevents)
             if action == "back":
                 self._ui = "lobby"
                 return
@@ -537,17 +552,19 @@ class GameClient:
             for event in events:
                 if event.type == pygame.QUIT:
                     self.running = False
+            mevents = self._menu_events(events)
             # The drag is applied immediately (once, the last size of the frame);
             # the screen itself keeps its fixed 1000x700 layout. The new size is
             # only recorded in memory here -- a drag fires dozens of events per
             # second and each ``save()`` is a disk write. Leaving the screen
             # (Esc / Назад) persists it.
-            if self._apply_resizes(events):
+            resized = self._apply_resizes(events)
+            if resized:
                 self.settings.set(
                     "window_size",
                     size_text(*self.renderer.window_size),
                 )
-            if self.settings_screen.handle(self._menu_events(events), self.settings) == "back":
+            if self.settings_screen.handle(mevents, self.settings) == "back":
                 self.settings.apply_runtime(self.input_handler)
                 self.fps_cap = int(self.settings.get("fps_cap"))
                 # Re-sync the adaptive adapter with the freshly applied config
@@ -643,9 +660,6 @@ class GameClient:
         # never lost between two 25 Hz sends, and consume the edge itself so
         # one press yields exactly one packet. The server stays authoritative
         # over duration and cooldown and ignores duplicates anyway.
-        if self.input_handler.dash_pressed:
-            self.input_handler.dash_pressed = False
-            self._dash_pending = True
         flags = INPUT_FLAG_DASH if self._dash_pending else 0
         self._dash_pending = False
         return (
@@ -712,6 +726,7 @@ class GameClient:
     def _exit_pause(self) -> None:
         self._paused = False
         self._pause_bg = None
+        self._dash_pending = False
         self.input_handler.lock_mouse()
         self.input_handler.reset_mouse_position()
         pygame.event.clear()
@@ -729,7 +744,13 @@ class GameClient:
         self.local_state = 0
         self._paused = False
         self._pause_bg = None
-        self._fire_press_queue.clear()
+        # A remembered press died with the party: it was meant for a weapon in
+        # a world that no longer exists.
+        self._fire_press_buffered = False
+        # The pending intents died with the party: their decisions will never
+        # arrive, so they must not be carried into the next one.
+        self._fire_pending.clear()
+        self._dash_pending = False
         self.input_handler.unlock_mouse()
         logger.info("Выход в меню")
 
@@ -739,12 +760,13 @@ class GameClient:
             if event.type == pygame.QUIT:
                 self.running = False
                 return
+        mevents = self._menu_events(events)
         if self._apply_resizes(events):
             # The frozen frame was captured for the old window; re-grab it so the
             # pause backdrop keeps filling the new one.
             self._pause_bg = self.renderer.capture_menu_frame()
 
-        action = self.pause_screen.handle(self._menu_events(events))
+        action = self.pause_screen.handle(mevents)
         if action == "resume":
             self._exit_pause()
             return
@@ -769,6 +791,17 @@ class GameClient:
         pygame.display.flip()
         self.renderer.clock.tick(self.fps_cap)
         await asyncio.sleep(0.005)
+
+    @property
+    def _fire_undecided(self) -> int:
+        """Intents sent but not yet decided by the server.
+
+        Read-only and derived from ``_fire_pending`` on purpose: a separate
+        counter could drift from the intents it counts, and the drift showed up
+        as a server decision charged to the wrong intent (a real shot losing its
+        recoil mid-animation).
+        """
+        return len(self._fire_pending)
 
     def _fire_anim_frames(self, now: float) -> int:
         """Remaining animation in 60 fps-equivalent frames.
@@ -799,31 +832,68 @@ class GameClient:
         """Reconcile the predicted recoil with the server's fire decision.
 
         The recoil *starts* on the local intent so the weapon does not feel
-        laggy, but the server decides whether a shot happened at all:
+        laggy, but the server decides whether a shot happened at all, and its
+        decision is addressed to ONE of our intents:
 
-        * ``fire_seq`` jumps -> intents were accepted; the recoil runs for the
-          ``fire_ready`` ticks the server reports.  This also covers the reverse
-          case — a snapshot lost between two shots — where the jump is the first
-          sign the shot happened at all.
-        * ``fire_reason`` != 0 with the sequence number unchanged -> the server
-          refused an intent of ours.  The predicted recoil was a phantom, so it
-          is cut.  Reason is what makes this safe: an unchanged ``fire_seq`` on
-          its own is ambiguous between "refused" and "the ack is still in
-          flight", and cutting on the latter would truncate a real shot.
-          A ``cooldown`` refusal is the exception: the weapon was still hot, so
-          the press was not spent — it goes back into the queue.
-        * neither -> nothing decided yet, the prediction is left alone.
+        * ``fire_seq`` jumps -> every pending intent up to that number was
+          accepted (the reliable channel decides in delivery order, so none can
+          still be in flight above it). The recoil runs for the ``fire_ready``
+          ticks the server reports.  This also covers the reverse case — a
+          snapshot lost between two shots — where the jump is the first sign the
+          shot happened at all.
+        * ``fire_reason`` != 0 with the sequence number unchanged -> the newest
+          decision refused the OLDEST intent still pending: a refusal leaves
+          ``fire_seq`` where it was, so it is the last decision made.  Only
+          intents ABOVE ``fire_seq`` are candidates: the snapshot has already
+          settled everything below it, and a shot that happened must not have
+          its recoil cut by a refusal meant for the next intent.
+
+        The pending intents are spent, not counted, so the same decision
+        repeated in every following snapshot (the server keeps it until the next
+        intent is decided) has nothing left to charge and does nothing.  Two
+        identical refusals in a row stay two decisions, because the second one
+        finds the next intent waiting — identifying a decision by its
+        ``(fire_seq, fire_reason)`` pair instead would have collapsed them and
+        left a phantom recoil behind.
         """
         self._server_fire_ready = fire_ready
+        # The refusal first, the acceptance second: decisions arrive in intent
+        # order, and the acceptance is authoritative about the recoil's length,
+        # so it must be the last word.
+        if fire_reason and self._fire_pending:
+            # A refusal can only be about an intent the server did NOT accept, so
+            # everything the snapshot has already accepted drops out of the way
+            # first. Without this the refusal lands on an accepted shot: the
+            # snapshot "fire_seq jumped AND a refusal came with it" is exactly
+            # "intent #1 fired, intent #2 was refused", and charging #1 cuts the
+            # recoil of a shot that really happened.
+            while self._fire_pending and self._fire_pending[0] <= fire_seq:
+                self._fire_pending.popleft()
+        if fire_reason and self._fire_pending:
+            self._fire_pending.popleft()
+            newest = not self._fire_pending
+            if newest:
+                # The recoil on screen was predicted for THIS intent, and no
+                # shot happened: cut it, or an empty magazine held down flashes
+                # forever.
+                self._fire_anim_until = 0.0
+                self._fire_anim_wpn = -1
+            if fire_reason == FIRE_REASON_COOLDOWN and fire_ready > 0:
+                # The client's gate and the server's tick are independent clocks,
+                # so one tick of slack does not always win the race: with real
+                # network jitter an intent arrives while the weapon is still hot.
+                # There is nothing to retry — the click was consumed when the
+                # intent was sent — so the only correct action is to wait out the
+                # weapon's real cooldown instead of racing the same tick again.
+                self._next_fire_time = max(
+                    self._next_fire_time,
+                    now + (fire_ready + 1) * TICK_INTERVAL)
         if fire_seq > self._server_fire_seq:
-            # intents accepted since the last snapshot. The gap is clamped:
-            # after a respawn the server's counter can legitimately be ahead of
-            # anything this client sent, and a negative "undecided" would then
-            # swallow a later refusal.
-            self._fire_undecided = max(
-                0, self._fire_undecided - (fire_seq - self._server_fire_seq))
+            # Everything the server has accepted is settled; a later refused
+            # intent can no longer be charged against it.
+            while self._fire_pending and self._fire_pending[0] <= fire_seq:
+                self._fire_pending.popleft()
             self._server_fire_seq = fire_seq
-            self._fire_served_press_time = None
             if fire_ready <= 0:
                 return
             # A confirmation for the weapon the player already swapped away
@@ -833,33 +903,13 @@ class GameClient:
             self._fire_anim_until = max(
                 self._fire_anim_until, now + fire_ready * TICK_INTERVAL)
             self._fire_anim_wpn = wpn
-            return
-        if fire_reason and self._fire_undecided > 0:
-            # this refusal answers one of our intents: the recoil it predicted
-            # never became a shot, so it must not keep playing (an empty
-            # magazine held down would flash forever otherwise)
-            self._fire_undecided -= 1
-            self._fire_anim_until = 0.0
-            self._fire_anim_wpn = -1
-            if fire_reason == FIRE_REASON_COOLDOWN:
-                # The client's gate and the server's tick are independent clocks,
-                # so one tick of slack does not always win the race: with real
-                # network jitter an intent arrives while the weapon is still hot.
-                # That press is not spent, so it is handed back with its ORIGINAL
-                # timestamp — a fresh one would make an endlessly refused press
-                # immortal — and the server's remaining cooldown moves the gate so
-                # the retry does not race the same tick again.
-                served = self._fire_served_press_time
-                self._fire_served_press_time = None
-                if served is not None:
-                    self._fire_press_queue.appendleft(served)
-                if fire_ready > 0:
-                    self._next_fire_time = max(
-                        self._next_fire_time,
-                        now + (fire_ready + 1) * TICK_INTERVAL)
 
     def _process_input(self) -> None:
         self.input_handler.update()
+        # Frame-level latch for dash edge: survives until next 25 Hz snapshot
+        if self.input_handler.dash_pressed:
+            self.input_handler.dash_pressed = False
+            self._dash_pending = True
 
         now = time.monotonic()
 
@@ -884,25 +934,27 @@ class GameClient:
         # SSG is equipped gets 3 intents in 4 refused as cooldown, so the
         # predicted recoil is cut and no shot is shown at all.
         #
-        # Each press is latched as its own queue entry, served one per opening:
-        # the edge is rebuilt by InputHandler.update() every frame, so a press
-        # inside a closed gate would be gone by the next opening (a single latch
-        # flag kept only the FIRST press of a burst and dropped the rest, which
-        # is "one shot per ten clicks"). The queue makes every press fire
-        # exactly once, still at the weapon's real rate.
-        if self.input_handler.shoot_pressed:
-            self._fire_press_queue.append(now)
-        stale_before = now - FIRE_INTENT_MAX_AGE
-        while self._fire_press_queue and self._fire_press_queue[0] < stale_before:
-            self._fire_press_queue.popleft()
+        # A press is remembered for AT MOST ONE gate opening. The shotgun's gate
+        # is 0.90 s, so at an ordinary 10 Hz click rate the player lands ~9 clicks
+        # per opening: with nothing remembered that is "one shot in ten clicks",
+        # which reads as the weapon ignoring the mouse. With a queue it is worse
+        # — the queue grows at the click rate and drains at the weapon's rate, so
+        # the SSG (1.30 s) banked ~39 shots for three seconds and fired them long
+        # after the player let go. One buffered press is the whole difference: the
+        # click is never lost, and the backlog cannot grow no matter how fast the
+        # player clicks. It is a bool, not a deque, precisely so that there is
+        # nothing to grow.
+        if self.input_handler.shoot_pressed and now < self._next_fire_time:
+            self._fire_press_buffered = True
 
         wpn = self.input_handler.weapon_id
         fired_wpn = self.local_weapon if 0 <= self.local_weapon < len(WPN) else wpn
         if 0 <= fired_wpn < len(WPN):
             info = WPN[fired_wpn]
-            if (
-                now >= self._next_fire_time
-                and (self.input_handler.shoot or self._fire_press_queue)
+            if now >= self._next_fire_time and (
+                self.input_handler.shoot
+                or self.input_handler.shoot_pressed
+                or self._fire_press_buffered
             ):
                 ticks = wpn_cooldown_ticks(int(info['f']))
                 # The +1 tick of slack belongs to the gate only: the animation
@@ -910,19 +962,18 @@ class GameClient:
                 self._next_fire_time = now + ticks * TICK_INTERVAL + TICK_INTERVAL
                 self._fire_anim_until = now + ticks * TICK_INTERVAL
                 self._fire_anim_wpn = fired_wpn
-                # One queue entry is served per opening. A held button has no
-                # entry: it re-opens the gate by itself every time.
-                if self._fire_press_queue:
-                    self._fire_served_press_time = self._fire_press_queue.popleft()
-                else:
-                    self._fire_served_press_time = None
+                # The buffered press has been spent, whatever fired this opening:
+                # a held button does not need it, and it must not survive to give
+                # a second shot the player did not ask for.
+                self._fire_press_buffered = False
                 # The reliable FIRE is the single path to a shot, so every gate
                 # opening sends an intent — held fire included. Ammo is not
                 # checked here on purpose: the server is the only authority and
                 # refuses an empty weapon with an explicit reason (see
                 # handle_shoot's FireResult), which the client then reflects.
-                self._fire_undecided += 1
-                self.network.send_fire(wpn)
+                # The intent is filed under its own number: that is what lets
+                # the server's decision be charged to the intent it answers.
+                self._fire_pending.append(self.network.send_fire(wpn))
 
         # A weapon switch drops the running animation: the other gun's recoil
         # must not keep playing (and counting down) on the new one. The owner is

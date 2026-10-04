@@ -798,36 +798,167 @@ def _render_sector_scene_legacy():
     return z_b
 
 
-# --- Own-dash screen speed lines (dash-fx) --------------------------------
-# Layout is a fixed table rather than per-frame RNG: the pattern must not
-# shimmer, and a dash lasts ~250 ms, so 10 rect fills and one blit are the whole
-# cost. y fractions are pushed towards the top and bottom edges -- the centre of
-# the view is what the player aims with, the periphery is what appears to move.
-_streak_rng = random.Random(0xD45A5)
-_DASH_STREAKS = tuple(
-    # (y fraction, thickness px, length fraction, x0 fraction, base alpha)
-    (
-        # Bias the y away from the middle: sample it as a distance from the
-        # centre raised to a power, so streaks crowd the edges.
-        (0.5 + (0.5 if i % 2 == 0 else -0.5) * (1.0 - (i + 0.5) / const.DASH_FX_STREAKS) ** 1.6),
-        2 + (i % 3),
-        _streak_rng.uniform(0.16, 0.44),
-        _streak_rng.uniform(0.0, 0.3),
-        _streak_rng.randint(70, 165),
-    )
-    for i in range(const.DASH_FX_STREAKS)
-)
-_streak_surf = None
-_streak_size = None
+# --- Own-dash radial rays (dash-fx) ---------------------------------------
+# The cue is a handful of cached wedge sprites, one blit each per frame. The
+# first version composited the streaks into one full-screen SRCALPHA overlay and
+# blitted that: one W*H composite every frame. Measured here that costs 12 ms at
+# 4K for a plain alpha blit of a full-screen surface and 43 ms when the surface
+# alpha is modulated per frame, which is a budget the whole renderer does not
+# have. SDL blends every pixel of the destination rect, so a full-screen
+# overlay always pays for the whole screen even though the field covers a few
+# percent of it -- the ink has to be blitted as small rects instead.
+#
+# A ray is therefore a triangle: its apex points at the aim point and it widens
+# towards the border, with a soft triangular alpha profile along its length and
+# feathered sides. Alpha reaches exactly zero at both ends, so a ray can be born
+# out of the aim point and leave the screen without a seam or a hard cut. The
+# profile is baked once into two tiny templates (one per axis) and scaled per
+# ray, so a whole field costs a fraction of a millisecond and is rebuilt only
+# when the viewport or the quality-derived count changes.
+#
+# Rays sweep outward along their own side and wrap: their inner end walks from
+# the dead zone past the border, where the transparent apex makes the reset
+# invisible. Travel is a share of the distance to the border rather than a fixed
+# number of pixels, so a dash reads the same on a 640x480 window and at 4K, and
+# the pattern streams instead of flashing on the spot.
+#
+# The rays stay axis aligned. A slanted ray would need its rotated bounding box
+# blitted: at 45 degrees that is roughly fifty times the area of the line itself,
+# which at 4K is more than the renderer's whole frame budget.
+_RAY_TPL_W = 64
+_RAY_TPL_H = 16
+_RAY_PEAK = 0.68       # where along a ray the alpha tops out
+_RAY_EDGE = 0.30       # feather of the wedge sides, as a share of half its width
+_ray_tpl_h = None
+_ray_tpl_v = None
+
+
+def _ramp(u):
+    """Smoothstep that saturates at 1 -- for feathers and anything clamped."""
+    u = 0.0 if u < 0.0 else (1.0 if u > 1.0 else u)
+    return u * u * (3.0 - 2.0 * u)
+
+
+def _soft_triangle(t, peak):
+    """Smooth 0 -> 1 -> 0 ramp, maximum at ``peak``, zero at both ends.
+
+    The zeros at the endpoints are the point: they are what lets a ray appear
+    out of nothing and run off the border without a visible cut. It is also why
+    this must not be reused for a feather -- a saturating ramp there would put a
+    hole down the middle of every ray.
+    """
+    if t <= 0.0 or t >= 1.0:
+        return 0.0
+    u = t / peak if t <= peak else (1.0 - t) / (1.0 - peak)
+    return _ramp(u)
+
+
+def _ray_templates():
+    """Build the wedge template for both axes (64x16 and 16x64).
+
+    Width along the ray grows linearly from a narrow apex to the full base, so
+    the result is a triangle rather than a bar, and both the apex and the base
+    reach zero alpha.
+    """
+    global _ray_tpl_h, _ray_tpl_v
+    if _ray_tpl_h is not None:
+        return _ray_tpl_h, _ray_tpl_v
+    r, g, b = const.DASH_FX_COLOR[:3]
+    hz = pygame.Surface((_RAY_TPL_W, _RAY_TPL_H), pygame.SRCALPHA)
+    vt = pygame.Surface((_RAY_TPL_H, _RAY_TPL_W), pygame.SRCALPHA)
+    half_max = _RAY_TPL_H * 0.5 - 1.0
+    for x in range(_RAY_TPL_W):
+        t = (x + 0.5) / _RAY_TPL_W
+        prof = _soft_triangle(t, _RAY_PEAK)
+        half = 0.08 + 0.92 * t            # wedge: apex -> full base
+        for y in range(_RAY_TPL_H):
+            d = abs(y - half_max) / half_max
+            if d >= half:
+                a = 0.0
+            else:
+                a = prof * _ramp((half - d) / _RAY_EDGE)
+            px = (r, g, b, int(255.0 * a))
+            hz.set_at((x, y), px)
+            vt.set_at((y, x), px)
+    _ray_tpl_h, _ray_tpl_v = hz, vt
+    return hz, vt
+
+
+_ray_rng = random.Random(0xD45A5)
+
+
+def _ray_table():
+    """``(arm, side, offset, peak alpha, phase)`` for every ray.
+
+    Rings are listed side by side and arms inside a ring, so *every* prefix of
+    the table is a symmetric aperture: the quality knob can drop the outer rings
+    and what is left still points at the aim point from all four sides instead of
+    degenerating into streaks on one edge only.
+    """
+    out = []
+    for side, ring in ((-1, 0.15), (1, 0.15), (-1, 0.30), (1, 0.30)):
+        for arm in ('L', 'R', 'T', 'B'):
+            out.append((arm, side,
+                        ring * _ray_rng.uniform(0.92, 1.08),
+                        _ray_rng.randint(90, 155),
+                        _ray_rng.random()))
+    return tuple(out)
+
+
+_DASH_RAYS = _ray_table()
+_ray_field = None
+_ray_key = None
+_ray_tip = []
+_ray_tip0 = []
+_ray_env = 0.0
+
+
+def _build_ray_field(w, rh, n):
+    """Bake the wedge sprites for a ``w`` x ``rh`` view band holding ``n`` of them."""
+    global _ray_tip, _ray_tip0
+    tips = []
+    if w <= 0 or rh <= 0:
+        _ray_tip = tips
+        _ray_tip0 = tips
+        return []
+    tpl_h, tpl_v = _ray_templates()
+    cx, cy = w * 0.5, rh * 0.5
+    dead = min(w, rh) * const.DASH_FX_STREAK_DEADZONE
+    # Thickness is a layout unit too: at 4K a literal 2px ray is invisible.
+    th = max(1, ui_px(const.DASH_FX_STREAK_WIDTH))
+    out = []
+    for arm, side, offf, peak, phase in _DASH_RAYS[:n]:
+        horiz = arm == 'L' or arm == 'R'
+        span = cx if horiz else cy
+        reach = span - dead
+        if reach <= 2.0:
+            continue
+        length = max(6, int(reach * 0.5))
+        # The apex may only walk as far as the border minus the ray itself:
+        # letting it past that would put the far end over the HUD band, which is
+        # drawn on top of the view and must stay clean.
+        travel = reach - length
+        if travel <= 2.0:
+            continue
+        spr = pygame.transform.smoothscale(
+            tpl_h if horiz else tpl_v,
+            (length, th) if horiz else (th, length))
+        off = side * int((rh if horiz else w) * offf)
+        out.append((spr, arm, off, peak, dead, travel, length))
+        tips.append(dead + travel * phase)
+    _ray_tip = tips
+    _ray_tip0 = list(tips)
+    return out
 
 
 def draw_dash_streaks(rh=None, ry=None):
-    """Horizontal speed lines for the local player's own dash.
+    """Radial speed rays for the local player's own dash.
 
-    Decays ``gs.dash_fx`` and, while it is positive, draws the streak table over
-    the world. Costs nothing at rest: the first check is a float compare.
+    Decays ``gs.dash_fx`` and, while it is positive, sweeps the ray sprites
+    outward from the aim point over the world. Costs nothing at rest: the first
+    check is a float compare, and nothing is baked before the first dash.
     """
-    global _streak_surf, _streak_size
+    global _ray_field, _ray_key, _ray_tip, _ray_env
     fx = gs.dash_fx
     if fx <= 0.0:
         return
@@ -839,29 +970,52 @@ def draw_dash_streaks(rh=None, ry=None):
         rh = _RH
     if ry is None:
         ry = _RY
-    if _streak_surf is None or _streak_size != (const.W, rh):
-        _streak_surf = pygame.Surface((const.W, rh), pygame.SRCALPHA)
-        _streak_size = (const.W, rh)
-    surf = _streak_surf
-    surf.fill((0, 0, 0, 0))
-    col = const.DASH_FX_COLOR
+    w = const.W
     # The cue is the only screen-space signal of a dash, so the quality knob
     # scales the count down but never to zero.
     n = int(const.DASH_FX_STREAKS * gs.effects_factor)
-    if n < const.DASH_FX_STREAKS_MIN:
-        n = const.DASH_FX_STREAKS_MIN
-    for yn, th, ln, x0, base in _DASH_STREAKS[:n]:
-        a = int(base * fx)
+    n = max(const.DASH_FX_STREAKS_MIN, min(const.DASH_FX_STREAKS, n))
+    if _ray_field is None or _ray_key != (w, rh, n):
+        _ray_field = _build_ray_field(w, rh, n)
+        _ray_key = (w, rh, n)
+    if fx > _ray_env:
+        # Rising edge: a fresh dash re-seeds the sweep, so the rays start spread
+        # over their travel again instead of continuing wherever the last one
+        # left them. A wrap mid-dash stays invisible either way (transparent apex).
+        _ray_tip = list(_ray_tip0)
+    _ray_env = fx
+    # Travel follows the envelope -- fastest while the dash bites, down to a
+    # crawl as it fades -- so one dash is roughly one sweep to the border.
+    step = const.DASH_FX_STREAK_FLOW * fx
+    tips = _ray_tip
+    cx, cy = w * 0.5, rh * 0.5
+    screen = gs.screen
+    for i in range(len(_ray_field)):
+        spr, arm, off, peak, dead, travel, length = _ray_field[i]
+        d = tips[i] + travel * step
+        if d >= dead + travel:
+            # The apex has walked its whole range: the ray sits at the border and
+            # re-seeds at the dead zone, which is invisible because both of its
+            # ends reach zero alpha.
+            d -= travel
+        tips[i] = d
+        a = int(peak * fx)
         if a <= 2:
             continue
-        w = max(2, int(const.W * ln))
-        x = int(const.W * x0)
-        if x + w > const.W:
-            w = const.W - x
-        y = int(rh * yn)
-        # Thickness is a layout unit too: at 4K a literal 2px line is invisible.
-        surf.fill((col[0], col[1], col[2], a), (x, y, w, ui_px(th)))
-    gs.screen.blit(surf, (0, ry))
+        spr.set_alpha(a)
+        if arm == 'L':
+            x = int(cx - d) - spr.get_width()
+            y = int(cy + off) - (spr.get_height() >> 1)
+        elif arm == 'R':
+            x = int(cx + d)
+            y = int(cy + off) - (spr.get_height() >> 1)
+        elif arm == 'T':
+            x = int(cx + off) - (spr.get_width() >> 1)
+            y = int(cy - d) - spr.get_height()
+        else:
+            x = int(cx + off) - (spr.get_width() >> 1)
+            y = int(cy + d)
+        screen.blit(spr, (x, ry + y))
 
 
 def render(vh=None, vy=None):

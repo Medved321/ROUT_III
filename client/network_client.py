@@ -238,14 +238,21 @@ class NetworkClient:
         )
         self._send(packet)
 
-    def send_fire(self, weapon_id: int = 1) -> None:
-        """Reliable per-click fire intent (monotonic fire_seq, exactly once)."""
+    def send_fire(self, weapon_id: int = 1) -> int:
+        """Reliable per-click fire intent (monotonic fire_seq, exactly once).
+
+        Returns the intent's number. The caller has to know which intent a later
+        server decision is about: the snapshot's ``fire_seq``/``fire_reason`` pair
+        cannot be attributed to an intent on its own, so the client keeps the
+        numbers it handed out.
+        """
         if self.state != "game" or self._endpoint is None:
-            return
+            return self._fire_seq
         self._fire_seq = (self._fire_seq + 1) & 0xFFFFFFFF
         self._endpoint.send_reliable(
             PacketType.FIRE, encode_fire(self._fire_seq, weapon_id)
         )
+        return self._fire_seq
 
     def connection_made(self, transport) -> None:
         self.transport = transport

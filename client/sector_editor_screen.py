@@ -114,6 +114,7 @@ class SectorEditorScreen:
         self._tex_target = "lower"
         self._tex_rects: dict[str, pygame.Rect] = {}
         self._tex_chips: dict[str, pygame.Rect] = {}
+        self._last_mouse_canvas: tuple[float, float] | None = (500.0, 350.0)
 
         self.zoom = 0.35
         self.cam = (800.0, 800.0)
@@ -409,6 +410,8 @@ class SectorEditorScreen:
                 if act:
                     return act
             elif event.type == pygame.MOUSEMOTION:
+                if event.pos is not None:
+                    self._last_mouse_canvas = (float(event.pos[0]), float(event.pos[1]))
                 if self._pan:
                     w = self._to_world(*event.pos)
                     self.cam = (self.cam[0] - (w[0] - self._pre[0]),
@@ -420,11 +423,21 @@ class SectorEditorScreen:
                     w = self._to_world(*event.pos)
                     self.editor.move_vertex(self._drag_v, w[0], w[1])
                     self._dirty()
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                pos = getattr(event, 'pos', None)
+                if pos is not None:
+                    self._last_mouse_canvas = (float(pos[0]), float(pos[1]))
             elif event.type == pygame.MOUSEBUTTONUP:
+                # a mouse event can arrive without a position (focus loss, and
+                # the smoke sends one on purpose): pan still has to end
+                pos = getattr(event, 'pos', None)
+                if pos is not None:
+                    self._last_mouse_canvas = (float(pos[0]), float(pos[1]))
                 self._pan = False
                 self._drag_v = None
             elif event.type == pygame.MOUSEWHEEL:
-                if self.canvas.collidepoint(pygame.mouse.get_pos()):
+                pos = getattr(event, 'pos', None) or self._last_mouse_canvas
+                if pos is not None and self.canvas.collidepoint(pos):
                     self.zoom = max(0.05, min(4.0,
                                     self.zoom * (1.2 if event.y > 0 else 1 / 1.2)))
                     self._dirty()
@@ -721,9 +734,19 @@ class SectorEditorScreen:
     def _prop(self, key: str) -> str | None:
         if self.sel_line is not None:
             if key == "two":
-                self.editor.set_two_sided(self.sel_line, True)
+                # may be refused: a portal needs a second, LIVE sector, and
+                # cur_sector is whatever was picked last, so it can be this
+                # wall's own sector (self-portal) or a void one
+                notes = self.editor.set_two_sided(self.sel_line, True)
+                if notes:
+                    self.status = "; ".join(notes)
             elif key == "one":
-                self.editor.set_two_sided(self.sel_line, False)
+                # may come back with a repair note: on a wall whose front side
+                # was lost, "1-ст." is what brings the sector back.  It may also
+                # be REFUSED: sealing a wall can void the sector behind it.
+                notes = self.editor.set_two_sided(self.sel_line, False)
+                if notes:
+                    self.status = "; ".join(notes)
             elif key == "solid":
                 ld = self.editor.lines[self.sel_line]
                 want = not ld.solid
@@ -733,7 +756,11 @@ class SectorEditorScreen:
                 else:
                     self.status = "Признак только для двусторонней линии"
             elif key == "flip":
-                self.editor.flip_line(self.sel_line)
+                if not self.editor.flip_line(self.sel_line):
+                    # refused, and the map is untouched — say so instead of
+                    # leaving the panel as if it had worked
+                    self.status = ("Разворот только для двусторонней линии "
+                                   "(у этой стены одна сторона)")
             elif key == "split":
                 ld = self.editor.lines[self.sel_line]
                 v1, v2 = self.editor.verts[ld.v1], self.editor.verts[ld.v2]
@@ -792,6 +819,22 @@ class SectorEditorScreen:
         except Exception as exc:
             self.status = f"Ошибка сохранения .mts: {exc}"
 
+    def _loaded_status(self, shown: str, errs) -> str:
+        """``Загружено: <file>`` plus whatever the load had to repair.
+
+        A repaired map must not look like a clean one.  ``SectorEditor``
+        restores the front-side invariant on load (``repair_front_sides``), so
+        the file on disk is still broken and sectors may have been lost with an
+        orphaned wall — the author has to hear it, and ``validate()`` speaks
+        after the repair, not before it.
+        """
+        parts = [f"Загружено: {shown}"]
+        if self.editor.repair_notes:
+            parts.append("починено: " + "; ".join(self.editor.repair_notes[:2]))
+        if errs:
+            parts.append("ошибок: " + "; ".join(errs[:2]))
+        return " — ".join(parts)
+
     def _load_mts(self) -> None:
         path = self._mts_path("mts")
         if not os.path.exists(path):
@@ -806,10 +849,8 @@ class SectorEditorScreen:
         except Exception as exc:
             self.status = f"Ошибка загрузки .mts: {exc}"
             return
-        errs = sm.validate()
-        name = f"maps/{os.path.basename(path)}"
-        self.status = (f"Загружено: {name} — ошибок: {'; '.join(errs[:2])}"
-                       if errs else f"Загружено: {name}")
+        self.status = self._loaded_status(f"maps/{os.path.basename(path)}",
+                                          sm.validate())
 
     def _load(self) -> None:
         name = self.map_name or "sector1"
@@ -824,10 +865,11 @@ class SectorEditorScreen:
             self.status = f"Не найдено: maps/{os.path.basename(path)}"
             return
         try:
-            self.editor = SectorEditor(self.editor.sm.__class__.load(path))
+            sm = self.editor.sm.__class__.load(path)
+            self.editor = SectorEditor(sm)
             self._reset_tool_state()
             self._set_sel()
-            self.status = f"Загружено: {shown}"
+            self.status = self._loaded_status(shown, sm.validate())
             self.frame_around()
         except Exception as exc:
             self.status = f"Ошибка загрузки: {exc}"
@@ -993,9 +1035,13 @@ class SectorEditorScreen:
 
     def _mouse_world(self) -> tuple[float, float] | None:
         """Cursor in world coordinates, or ``None`` when it left the canvas."""
-        if not self.canvas.collidepoint(pygame.mouse.get_pos()):
+        pos = self._last_mouse_canvas
+        if pos is None:
             return None
-        return self._to_world(*pygame.mouse.get_pos())
+        p = (int(pos[0]), int(pos[1]))
+        if not self.canvas.collidepoint(p):
+            return None
+        return self._to_world(*p)
 
     def _render_base(self, surf) -> None:
         z = self.zoom
@@ -1091,8 +1137,8 @@ class SectorEditorScreen:
         if self.sel_thing is not None:
             return f"вещь {self.editor.things[self.sel_thing].type}"
         if self.sel_line is not None:
-            ld = self.editor.lines[self.sel_line]
-            return f"лайндеф {self.sel_line} ({'2ст.' if ld.two_sided else '1ст.'})"
+            two = self.editor.line_two_sided(self.sel_line)
+            return f"лайндеф {self.sel_line} ({'2ст.' if two else '1ст.'})"
         if self.sel_vertex is not None:
             return f"вершина {self.sel_vertex}"
         if self.sel_sector is not None:
@@ -1111,7 +1157,7 @@ class SectorEditorScreen:
             chips = {"two": "2-ст.", "one": "1-ст.", "flip": "Flip",
                      "split": "Split"}
             ld = self.editor.lines[self.sel_line]
-            if ld.two_sided:
+            if self.editor.line_two_sided(self.sel_line):
                 chips["solid"] = "сплошная" if ld.solid else "проём"
         elif self.sel_sector is not None and self.sel_sector >= 0:
             s = self.editor.sectors[self.sel_sector]
@@ -1200,9 +1246,13 @@ class SectorEditorScreen:
         """Sidedef index the texture palette currently writes to."""
         if self.sel_line is None:
             return None
-        ld = self.editor.lines[self.sel_line]
-        if not ld.two_sided:
+        if not self.editor.line_two_sided(self.sel_line):
+            # Not "no back side" but "no FRONT side either": the shared
+            # `two_sided` property would have said yes and handed the palette
+            # front == -1, i.e. sides[-1] — a texture written onto a stranger's
+            # wall.
             return None
+        ld = self.editor.lines[self.sel_line]
         return ld.back if self._tex_side == "back" else ld.front
 
     def _draw_tex_palette(self, surface, x: int) -> bool:

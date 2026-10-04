@@ -251,9 +251,12 @@ DASH_FX_BURST = 9            # puffs thrown out when a dash starts
 DASH_FX_TRAIL = 2            # puffs per trail emission while dashing
 DASH_FX_TRAIL_PX = 16.0      # distance covered between trail emissions
 DASH_FX_COLOR = (120, 200, 255)   # own dash (remote players use shirt color)
-DASH_FX_FADE = 0.055         # per-frame decay of the screen-streak envelope
-DASH_FX_STREAKS = 10         # screen speed lines at full quality
+DASH_FX_FADE = 0.055         # per-frame decay of the radial-ray envelope
+DASH_FX_STREAKS = 8          # radial speed rays at full quality (four sides, two rings)
 DASH_FX_STREAKS_MIN = 4      # never let the cue disappear at low quality
+DASH_FX_STREAK_FLOW = 0.11   # share of a ray's travel per frame at a full envelope
+DASH_FX_STREAK_DEADZONE = 0.18   # empty fraction of the short side around the aim point
+DASH_FX_STREAK_WIDTH = 5.0   # layout units across a ray at its wide (outer) end
 
 # Rendering
 MIN_SHADE = 0.15

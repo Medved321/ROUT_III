@@ -67,6 +67,26 @@ def snap_point(x: float, y: float, step: int | None = None,
     return round(x / step) * step, round(y / step) * step
 
 
+def _promote_back_to_front(ld: LineDef) -> bool:
+    """Make ``ld``'s back side its front side, keeping the directed contour.
+
+    ``SectorMap._ensure_polys`` reads a front side as ``v1 -> v2`` and a back
+    side as ``v2 -> v1``, so a side moving from ``back`` to ``front`` MUST take
+    the vertex swap with it: without the swap the sector's edge is traversed
+    backwards, the directed cycle stops closing, and the sector silently
+    becomes void — the exact damage a bare ``front = back`` does.
+
+    Single place this rule is written down; ``delete_sector``,
+    ``set_two_sided`` and ``repair_front_sides`` all go through it.  Returns
+    False when there is no back side to promote.
+    """
+    if ld.back < 0:
+        return False
+    ld.v1, ld.v2 = ld.v2, ld.v1
+    ld.front, ld.back = ld.back, -1
+    return True
+
+
 def _item_from_json(kind: str, item) -> object:
     if kind == "vertices":
         return Vertex(float(item[0]), float(item[1]))
@@ -165,6 +185,51 @@ class SectorEditor:
         self._batch_depth = 0
         self._batch_before: dict | None = None
         self._pending_before: dict | None = None
+        # Restored map is the BASELINE, not an edit: it goes into no history, so
+        # Ctrl+Z cannot "un-repair" a file the author just opened.
+        self.repair_notes: list[str] = self.repair_front_sides()
+
+    # ── map integrity ─────────────────────────────────────────────────
+    def repair_front_sides(self) -> list[str]:
+        """Restore "every linedef has a front side" on the working map.
+
+        ``SectorMap.validate`` requires a front sidedef on every linedef and
+        ``_ensure_polys`` walks directed front/back edges, so ``front < 0`` is
+        a broken map either way: the wall belongs to no sector, and whatever
+        the author drew there is unreachable. Two cases, both deterministic:
+
+        * ``back >= 0`` — the back side becomes the front, with the vertex swap
+          (``_promote_back_to_front``) that keeps the sector's contour closed;
+        * no sides at all — the linedef is orphaned and is dropped the way a
+          deleted wall is dropped (``_drop(..., record=False)``), and the sectors
+          left without a contour are named by the same helper, because losing a
+          wall is a visible loss, not a silent one.
+
+        Runs from ``__init__`` so EVERY load path is covered by construction
+        (``.mt1``, ``.mts``, legacy ``.json``, plus maps built in tests) and the
+        format loaders stay strict. Notes are handed to the caller for the
+        status line — a repaired file must not look untouched.
+        """
+        promote = [li for li, ld in enumerate(self.lines)
+                   if ld.front < 0 and ld.back >= 0]
+        orphans = [li for li, ld in enumerate(self.lines)
+                   if ld.front < 0 and ld.back < 0]
+        if not promote and not orphans:
+            return []
+        notes: list[str] = []
+        # promote first: _drop renumbers linedefs, and these indices are pre-drop
+        for li in promote:
+            _promote_back_to_front(self.lines[li])
+        if orphans:
+            drop = set(orphans)
+            notes += self._open_sector_notes(drop)
+            self._drop(lines=drop, record=False)
+            notes.append(f"лайндеф(ы) {', '.join(str(i) for i in orphans)}: "
+                         "обе стороны потеряны — стена удалена")
+        notes += [f"лайндеф {li}: передняя сторона восстановлена из задней"
+                  for li in promote]
+        self._after_mutate()
+        return notes
 
     # ── snapping helpers ──────────────────────────────────────────────
     def snap(self, x: float, y: float) -> tuple[float, float]:
@@ -462,12 +527,12 @@ class SectorEditor:
         # flag and validate() rejects it on a one-sided linedef. Promoting the
         # neighbour's side to the front also re-aims the edge, because a
         # back side runs v2->v1 while a front side runs v1->v2 — without the
-        # swap the neighbour is left with a contour that does not close.
+        # swap the neighbour is left with a contour that does not close
+        # (`_promote_back_to_front` owns that rule).
         for li, own in keep_walls:
-            ld = sm.linedefs[li]
+            ld = self.lines[li]
             if own == ld.front:
-                ld.v1, ld.v2 = ld.v2, ld.v1
-                ld.front, ld.back = ld.back, -1
+                _promote_back_to_front(ld)
             else:
                 ld.back = -1
             ld.solid = False
@@ -510,36 +575,131 @@ class SectorEditor:
         self._after_mutate()
         return len(self.lines) - 1
 
-    def flip_line(self, idx: int) -> None:
+    def line_two_sided(self, idx: int) -> bool:
+        """Editor-side "this wall is a portal" test: BOTH sides exist.
+
+        ``LineDef.two_sided`` in ``shared/`` answers "does it have a back side",
+        which is a different question: a wall left with ``front < 0, back >= 0``
+        reads as two-sided there, yet it has no front side at all, so every
+        editor feature that means "a wall between two sectors" — the staircase
+        end check, the panel label, the 2D overlay — would act on a wall that
+        belongs to no sector. The shared property stays as it is (renderer and
+        physics read it); the editor asks this instead.
+        """
         if not (0 <= idx < len(self.lines)):
-            return
-        self._record()
+            return False
         ld = self.lines[idx]
+        return ld.front >= 0 and ld.back >= 0
+
+    def flip_line(self, idx: int) -> bool:
+        """Reverse a linedef's direction; ``False`` when nothing was done.
+
+        Only a two-sided linedef can be flipped: it needs a back side to swap
+        with the front.  On a ONE-sided wall the only thing left to swap is the
+        vertex pair, and that turns the wall's single directed edge the wrong
+        way — its sector's cycle stops closing, ``_ensure_polys`` drops the
+        contour and the sector silently becomes void (see ``_stair_open_rails``
+        for how the walk works).  That is how a map was destroyed from the
+        properties panel, so the refusal is the point of this method and the
+        caller has to show it.
+        """
+        if not (0 <= idx < len(self.lines)):
+            return False
+        ld = self.lines[idx]
+        if ld.front < 0 or ld.back < 0:
+            return False
+        self._record()
         ld.v1, ld.v2 = ld.v2, ld.v1
         ld.front, ld.back = ld.back, ld.front
         self._after_mutate()
+        return True
 
     def set_two_sided(self, idx: int, two_sided: bool,
-                      back_sector: int | None = None) -> None:
+                      back_sector: int | None = None) -> list[str]:
+        """Give a linedef a back side, or drop it.  Returns ``[notes]``.
+
+        Both directions are refused when the result would be a lie about the
+        map, and the refusal is what the panel shows:
+
+        * ``True`` aims a new back side at ``back_sector`` (``cur_sector`` by
+          default).  A two-sided line IS a portal between two DIFFERENT sectors,
+          so aiming it at the wall's own sector is refused: that would make a
+          self-portal (both sides in one sector — the edge is then walked twice
+          in opposite directions, and every feature that reads "a wall between
+          two rooms" sees a portal whose two floors are, necessarily, at the
+          same height).  An aim at a sector that has no contour yet is NOT
+          refused: sectors are routinely created empty and closed later by
+          ``sector_from_contour``, and a void sector is reported by
+          ``validate()`` when the map is saved or played.
+        * ``False`` drops the back side, which removes that wall from the
+          contour of the sector behind it.  If that contour was the sector's
+          last one, the sector silently becomes void — it stops being walkable,
+          its area is gone and its height disappears from the panel, with no
+          note and no way back but undo.  So the question is asked first
+          (``_polygon_alive``) and the toggle is refused by name.
+
+        The ``front < 0`` case is the repair, not a deletion: a wall whose front
+        was lost keeps its back side, promoted to front together with the vertex
+        order (``_promote_back_to_front``), so the sector survives.
+        """
         if not (0 <= idx < len(self.lines)):
-            return
-        self._record()
+            return []
         ld = self.lines[idx]
+        notes: list[str] = []
         if two_sided:
-            if ld.back < 0:
+            if ld.front >= 0 and ld.back < 0:
                 back_sector = self.cur_sector if back_sector is None else back_sector
-                if 0 <= back_sector < len(self.sectors):
-                    mid = self.sides[ld.front].mid if ld.front >= 0 else None
-                    ld.back = self._new_side(back_sector, mid)
-        else:
-            if ld.back >= 0:
-                if ld.back == len(self.sides) - 1:
-                    self.sides.pop()
-                ld.back = -1
-                # "solid" is only meaningful on a two-sided line, and the
-                # validator rejects it on a one-sided one, so drop the flag.
-                ld.solid = False
-        self._after_mutate()
+                if not (0 <= back_sector < len(self.sectors)):
+                    return notes
+                front_sector = self.sides[ld.front].sector
+                if back_sector == front_sector:
+                    notes.append(f"лайндеф {idx}: задняя сторона попала бы в "
+                                 f"тот же сектор {front_sector} — проём "
+                                 "делается между разными секторами, выберите "
+                                 "другой сектор")
+                    return notes
+                self._record()
+                ld.back = self._new_side(back_sector, self.sides[ld.front].mid)
+                self._after_mutate()
+            return notes
+        if ld.front < 0:
+            # broken wall: there is no front to keep, so the back has to become
+            # it rather than be dropped — that is the repair, not a deletion.
+            # A linedef with no sides at all is not this method's business;
+            # repair_front_sides deals with those at load time.
+            if ld.back < 0:
+                return notes
+            self._record()
+            _promote_back_to_front(ld)
+            self._after_mutate()
+            notes.append(f"лайндеф {idx}: передняя сторона восстановлена "
+                         "из задней")
+            return notes
+        if ld.back >= 0:
+            back_sector = self.sides[ld.back].sector
+            # The wall stays, but for the sector behind it this edge is gone: ask
+            # whether its contour survives that before dropping the side.
+            # (``_polygon_alive`` skips the whole linedef, which is exactly what
+            # the sector behind loses — the front sector keeps the wall and is
+            # not what is being asked about.)  A sector that has NO contour yet
+            # is not at risk: rooms are drawn before they are closed, and an
+            # empty sector has nothing to lose.
+            if (0 <= back_sector < len(self.sectors)
+                    and self.sm.has_polygon(back_sector)
+                    and not self._polygon_alive(back_sector, {idx})):
+                notes.append(f"лайндеф {idx}: у сектора {back_sector} не "
+                             "останется замкнутого контура (его область "
+                             "станет пустотой) — стена не станет односторонней")
+                return notes
+            self._record()
+            if ld.back == len(self.sides) - 1:
+                self.sides.pop()
+            ld.back = -1
+            # "solid" is only meaningful on a two-sided line, and the
+            # validator rejects it on a one-sided one, so drop the flag.
+            ld.solid = False
+            self._after_mutate()
+        return notes
 
     def set_line_special(self, idx: int, special: int = 0,
                          tag: int = 0) -> None:
@@ -1166,12 +1326,39 @@ class SectorEditor:
                         rise: int) -> tuple[dict | None, list[str]]:
         for li in (la, lb):
             ld = self.lines[li]
-            if ld.two_sided:
+            # A staircase climbs the room on the FRONT side of its end walls, so
+            # the front side is the only one that may be read here — and it has
+            # to be checked, not assumed: `self.sides[-1]` is some other wall's
+            # side, and a broken linedef (front < 0) silently produced heights
+            # from it, i.e. "полы секторов на одной высоте" for a staircase
+            # that was perfectly placeable.
+            if ld.front < 0:
+                return None, [f"лестница: край (лайндеф {li}) — у стены нет "
+                              "передней стороны (повреждённая карта), "
+                              "выберите другую стену"]
+            if ld.back >= 0:
                 return None, [f"лестница: край (лайндеф {li}) — проём между "
                               "секторами, нужен край сектора (односторонняя "
                               "стена)"]
+        for li in (la, lb):
+            # The side's own sector may have lost its contour (it is then void,
+            # `find_sector_at` reports nothing and nobody can walk there), and
+            # its floor height is still a number we would happily build steps
+            # from — reject before the heights are compared.
+            sec = self.sides[self.lines[li].front].sector
+            if not self.sm.has_polygon(sec):
+                return None, [f"лестница: край (лайндеф {li}) — сектор {sec} "
+                              "не замкнулся в контур (область пуста), "
+                              "почините карту"]
         sec_a = self.sides[self.lines[la].front].sector
         sec_b = self.sides[self.lines[lb].front].sector
+        if sec_a == sec_b:
+            # Two walls of one room are not a height difference, and "полы
+            # секторов на одной высоте" sent the author looking for a height
+            # bug that was really a pick: name what was picked.
+            return None, [f"лестница: оба края (лайндефы {la} и {lb}) "
+                          f"принадлежат одному сектору {sec_a} — ступени "
+                          "поднимают между РАЗНЫМИ секторами"]
         a, b = self.sectors[sec_a], self.sectors[sec_b]
         try:
             want = max(STAIR_RISE_MIN, min(STAIR_RISE_MAX, int(rise)))
