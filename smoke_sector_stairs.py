@@ -360,6 +360,113 @@ def test_mid_build_failure_rolls_back():
     print("  exception mid-build rolls back, no history entry")
 
 
+def test_flip_on_one_sided_wall_is_refused():
+    """Flip needs a back side; on a one-sided wall it must change nothing.
+
+    The bare ``v1 <-> v2`` swap that is all a one-sided wall could do turns its
+    only directed edge the wrong way, ``_ensure_polys`` drops the contour and the
+    sector silently becomes void.  The refusal is what keeps the map intact, and
+    "the map is byte-identical afterwards" is the assertion that matters.
+    """
+    ed = SectorEditor(_map())
+    before = ed.sm.to_json()
+    hist = len(ed._history)
+    ld = ed.lines[1]                                # low room's right wall
+    assert ld.back < 0, "test wall is not one-sided"
+    assert ed.flip_line(1) is False, "flip accepted on a one-sided wall"
+    assert ed.sm.to_json() == before, "a refused flip mutated the map"
+    assert len(ed._history) == hist, "a refused flip left an undo entry"
+    assert not ed.lines[1].two_sided, ed.lines[1]
+    # these maps carry no spawn, so only the linedef complaints are ours to check
+    assert not [e for e in ed.validate() if "sidedef" in e], ed.validate()
+
+    # two-sided with both sectors alive: the flip goes through, and the sector
+    # it used to bound keeps its polygon
+    ed2 = SectorEditor(_map())
+    ed2.set_two_sided(1, True, back_sector=1)
+    ed2.sm.invalidate()
+    assert not [e for e in ed2.validate() if "sidedef" in e], ed2.validate()
+    alive_before = _alive(ed2)
+    v1, v2 = ed2.lines[1].v1, ed2.lines[1].v2
+    front, back = ed2.lines[1].front, ed2.lines[1].back
+    assert ed2.flip_line(1) is True, "flip refused on a two-sided wall"
+    assert (ed2.lines[1].v1, ed2.lines[1].v2) == (v2, v1), "vertices not swapped"
+    assert (ed2.lines[1].front, ed2.lines[1].back) == (back, front), "sides not swapped"
+    ed2.sm.invalidate()
+    assert _alive(ed2) == alive_before, sorted(_alive(ed2))
+    assert not [e for e in ed2.validate() if "sidedef" in e], ed2.validate()
+    print("  flip refused on a one-sided wall, applied on a two-sided one")
+
+
+def test_wall_without_a_front_side_is_not_a_staircase_end():
+    """A stair end reads its FRONT side — so a missing front must be refused.
+
+    ``sides[-1]`` is the last sidedef in the file, i.e. somebody else's wall, and
+    its floor height is a number the tool would happily build steps from.  Both
+    messages the old code produced here were lies about the map.
+    """
+    # (a) both sides gone — what "1-ст." left behind before the repair
+    ed = SectorEditor(_map())
+    ed.lines[1].front = -1
+    ed.lines[1].back = -1
+    ed.sm.invalidate()
+    assert ed.sides[-1].sector == ed.sides[ed.lines[5].front].sector, \
+        "test no longer reproduces the sides[-1] mix-up"
+    errs = _expect_reject(ed, _points(), "wall with no sides")
+    assert "передней стороны" in errs, errs
+    assert "одной высоте" not in errs, errs
+
+    # (b) only the back side survived — what "Flip" used to leave behind
+    ed2 = SectorEditor(_map())
+    ld = ed2.lines[1]
+    ld.v1, ld.v2 = ld.v2, ld.v1
+    ld.front, ld.back = ld.back, ld.front
+    assert ld.front < 0 and ld.back >= 0, (ld.front, ld.back)
+    ed2.sm.invalidate()
+    errs = _expect_reject(ed2, _points(), "wall with no front side")
+    assert "передней стороны" in errs, errs
+    assert "проём между секторами" not in errs, errs
+    print("  stair end needs its own front side, and is told which wall is broken")
+
+
+def test_stair_end_in_a_void_sector_is_refused():
+    """A wall whose sector lost its contour bounds emptiness, not a room.
+
+    The floor height is still a number, and building steps to it would put a
+    staircase into the void — reachable from nowhere and leading nowhere.
+    """
+    ed = SectorEditor(_map())
+    ed._drop(lines={0}, record=False)     # low room loses its top wall
+    assert not ed.sm.has_polygon(0), "sector 0 was supposed to become void"
+    errs = _expect_reject(ed, _points(), "stair end in a void sector")
+    assert "не замкнулся в контур" in errs, errs
+    print("  stair end in a sector that is void is refused by name")
+
+
+def test_two_ends_of_one_sector_are_named_as_such():
+    """Two walls of the same room are a bad pick, not a height problem.
+
+    "полы секторов на одной высоте" is what the author saw, and it sent them
+    looking for a height bug: both ends were simply walls of ONE sector, which
+    has no height difference to climb by definition.
+    """
+    ed = SectorEditor(_map())
+    # the low room's bottom wall (y=0) and top wall (y=384): two one-sided
+    # walls of sector 0, with no corners in common
+    for li in (0, 2):
+        assert ed.lines[li].back < 0, "fixture: both must be one-sided"
+        assert ed.sides[ed.lines[li].front].sector == 0
+    pts = [(96.0, 0.0), (48.0, 0.0), (96.0, 384.0), (48.0, 384.0)]
+    before = ed.sm.to_json()
+    info, errs = ed.build_stair(pts)
+    assert info is None, info
+    msg = "; ".join(errs)
+    assert "одному сектору 0" in msg, errs
+    assert "одной высоте" not in msg, errs
+    assert ed.sm.to_json() == before, "a rejected staircase changed the map"
+    print("  two ends in one sector are named, not called a height tie")
+
+
 def main():
     print("smoke_sector_stairs")
     test_treads_are_closed_and_stepped()
@@ -368,6 +475,10 @@ def main():
     test_undo_redo_is_exact()
     test_mid_build_failure_rolls_back()
     test_rejections_leave_no_trace()
+    test_flip_on_one_sided_wall_is_refused()
+    test_wall_without_a_front_side_is_not_a_staircase_end()
+    test_stair_end_in_a_void_sector_is_refused()
+    test_two_ends_of_one_sector_are_named_as_such()
     test_click_order_does_not_matter()
     test_rise_is_clamped_and_bounded()
     test_default_rise_and_sector_metadata()

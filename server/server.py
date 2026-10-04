@@ -24,7 +24,8 @@ from server.game_data import (
 from server.lobby import Lobby, Party
 from server.network import ServerNetwork
 from server.player import PlayerSession
-from server.weapons import handle_shoot as weapons_handle_shoot, apply_weapon_switch
+from server.weapons import (
+    FireResult, handle_shoot as weapons_handle_shoot, apply_weapon_switch)
 
 logger = logging.getLogger(__name__)
 
@@ -274,17 +275,29 @@ class GameServer:
     def _on_player_fire(
         self, session: PlayerSession, fire_seq: int, weapon_id: int = 1
     ) -> None:
-        # Idempotent: the reliable channel may redeliver the same intent. Only
-        # an accepted intent advances last_fire_seq, so a redelivery of a
-        # refused intent is refused again (no ammo is spent twice, and the
-        # decision the client sees stays truthful).
-        if fire_seq == session.last_fire_seq:
+        # Idempotent: the reliable channel may redeliver an intent, and it may
+        # redeliver it LATE. The test is therefore "not newer than the last
+        # decided intent", not "equal to the last accepted one": the reliable
+        # channel retransmits with rto=0.2 and exponential backoff, so an intent
+        # refused for cooldown can come back after a later intent was accepted.
+        # Deciding it again would overwrite that acceptance with a bogus refusal,
+        # which the client then charges against whatever it has in flight (the
+        # accepted shot loses its recoil mid-animation). The client numbers its
+        # intents strictly increasing (send_fire bumps the counter on every
+        # send), so "not newer" can never reject a fresh intent.
+        if fire_seq <= session.last_fire_seq:
             return
         party = self.lobby.find_party_of(session)
         if party is None:
+            # An intent the server cannot process still gets a decision: a
+            # silent drop is indistinguishable from a lost packet, and the
+            # client would keep the predicted recoil playing with no shot and no
+            # answer ever coming. The press is spent (retrying cannot help).
+            session.last_fire_result = FireResult(False, 'noop', 0)
             return
         entity_id = party.world.get_player_entity(session.player_id)
         if entity_id is None:
+            session.last_fire_result = FireResult(False, 'noop', 0)
             return
         apply_weapon_switch(party.world, entity_id, weapon_id)
         result = weapons_handle_shoot(party.world, entity_id)

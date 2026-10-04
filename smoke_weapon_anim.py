@@ -74,6 +74,7 @@ class FakeInput:
         self.weapon_id = weapon_id
         self.shoot = shoot
         self.shoot_pressed = pressed
+        self.dash_pressed = False
         self.rotate_delta = 0.0
 
     def update(self):
@@ -83,9 +84,14 @@ class FakeInput:
 class FakeNet:
     def __init__(self):
         self.fired = []
+        self._seq = 0
 
     def send_fire(self, wpn):
+        # Real NetworkClient hands out a strictly increasing intent number and
+        # returns it; the client files every intent it sent.
+        self._seq += 1
         self.fired.append(wpn)
+        return self._seq
 
 
 def make_client(weapon_id=0, shoot=False, pressed=False, anim_until=0.0,
@@ -99,9 +105,8 @@ def make_client(weapon_id=0, shoot=False, pressed=False, anim_until=0.0,
     c._fire_anim_until = anim_until
     c._fire_anim_wpn = anim_wpn
     c._next_fire_time = gate
-    c._fire_press_queue = deque()
-    c._fire_served_press_time = None
-    c._fire_undecided = 0
+    c._fire_press_buffered = False
+    c._fire_pending = deque()
     c._server_fire_seq = 0
     c._server_fire_ready = 0
     c.local_weapon = weapon_id

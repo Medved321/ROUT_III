@@ -236,7 +236,7 @@ def test_player_colors():
 
 
 def test_screen_streaks():
-    """9. Speed lines: own dash only, viewport-bounded, fading to nothing.
+    """9. Speed rays: own dash only, aimed at the centre, fading to nothing.
 
     Driven straight through ``draw_dash_streaks`` on a blank framebuffer: a full
     ``render()`` would mix animated textures and the world itself into the
@@ -251,19 +251,20 @@ def test_screen_streaks():
     w, h = const.W, const.H
 
     def lit_pixels():
-        surf = rendering._streak_surf
-        if surf is None:
+        field = rendering._ray_field
+        if field is None:
             return -1
-        return sum(1 for y in range(0, surf.get_height(), 2)
-                   for x in range(0, surf.get_width(), 4)
-                   if surf.get_at((x, y))[3] > 0)
+        return sum(1 for spr, _a, _o, _p, _d, _t, _l in field
+                   for y in range(0, spr.get_height())
+                   for x in range(0, spr.get_width(), 2)
+                   if spr.get_at((x, y))[3] > 0)
 
-    # At rest: nothing is drawn, and the overlay surface is not even allocated.
+    # At rest: nothing is drawn, and not even the ray sprites are baked.
     gs.screen.fill((10, 20, 30))
     idle = pygame.image.tostring(gs.screen, 'RGB')
     rendering.draw_dash_streaks(rh, ry)
     assert pygame.image.tostring(gs.screen, 'RGB') == idle, 'drew at rest'
-    assert rendering._streak_surf is None, 'overlay allocated while idle'
+    assert rendering._ray_field is None, 'ray field baked while idle'
 
     # Dashing: the frame changes, and the envelope decays per call.
     gs.dash_fx = 1.0
@@ -271,7 +272,66 @@ def test_screen_streaks():
     dashed = pygame.image.tostring(gs.screen, 'RGB')
     assert dashed != idle, 'own dash painted nothing'
     assert gs.dash_fx == 1.0 - const.DASH_FX_FADE, gs.dash_fx
-    assert lit_pixels() > 0, 'streak surface is empty while dashing'
+    assert lit_pixels() > 0, 'ray field is empty while dashing'
+
+    # Every ray is a triangle pointing at the aim point: transparent at the apex
+    # and at the border end, brightest past the middle, and feathered across its
+    # width. Solid rects with hard ends are what this replaces -- they are what
+    # made the cue read as tearing.
+    for spr, arm, _off, _peak, _dead, _travel, _length in rendering._ray_field:
+        sw, sh = spr.get_size()
+        horiz = arm == 'L' or arm == 'R'
+        ln, th = (sw, sh) if horiz else (sh, sw)
+        mid_c = th // 2
+
+        def along(t):
+            return spr.get_at((t, mid_c))[3] if horiz else spr.get_at((mid_c, t))[3]
+
+        # Both ends of the length reach zero in the template, but a heavily
+        # downscaled ray averages the whole fade-out tail into its last pixel, so
+        # the criterion is relative: an end may only be a sliver of the peak. A
+        # hard end would be a visible fraction of it.
+        samples = [along((ln - 1) * k // 15) for k in range(16)]
+        peak = max(samples)
+        assert peak > 8, f'ray is flat at {peak}, not a gradient'
+        assert samples[0] * 6 <= peak, f'ray starts on a hard edge ({samples[0]}/{peak})'
+        assert samples[-1] * 6 <= peak, f'ray ends on a hard edge ({samples[-1]}/{peak})'
+        if th >= 3:
+            # A ray only has sides once it is three pixels or more across: two
+            # rows are both inside the wedge, and averaging the template down to
+            # them cannot produce a feather that was never there.
+            # The wedge widens towards the border, so the column at the peak is
+            # the widest one and the only fair place to read the profile.
+            col = min(ln - 1, int(ln * 0.68))
+            mid = along(col)
+            top = spr.get_at((col, 0))[3] if horiz else spr.get_at((0, col))[3]
+            bot = (spr.get_at((col, th - 1))[3] if horiz
+                   else spr.get_at((th - 1, col))[3])
+            assert max(top, bot) * 2 < mid * 3, (
+                f'{sw}x{sh} ray has hard side edges: {top}/{bot} vs {mid}')
+
+    # Nothing may reach the aim point: the crosshair sits on top of it and a ray
+    # through the middle is what makes the cue unreadable exactly when it fires.
+    cx, cy = w * 0.5, ry + rh * 0.5
+    for y in range(int(cy) - 6, int(cy) + 7):
+        for x in range(int(cx) - 6, int(cx) + 7):
+            assert gs.screen.get_at((x, y))[:3] == (10, 20, 30), (
+                f'ray covers the aim point at {x},{y}')
+
+    # The rays sweep outward instead of sitting still. The envelope has to be
+    # frozen for the comparison, or the fade alone would move the ink and prove
+    # nothing.
+    fade = const.DASH_FX_FADE
+    const.DASH_FX_FADE = 0.0
+    try:
+        gs.dash_fx = 1.0
+        rendering.draw_dash_streaks(rh, ry)
+        held = pygame.image.tostring(gs.screen, 'RGB')
+        rendering.draw_dash_streaks(rh, ry)
+        assert pygame.image.tostring(gs.screen, 'RGB') != held, 'rays do not move'
+    finally:
+        const.DASH_FX_FADE = fade
+        gs.dash_fx = 1.0 - const.DASH_FX_FADE
 
     # Only the viewport rows change: the HUD band above and below stays intact.
     def row(y):
@@ -279,8 +339,8 @@ def test_screen_streaks():
     top_same = all(row(y) == idle[y * w * 3:(y + 1) * w * 3] for y in range(ry))
     bottom_same = all(row(y) == idle[y * w * 3:(y + 1) * w * 3]
                       for y in range(ry + rh, h))
-    assert top_same, 'streaks painted over the HUD band above the view'
-    assert bottom_same, 'streaks painted over the HUD band below the view'
+    assert top_same, 'rays painted over the HUD band above the view'
+    assert bottom_same, 'rays painted over the HUD band below the view'
 
     # Decays to nothing within a dash-length window and then stops costing.
     frames = 1
@@ -292,7 +352,7 @@ def test_screen_streaks():
     gs.screen.fill((10, 20, 30))
     rendering.draw_dash_streaks(rh, ry)
     assert pygame.image.tostring(gs.screen, 'RGB') == idle, 'still drawing after fade'
-    print(f'9. screen streaks: viewport-bounded, fade out in {frames} frames OK')
+    print(f'9. screen rays: viewport-bounded, fade out in {frames} frames OK')
 
 
 def test_streaks_armed_only_by_own_dash():
@@ -303,15 +363,15 @@ def test_streaks_armed_only_by_own_dash():
     from engine import constants as const
     b = _new_bridge()
     _reset()
-    # The overlay surface is module-level and cached between tests; drop it so
-    # "was it ever allocated" means something here.
-    rendering._streak_surf = None
+    # The ray field is module-level and cached between tests; drop it so
+    # "was it ever baked" means something here.
+    rendering._ray_field = None
 
     # A remote dash spawns world dust but must not touch the screen overlay.
     p = {'id': 1, 'x': 500.0, 'y': 500.0, 'angle': 0.0, 'state': DASH}
     _frame(b, players=[p])
     assert gs.dash_fx == 0.0, 'remote dash armed the own-dash overlay'
-    assert rendering._streak_surf is None, 'remote dash allocated the overlay'
+    assert rendering._ray_field is None, 'remote dash baked the ray field'
 
     # Own dash arms it, even with effects at the floor: this is the only
     # screen-space signal that the dash happened.
@@ -319,13 +379,16 @@ def test_streaks_armed_only_by_own_dash():
     gs.effects_factor = 0.0
     _frame(b, local_state=DASH)
     assert gs.dash_fx > 0.0, 'own dash did not arm the overlay'
-    surf = rendering._streak_surf
-    lit = sum(1 for y in range(0, surf.get_height(), 2)
-              for x in range(0, surf.get_width(), 4)
-              if surf.get_at((x, y))[3] > 0)
-    assert lit > 0, 'no streak drawn at effects_factor 0'
+    field = rendering._ray_field
+    lit = sum(1 for spr, _a, _o, _p, _d, _t, _l in field
+              for y in range(0, spr.get_height())
+              for x in range(0, spr.get_width(), 2)
+              if spr.get_at((x, y))[3] > 0)
+    assert lit > 0, 'no ray drawn at effects_factor 0'
+    assert len(field) == const.DASH_FX_STREAKS_MIN, (
+        f'{len(field)} rays at effects_factor 0')
     gs.effects_factor = 1.0
-    print('10. streaks: remote dash draws none, own dash always draws some OK')
+    print('10. rays: remote dash draws none, own dash always draws some OK')
 
 
 def main():

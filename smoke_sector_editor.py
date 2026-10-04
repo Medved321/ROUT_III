@@ -609,9 +609,263 @@ def test_delete_vertex_from_selection():
     print("  delete vertex    OK")
 
 
+def _per_wall_rooms() -> SectorMap:
+    """Two rooms side by side, every wall with its OWN sidedef.
+
+    ``new_room`` shares one sidedef across all four walls, and that hides the
+    damage this change is about: with a single shared side the greedy contour
+    walk simply routes around one backwards edge and the room survives.  The
+    reported bug needs per-wall sides, which is what the editor produces as soon
+    as a room is split — so this is the geometry the tests below work on.
+    """
+    sm = SectorMap([], [], [], [
+        Sector(floor_h=0, ceil_h=128),
+        Sector(floor_h=64, ceil_h=128),
+    ])
+    sm.things.append(Thing(96, 96))
+    for x0, x1, sid in ((0, 192, 0), (400, 592, 1)):
+        base = len(sm.verts)
+        for x, y in ((x0, 0), (x1, 0), (x1, 384), (x0, 384)):
+            sm.verts.append(Vertex(float(x), float(y)))
+        side = len(sm.sidedefs)
+        sm.sidedefs.append(SideDef(sector=sid))
+        for i in range(4):
+            sm.linedefs.append(LineDef(base + i, base + (i + 1) % 4, front=side))
+    sm.invalidate()
+    return sm
+
+
+def _poly_points(sm: SectorMap, sid: int) -> set:
+    """Sector ``sid``'s polygon, as a set of points: order/rotation insensitive."""
+    return {p for poly, _bbox, _area in sm._ensure_polys()[sid] for p in poly}
+
+
+def _flipped(ld) -> None:
+    """Corrupt a linedef the way the old flip did: sides swap, vertices swap."""
+    ld.v1, ld.v2 = ld.v2, ld.v1
+    ld.front, ld.back = ld.back, ld.front
+
+
+def test_one_sided_flip_is_refused():
+    """Flip is a front/back swap, and a one-sided wall has no back to swap with.
+
+    Swapping alone re-aims the wall but keeps the sector's directed edge, so the
+    room survives — while ``validate()`` already calls the map broken ("missing
+    front sidedef").  The damage lands on the NEXT action: "1-ст." clears the
+    back side too, the wall stops bounding anything and the room goes void.  The
+    refusal is what keeps the map out of that state at all.
+    """
+    ed = SectorEditor(_per_wall_rooms())
+    # what the old flip plus the old "1-ст." did to this very wall, recorded so
+    # the test cannot pass for the wrong reason
+    probe = SectorEditor(_per_wall_rooms())
+    _flipped(probe.lines[1])
+    probe.lines[1].back = -1            # the old one-sided toggle cleared it too
+    probe.sm.invalidate()
+    assert [e for e in probe.validate() if "missing front" in e], probe.validate()
+    assert not probe.sm.has_polygon(0), "precondition: the room went void"
+
+    before = ed.sm.to_json()
+    assert ed.flip_line(1) is False, "flip accepted on a one-sided wall"
+    assert ed.sm.to_json() == before, "a refused flip mutated the map"
+    assert not ed._history, "a refused flip left an undo entry"
+    assert not ed.lines[1].two_sided, ed.lines[1]
+    assert not ed.validate(), ed.validate()
+    assert ed.sm.has_polygon(0), "the room lost its contour"
+    print("  one-sided flip refused, map untouched")
+
+
+def test_one_sided_toggle_repairs_a_frontless_wall():
+    """"1-ст." on a wall whose front side is gone must bring it back.
+
+    The old code cleared the back side as well, which left a linedef with no
+    sides at all — a wall belonging to no sector.  That is what actually killed
+    the room: with the wall no longer bounding it, the contour stops closing.
+    The back side becomes the front instead, with the vertex swap that keeps the
+    directed edge identical, so the polygon comes back exactly as it was and the
+    caller is told a repair happened.
+    """
+    ed = SectorEditor(_per_wall_rooms())
+    footprint = _poly_points(ed.sm, 0)
+    ld = ed.lines[1]
+    _flipped(ld)
+    ed.sm.invalidate()
+    assert ld.front < 0 and ld.back >= 0, (ld.front, ld.back)
+    assert [e for e in ed.validate() if "missing front" in e], ed.validate()
+    n_sides = len(ed.sides)
+
+    notes = ed.set_two_sided(1, False)
+    ed.sm.invalidate()
+    assert notes and "восстановлена" in notes[0], notes
+    assert ld.front >= 0 and ld.back == -1, (ld.front, ld.back)
+    assert len(ed.sides) == n_sides, "no side may be dropped on the way"
+    assert all(l.front >= 0 for l in ed.lines), "a linedef is left frontless"
+    assert _poly_points(ed.sm, 0) == footprint, "the room's polygon moved"
+    assert not ed.validate(), ed.validate()
+    # and it is a real edit: one undo step puts the damage back
+    assert ed.can_undo(), "the repair left no undo entry"
+    ed.undo()
+    assert ed.lines[1].front < 0, "undo did not put the frontless wall back"
+    print("  one-sided toggle repairs a frontless wall")
+
+
+def test_sealing_a_wall_refuses_to_void_the_room_behind_it():
+    """"1-ст." must not turn the room behind the wall into a void.
+
+    This is the reported loss, in the shape the panel can produce it: sealing
+    the wall two rooms share drops the back side, and with it the only edge
+    that closed the far room's contour.  The sector stops being walkable, its
+    area is gone and its height disappears from the panel — silently, with no
+    note and nothing to undo but the whole edit.  The toggle is refused and the
+    refusal names the sector that would have been lost.
+    """
+    ed = SectorEditor(_two_rooms())
+    shared = 1
+    assert ed.lines[shared].two_sided, "fixture: the rooms must share a portal"
+    assert ed.sm.has_polygon(0) and ed.sm.has_polygon(1)
+    before = ed.sm.to_json()
+
+    notes = ed.set_two_sided(shared, False)
+    assert notes, "sealing the shared wall was allowed"
+    assert "сектора 1" in notes[0], notes
+    assert "контур" in notes[0], notes
+    assert ed.sm.to_json() == before, "a refused toggle changed the map"
+    assert ed.lines[shared].two_sided, "the portal was dropped anyway"
+    assert ed.sm.has_polygon(1), "the far room died"
+    assert ed.sectors[1].floor_h == 0, "the far room lost its height"
+    assert not ed.validate(), ed.validate()
+    assert not ed.can_undo(), "a refusal left an undo entry"
+
+    # a wall whose far sector has ANOTHER contour to close still seals: the
+    # question is "does the sector survive", not "is the wall shared"
+    ed2 = SectorEditor(_two_rooms())
+    sm = ed2.sm
+    base = len(sm.verts)
+    for x, y in ((2400.0, 0.0), (3200.0, 0.0), (3200.0, 800.0), (2400.0, 800.0)):
+        sm.verts.append(Vertex(x, y))
+    for v1, v2 in ((base, base + 1), (base + 1, base + 2),
+                   (base + 2, base + 3), (base + 3, base)):
+        sm.sidedefs.append(SideDef(sector=1))          # a second island of
+        sm.linedefs.append(LineDef(v1, v2,             # the same right room
+                                   front=len(sm.sidedefs) - 1))
+    sm.invalidate()
+    assert ed2.sm.has_polygon(1)
+    assert ed2.set_two_sided(1, False) == [], \
+        "the room survives on its second contour, so sealing is fine"
+    assert ed2.lines[1].back == -1
+    assert ed2.sm.has_polygon(1), "the island room lost everything"
+    assert not ed2.validate(), ed2.validate()
+    print("  sealing a wall refuses to void the room behind it")
+
+
+def test_two_sided_toggle_refuses_a_self_portal():
+    """"2-ст." must not aim the back side at the wall's own sector.
+
+    Both sides in one sector is a self-portal: the edge is walked twice in
+    opposite directions, and every "wall between two rooms" feature — the
+    staircase included — reads a portal whose two floors are necessarily at the
+    same height.  An aim at an EMPTY sector is deliberately still allowed:
+    sectors are created empty and closed later by ``sector_from_contour``.
+    """
+    ed = SectorEditor(_two_rooms())
+    wall = 2                                    # one-sided wall of the left room
+    ld = ed.lines[wall]
+    assert ld.back == -1, "fixture: the wall must be one-sided"
+    own = ed.sides[ld.front].sector
+    ed.cur_sector = own                        # picked inside that very room
+    before = ed.sm.to_json()
+
+    notes = ed.set_two_sided(wall, True)
+    assert notes, "a self-portal was created"
+    assert f"сектор {own}" in notes[0], notes
+    assert ed.sm.to_json() == before, "a refused toggle changed the map"
+    assert ld.back == -1, "the self-portal is there anyway"
+    assert not ed.can_undo(), "a refusal left an undo entry"
+
+    # an empty (not yet closed) sector is a normal target: rooms are drawn
+    # first and closed afterwards
+    ed2 = SectorEditor(_two_rooms())
+    ed2.sectors.append(Sector(floor_h=32, ceil_h=128, light=80))
+    assert ed2.set_two_sided(wall, True, back_sector=len(ed2.sectors) - 1) == []
+    assert ed2.lines[wall].back >= 0
+    assert ed2.sides[ed2.lines[wall].back].sector == len(ed2.sectors) - 1
+
+    # and the real thing still works: a second, live sector is accepted
+    notes = ed.set_two_sided(wall, True, back_sector=1)
+    assert notes == [], notes
+    assert ld.back >= 0 and ed.sides[ld.back].sector == 1
+    assert not ed.validate(), ed.validate()
+    ed.undo()
+    assert ld.back == -1, "undo did not take the portal back"
+    print("  two-sided toggle refuses a self-portal")
+
+
+def test_load_repairs_a_broken_map():
+    """A map saved by the old editor opens repaired, and says so.
+
+    Two cases, both from the reported damage: a wall left with only a back side
+    (after Flip) and a wall left with no sides at all (after "1-ст.").  The
+    repair is the loaded state, not an edit — it must not be undoable, or the
+    first Ctrl+Z would hand the author a map nobody ever drew.
+    """
+    # (a) frontless, back side alive -> promoted back to front
+    sm = _per_wall_rooms()
+    _flipped(sm.linedefs[1])
+    ed = SectorEditor(sm)
+    assert any("восстановлена" in n for n in ed.repair_notes), ed.repair_notes
+    assert all(l.front >= 0 for l in ed.lines), "a linedef is left frontless"
+    assert ed.validate() == [], ed.validate()
+    assert ed.sm.has_polygon(0), "the room did not come back"
+    assert not ed._history, "the repair became an undoable edit"
+
+    # (b) no sides at all -> the orphaned wall goes, and the sector it leaves
+    # without a contour is named instead of quietly going void
+    sm2 = _per_wall_rooms()
+    sm2.linedefs[1].front = -1
+    sm2.linedefs[1].back = -1
+    ed2 = SectorEditor(sm2)
+    assert any("удалена" in n for n in ed2.repair_notes), ed2.repair_notes
+    assert any("без замкнутого контура" in n for n in ed2.repair_notes), \
+        ed2.repair_notes
+    assert all(l.front >= 0 for l in ed2.lines), "a linedef is left frontless"
+    assert not [e for e in ed2.validate() if "sidedef" in e], ed2.validate()
+    assert not ed2._history, "the repair became an undoable edit"
+
+    # a healthy map is left completely alone
+    ed3 = SectorEditor(_per_wall_rooms())
+    assert ed3.repair_notes == [], ed3.repair_notes
+    print("  load repairs a broken map, a healthy one not at all")
+
+
+def test_two_sided_predicate():
+    """``line_two_sided`` asks "both sides?", ``LineDef.two_sided`` asks "back?".
+
+    They disagree exactly on a wall the old editor could produce, and the editor
+    features that mean "a wall between two sectors" must not act on it.
+    """
+    ed = SectorEditor(_per_wall_rooms())
+    assert not ed.line_two_sided(1), "a fresh wall is not a portal"
+    ld = ed.lines[1]
+    ld.front, ld.back = -1, 0
+    assert ld.two_sided, "precondition: shared property says 'has a back side'"
+    assert not ed.line_two_sided(1), "no front side is not a portal"
+    ld.front = 0
+    ld.back = len(ed.sides)
+    ed.sides.append(SideDef(sector=1))
+    assert ed.line_two_sided(1), "both sides is a portal"
+    assert not ed.line_two_sided(99), "out-of-range index is not a portal"
+    print("  two-sided predicate disagrees with the shared one on purpose")
+
+
 def main():
     test_vertex_ops()
     test_line_ops()
+    test_one_sided_flip_is_refused()
+    test_one_sided_toggle_repairs_a_frontless_wall()
+    test_sealing_a_wall_refuses_to_void_the_room_behind_it()
+    test_two_sided_toggle_refuses_a_self_portal()
+    test_load_repairs_a_broken_map()
+    test_two_sided_predicate()
     test_sector_from_contour()
     test_height_clamp()
     test_solid_flag_and_step_textures()

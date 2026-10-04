@@ -107,6 +107,9 @@ def main():
     _check_heights_and_solid(scr, surface)
     _check_tex_palette(scr, surface)
     _check_panel_layout(surface)
+    _check_front_side_invariant(scr, surface)
+    _check_side_toggle_refusals_reach_the_status_line(scr, surface)
+    _check_load_reports_a_repair(scr, surface)
     _check_selection_survives_nothing(scr, surface)
     _check_map_list(scr, surface)
     print("smoke_sector_editor_screen: ALL OK")
@@ -333,14 +336,23 @@ def _check_heights_and_solid(scr, surface) -> None:
     assert ed.sectors[0].ceil_h == 96, ed.sectors[0].ceil_h
     assert ed.sectors[0].floor_h == 16
 
-    # a two-sided linedef gets a solid/portal toggle that changes the model
+    # a two-sided linedef gets a solid/portal toggle that changes the model.
+    # The portal needs a SECOND sector: the wall is drawn from inside the
+    # current one, so a bare «2-ст.» here would aim the back side at the very
+    # sector the front belongs to, which is refused as a self-portal.
+    ed.cur_sector = 0                         # the wall is drawn inside room 0
     v1 = ed.add_vertex(300, 300)
     v2 = ed.add_vertex(700, 300)
     li = ed.add_line(v1, v2)
+    ed.add_sector(floor_h=32, ceil_h=128, light=90)
+    ed.cur_sector = len(ed.sectors) - 1   # now standing in the other room
+    assert ed.sides[ed.lines[li].front].sector != ed.cur_sector, \
+        "fixture: the portal would aim at the wall's own sector"
     scr._set_sel(line=li)
     scr.draw(surface)
     assert "solid" not in scr._prop_chips, "one-sided linedef has no toggle"
     scr._prop("two")
+    assert ed.lines[li].back >= 0, scr.status
     scr.draw(surface)
     assert "solid" in scr._prop_chips, scr._prop_chips
     scr._prop("solid")
@@ -417,8 +429,8 @@ def _check_panel_layout(surface) -> None:
         assert scr.thing_type == name
         # a one-sided line shows the flats block instead of the textures
         scr.draw(surf)
-        scr._set_sel(line=ids[1])
-        ed.set_two_sided(ids[1], False)
+        spare = ed.add_line(*(ed.add_vertex(200, 900), ed.add_vertex(900, 900)))
+        scr._set_sel(line=spare)
         scr.draw(surf)
         assert scr._tex_side_idx() is None
     print("  panel layout fits OK")
@@ -439,9 +451,12 @@ def _check_tex_palette(scr, surface) -> None:
     scr.editor = ed
     scr.frame_around()
 
-    # no palette while nothing (or a one-sided line) is selected
-    scr._set_sel(line=ids[1])
-    ed.set_two_sided(ids[1], False)
+    # no palette while nothing (or a one-sided line) is selected.  A fresh line is
+# one-sided by construction: sealing an existing portal would be refused when
+# the sector behind it would lose its contour, and that is covered elsewhere.
+    spare = ed.add_line(*(ed.add_vertex(200, 900), ed.add_vertex(900, 900)))
+    assert not ed.line_two_sided(spare)
+    scr._set_sel(line=spare)
     scr.draw(surface)
     assert scr._tex_side_idx() is None, "one-sided linedef has no texture palette"
     assert not scr._base_chips_y > scr.panel.bottom - BASE_CHIPS_H, \
@@ -576,6 +591,195 @@ def _geometry(sm):
     things = sorted((round(t.x, 2), round(t.y, 2), t.type, t.angle, round(t.z, 2))
                     for t in sm.things)
     return (pos, sorted(lines), sectors, things)
+
+
+def _check_front_side_invariant(scr, surface) -> None:
+    """The panel must not pretend a refused edit worked, and a repair must speak.
+
+    These are the two status strings the reported damage went without: ``Flip``
+    on a one-sided wall was accepted silently, and a map repaired on load looked
+    exactly like a clean one.  Both are checked through the real widget, because
+    the widget is what decides whether the author ever hears about it.
+    """
+    ed = SectorEditor(new_room(1600, 1600))
+    a = ed.add_vertex(100, 100)
+    b = ed.add_vertex(900, 100)
+    c = ed.add_vertex(900, 500)
+    d = ed.add_vertex(100, 500)
+    ids = [ed.add_line(*e) for e in ((a, b), (b, c), (c, d), (d, a))]
+    ed.sector_from_contour(ids, floor_h=16, ceil_h=128)
+    # a genuine one-sided wall, drawn rather than sealed: sealing a portal is
+    # refused whenever the sector behind it would lose its contour
+    single = ed.add_line(*(ed.add_vertex(100, 700), ed.add_vertex(900, 700)))
+    assert not ed.line_two_sided(single)
+    scr.editor = ed
+    scr.frame_around()
+
+    # Flip on the one-sided wall: refused, explained, and nothing touched
+    before = ed.sm.to_json()
+    hist = len(ed._history)
+    scr._set_sel(line=single)
+    scr._prop("flip")
+    assert scr.status, "a refused Flip said nothing"
+    assert "двусторонней" in scr.status, scr.status
+    assert ed.sm.to_json() == before, "a refused Flip changed the map"
+    assert len(ed._history) == hist, "a refused Flip left an undo entry"
+    scr.draw(surface)
+
+    # a wall the old editor left frontless: the panel calls it one-sided (the
+    # shared property would say two-sided), offers no portal textures, and "1-ст."
+    # is what brings the sector back — with a status that says so.  The damage is
+    # applied directly to a fresh one-sided wall: it is what the old Flip left on
+    # disk, not something the editor can be asked to do any more.
+    broken = ed.add_line(*(ed.add_vertex(100, 900), ed.add_vertex(900, 900)))
+    ld = ed.lines[broken]
+    assert ld.back < 0, "precondition: the wall starts one-sided"
+    ld.v1, ld.v2 = ld.v2, ld.v1
+    ld.front, ld.back = ld.back, ld.front
+    ed.sm.invalidate()
+    assert ld.two_sided, "precondition: the shared property sees a back side"
+    assert ld.front < 0, "precondition: the wall is frontless now"
+    scr._set_sel(line=broken)
+    assert "1ст." in scr._tool_selection_label(), scr._tool_selection_label()
+    assert scr._tex_side_idx() is None, "a frontless wall must not be textured"
+    scr.draw(surface)
+    footprint = len(ed.sides)
+    scr._prop("one")
+    assert "восстановлена" in scr.status, scr.status
+    assert len(ed.sides) == footprint, "the repair dropped a side"
+    assert all(l.front >= 0 for l in ed.lines), "a wall is still frontless"
+    assert not ed.validate(), ed.validate()
+    scr.draw(surface)
+    print("  refused Flip and wall repair both reach the status line")
+
+
+def _check_side_toggle_refusals_reach_the_status_line(scr, surface) -> None:
+    """Both sidedness toggles must be able to SAY no, and the map must survive it.
+
+    ``1-ст.`` on the wall two rooms share used to drop the back side, and with it
+    the only edge closing the far room's contour: the sector went void, its
+    height vanished from the panel, and nothing said so.  ``2-ст.`` aimed at
+    whatever sector was picked last, which can be the wall's own — a self-portal
+    that reads, to the staircase, like two floors at the same height.
+    """
+    ed = SectorEditor(new_room(1600, 1600))
+    a = ed.add_vertex(100, 100)
+    b = ed.add_vertex(900, 100)
+    c = ed.add_vertex(900, 700)
+    d = ed.add_vertex(100, 700)
+    ids = [ed.add_line(*e) for e in ((a, b), (b, c), (c, d), (d, a))]
+    _, errs = ed.sector_from_contour(ids, floor_h=0, ceil_h=128)
+    assert not errs, errs
+    # a second room hanging off the divider, so the divider is a real portal:
+    # the new room walks it backwards, which is what a back side is for
+    f2 = ed.add_vertex(1400, 100)
+    g2 = ed.add_vertex(1400, 700)
+    far = [ed.add_line(*e) for e in ((b, f2), (f2, g2), (g2, c))]
+    sid, errs = ed.sector_from_contour(far + [ids[1]], floor_h=64, ceil_h=128)
+    assert sid >= 0 and not errs, errs
+    scr.editor = ed
+    scr.frame_around()
+
+    divider = ids[1]
+    assert ed.lines[divider].two_sided, "precondition: a portal between rooms"
+    heights = [ed.sectors[i].floor_h for i in range(len(ed.sectors))]
+    alive = {i for i in range(len(ed.sectors)) if ed.sm.has_polygon(i)}
+    before = ed.sm.to_json()
+
+    # «1-ст.» on the shared wall: refused, the far room keeps its floor
+    scr._set_sel(line=divider)
+    scr._prop("one")
+    assert "контур" in scr.status, scr.status
+    assert "сектора" in scr.status, scr.status
+    assert ed.sm.to_json() == before, "a refused toggle changed the map"
+    assert {i for i in range(len(ed.sectors))
+            if ed.sm.has_polygon(i)} == alive, "a room went void"
+    assert [ed.sectors[i].floor_h for i in range(len(ed.sectors))] == heights
+
+    # «2-ст.» aimed at the wall's own sector: refused by name.  A fresh line is
+    # one-sided, so the panel really is being asked to add a back side.
+    stub = ed.add_line(*(ed.add_vertex(200, 1200), ed.add_vertex(800, 1200)))
+    assert not ed.line_two_sided(stub), "precondition: one-sided wall"
+    ed.cur_sector = ed.sides[ed.lines[stub].front].sector
+    before_stub = ed.sm.to_json()          # after the line above was added
+    scr._set_sel(line=stub)
+    scr._prop("two")
+    assert "тот же сектор" in scr.status, scr.status
+    assert ed.lines[stub].back == -1, "the self-portal is there anyway"
+    assert ed.sm.to_json() == before_stub, "a refused toggle changed the map"
+    scr.draw(surface)
+    print("  both sidedness toggles refuse by name, and the rooms survive")
+
+
+def _check_load_reports_a_repair(scr, surface) -> None:
+    """A map that had to be repaired must not open looking clean.
+
+    ``SectorEditor`` repairs the front-side invariant on load, so the file on
+    disk is still broken; the status line is where the author learns that, and
+    ``validate()`` has to speak AFTER the repair rather than before it.  Both
+    load paths are covered, since they are separate code: the ``.mt1`` one used
+    to report nothing at all.  The repair itself can only arrive through a
+    binary map — the ``.mts`` text form writes one side per wall and cannot
+    express a missing front side — so that path is checked for the validation
+    half of the message.
+    """
+    from shared import text_map
+    from client.sector_editor import save_mt1_with_bsp
+
+    ed = SectorEditor(new_room(1600, 1600))
+    a = ed.add_vertex(100, 100)
+    b = ed.add_vertex(900, 100)
+    c = ed.add_vertex(900, 500)
+    ids = [ed.add_line(*e) for e in ((a, b), (b, c), (c, a))]
+    ed.sector_from_contour(ids, floor_h=16, ceil_h=128)
+    wall = ed.add_line(*(ed.add_vertex(100, 500), ed.add_vertex(900, 500)))
+    ld = ed.lines[wall]
+    assert ld.back < 0, "precondition: the wall starts one-sided"
+    ld.v1, ld.v2 = ld.v2, ld.v1          # the damage the old editor could leave:
+    ld.front, ld.back = ld.back, ld.front  # front side gone, back side alive
+    ed.sm.invalidate()
+    ed.things.clear()                     # so validate() still has something to say
+    assert [e for e in ed.validate() if "sidedef" in e], ed.validate()
+
+    name = "smoke_broken_load"
+    scr.map_name = name                 # BEFORE the paths: _mts_path reads it
+    mts_path = scr._mts_path("mts")
+    mt1_path = scr._mts_path("mt1")
+    os.makedirs(os.path.dirname(mts_path), exist_ok=True)
+    with open(mts_path, "w", encoding="utf-8") as fh:
+        fh.write(text_map.render(ed.sm))
+    save_mt1_with_bsp(ed.sm, mt1_path)
+    try:
+        # (a) the .mt1 path: repaired on load, and the status names the wall
+        scr._load()
+        assert "Загружено" in scr.status, scr.status
+        assert "починено" in scr.status, scr.status
+        assert "ошибок" in scr.status, "validate() must speak after the repair"
+        assert scr.editor.repair_notes, "the repair was not recorded"
+        assert all(l.front >= 0 for l in scr.editor.lines), \
+            "a wall is still frontless after load"
+        assert not [e for e in scr.editor.validate() if "sidedef" in e], \
+            scr.editor.validate()
+        scr.draw(surface)
+
+        # (b) the .mts path reports validation errors, which it used to swallow
+        scr._load_mts()
+        assert "Загружено" in scr.status, scr.status
+        assert "ошибок" in scr.status, scr.status
+        assert scr.editor.repair_notes == [], scr.editor.repair_notes
+        scr.draw(surface)
+    finally:
+        for p in (mts_path, mt1_path):
+            if os.path.exists(p):
+                os.remove(p)
+        scr.map_name = "sector1"
+
+    # (c) a healthy map opens with the plain message, no repair noise
+    scr._load_mts()
+    assert scr.status == f"Загружено: maps/{os.path.basename(scr._mts_path('mts'))}",\
+        scr.status
+    assert scr.editor.repair_notes == [], scr.editor.repair_notes
+    print("  load status names the repair, and stays quiet on a healthy map")
 
 
 if __name__ == "__main__":

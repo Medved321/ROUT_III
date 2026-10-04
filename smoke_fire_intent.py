@@ -1,14 +1,21 @@
 """smoke_fire_intent.py — детерминированные проверки единственного пути выстрела.
 
-Покрытие (openspec changes/fire-intent-single-path):
-  1.1  фронт нажатия не терается в закрытых вратах темпа (отдача была, выстрела нет)
+Покрытие (openspec changes/fire-intent-single-path, fire-decision-attribution,
+fire-no-shot-backlog):
+  1.1  клик по горячему оружию съедается: ни интента, ни отдачи
   1.2  PLAYER_INPUT не создаёт выстрел на сервере (единственный путь — FIRE)
-  1.3  клики быстрее кулдауна: ровно одно открытие врат -> ровно один выстрел
+  1.3  клики быстрее кулдауна не теряются: ровно одно открытие врат -> ровно
+       один выстрел (а отказ по кулдауну не превращается в повторные интенты)
   1.4  решение сервера доезжает в снимке мира (fire_seq + число тиков)
   1.5  клиент берёт таймер оружия из серверного решения, а не из своего нажатия
   1.6  темп врат считается по оружию СЕРВЕРА, а не по локально выбранному
-  1.7  очередь нажатий: каждое нажатие = свой выстрел, ничего не схлопывается
-  1.8  отказ по cooldown возвращает нажатие в очередь (остальные отказы — нет)
+  1.7  серия кликов не оставляет отложенных выстрелов; стрелять чаще врат можно
+       только удержанием
+  1.8  отказ по cooldown отодвигает врата по серверному остатку и НЕ порождает
+       повторов (возвращать нечего: нажатий не хранится)
+  1.9  решение адресуется к своему интенту, а не к самому свежему; поздний
+       повтор отказа не затирает более новое решение; интент без партии получает
+       решение `noop`
 
 Сценарии детерминированные: без UDP, без pygame-окна, без живого сервера.
 
@@ -61,6 +68,7 @@ class _StubInput:
         self.rotate_delta = 0.0
         self.shoot = False
         self.shoot_pressed = False
+        self.dash_pressed = False
         self.weapon_id = PISTOL
         self.updates = 0
         self._queued: list[tuple[bool, bool]] = []
@@ -73,6 +81,7 @@ class _StubInput:
         self.rotate_delta = 0.0
         self.shoot = False
         self.shoot_pressed = False
+        self.dash_pressed = False
         shoot, pressed = self._queued.pop(0) if self._queued else (False, False)
         self.shoot = self.shoot or shoot
         self.shoot_pressed = self.shoot_pressed or pressed
@@ -81,9 +90,14 @@ class _StubInput:
 class _StubNet:
     def __init__(self) -> None:
         self.fires: list[int] = []
+        self._seq = 0
 
-    def send_fire(self, weapon_id: int = 1) -> None:
+    def send_fire(self, weapon_id: int = 1) -> int:
+        # The real NetworkClient numbers its intents strictly increasing from
+        # 1; the tests drive _sync_fire_anim with those same numbers.
+        self._seq += 1
         self.fires.append(weapon_id)
+        return self._seq
 
 
 def _client_stub(ammo: int = 200, weapon_id: int = PISTOL):
@@ -98,9 +112,8 @@ def _client_stub(ammo: int = 200, weapon_id: int = PISTOL):
     c._next_fire_time = 0.0
     c._fire_anim_until = 0.0
     c._fire_anim_wpn = -1
-    c._fire_press_queue = deque()
-    c._fire_served_press_time = None
-    c._fire_undecided = 0
+    c._fire_press_buffered = False
+    c._fire_pending = deque()
     c._server_fire_seq = 0
     c._server_fire_ready = 0
     c.local_weapon = weapon_id
@@ -123,8 +136,15 @@ def _run_frames(c, clock, times_and_presses):
         cc.time = real
 
 
-def test_client_edge_survives_closed_gate():
-    """1.1 Нажатие в закрытых вратах не пропадает: один клик -> один FIRE."""
+def test_client_press_on_a_closed_gate_is_remembered_once():
+    """1.1 Клик по горячему оружию запоминается РОВНО на одно открытие врат.
+
+    Без памяти клик в закрытые врата просто пропадает, а у дробовика (врата
+    0.90 с) это девять кликов из десяти — «оружие стреляет раз в 10 нажатий».
+    С очередью кликов хуже: она растёт со скоростью кликов и расходуется со
+    скоростью кулдауна. Поэтому память ровно на одно нажатие: клик не теряется,
+    и расти нечему.
+    """
     c = _client_stub()
     clock = _Clock()
     gate = _gate_seconds(PISTOL)
@@ -132,26 +152,30 @@ def test_client_edge_survives_closed_gate():
     # первый клик: врата открыты -> интент уходит
     _run_frames(c, clock, [(0.10, True, True)])
     assert len(c.network.fires) == 1, c.network.fires
+    accepted = c._fire_anim_until
+    assert accepted > 0.0, accepted
 
-    # клик через 0.05 с, врата ещё закрыты (gate = 0.30 с): фронт обязан пережить
-    # окно и выстрелить на ближайшем открытии, а не потеряться.
+    # клик через 0.05 с, врата ещё закрыты (gate = 0.30 с): интента нет и отдача
+    # НЕ продлевается — выстрела ещё не было, значит и отдачи пока не видно
     _run_frames(c, clock, [
         (0.15, True, True),
         (0.16, False, False),
         (0.17, False, False),
     ])
     assert len(c.network.fires) == 1, \
-        "нажатие в закрытых вратах потерялось (отдача без выстрела)"
+        "клик по горячему оружию отправил интент (выстрел из ничего)"
+    assert c._fire_anim_until == accepted, c._fire_anim_until
+    assert c._fire_press_buffered is True, "нажатие не запомнилось"
 
-    # ближайшее открытие врат -> ровно один отложенный выстрел
-    first = 0.10
-    _run_frames(c, clock, [(first + gate + 0.01, False, False)])
+    # ближайшее открытие врат обслуживает запомненный клик, кнопка уже отпущена
+    _run_frames(c, clock, [(0.10 + gate + 0.01, False, False)])
     assert len(c.network.fires) == 2, c.network.fires
+    assert c._fire_press_buffered is False, "нажатие пережило своё открытие"
 
-    # и ровно один, а не два на следующем открытии
-    _run_frames(c, clock, [(first + 2 * gate + 0.01, False, False)])
+    # и следующее открытие без нажатия уже молчит: память кончилась
+    _run_frames(c, clock, [(0.10 + 2 * gate + 0.01, False, False)])
     assert len(c.network.fires) == 2, c.network.fires
-    print("1.1 client fire edge survives a closed gate OK")
+    print("1.1 a press on a closed gate fires on the next opening, once OK")
 
 
 def test_client_held_fire_sends_every_gate():
@@ -244,8 +268,16 @@ def test_handle_shoot_reports_decision():
     print("1.2 handle_shoot reports fired/refused OK")
 
 
-def test_clicks_faster_than_cooldown_are_not_lost():
-    """1.3 Клики быстрее кулдауна: N кликов -> N открытий врат -> N выстрелов."""
+def test_clicks_on_a_hot_weapon_never_reach_the_server():
+    """1.3 Клик по горячему оружию не доходит до сети, а дошедший интент стреляет.
+
+    Две стороны одного контракта. Первая: клиент отсекает клик сам, поэтому в сеть
+    уходит ровно столько интентов, сколько было открытий врат, и ни одним
+    больше. Вторая: он при этом НЕ отсекает лишнего — каждый дошедший интент
+    сервер принимает, ни одного отказа по cooldown. Раньше вторая сторона была
+    недостижимой без очереди: чтобы «не терять» клики, их надо было где-то
+    хранить, и хранилище отдавало их пачками уже после кулдауна.
+    """
     from server.game_world import GameWorld
     from server.server import GameServer
     from server.weapons import apply_weapon_switch
@@ -296,11 +328,16 @@ def test_clicks_faster_than_cooldown_are_not_lost():
         for _ in range(ticks):
             w.update()
 
-    assert len(c.network.fires) > 1, "интенты не дошли до сети вообще"
+    # шесть кликов за 0.62 с при вратах 0.30 с = два открытия врат, и интентов
+    # ровно столько же, плюс одно запомненное нажатие, обслуженное на них.
+    # Кликов шесть, интентов три: клики не копятся, но и не теряются.
+    assert len(c.network.fires) == 3, c.network.fires
+    # и каждый дошедший интент сервер ПРИНЯЛ — ни одного отказа по cooldown
+    assert session.last_fire_result.fired is True, session.last_fire_result
     assert wp.ammo['pstl'] == ammo - len(c.network.fires), \
         (wp.ammo['pstl'], len(c.network.fires), ammo)
-    print(f"1.3 {len(c.network.fires)} clicks -> {len(c.network.fires)} shots, "
-          f"no dropped intent OK")
+    print(f"1.3 {len(c.network.fires)} intents -> {len(c.network.fires)} shots, "
+          f"clicks on a hot weapon never left the client OK")
 
 
 def test_shooting_flag_is_one_tick():
@@ -521,10 +558,10 @@ def test_recoil_follows_server_decision():
     assert c._fire_anim_until == now, c._fire_anim_until
 
     # смена оружия: подтверждение по старому стволу не воскрешает отдачу
-    c._fire_undecided = 1
+    c._fire_pending.append(3)
     c._fire_anim_until = 0.0
     c._fire_anim_wpn = 2
-    c._sync_fire_anim(2, 4, 0, 1, now)
+    c._sync_fire_anim(3, 4, 0, 1, now)
     assert c._fire_anim_until == 0.0, c._fire_anim_until
 
     # потерянный снимок: скачок fire_seq всё равно означает выстрел
@@ -544,7 +581,6 @@ def test_in_flight_intent_is_not_mistaken_for_refusal():
     c.local_weapon = 1
 
     # выстрел принят, отдача идёт
-    c._fire_press_queue.append(now)
     _run_frames(c, clock, [(now, True, True)])
     c._sync_fire_anim(1, 4, 0, 1, now + 0.01)
     running = c._fire_anim_until
@@ -563,7 +599,6 @@ def test_in_flight_intent_is_not_mistaken_for_refusal():
     assert c._fire_anim_until == predicted_next, c._fire_anim_until
     print("1.5 an in-flight intent does not cancel a real shot OK")
 
-
 def test_gate_tempo_follows_the_server_weapon():
     """1.6 Темп врат — по оружию сервера, а не по локально выбранному.
 
@@ -573,6 +608,10 @@ def test_gate_tempo_follows_the_server_weapon():
     (врата 1.30 с) при пистолете на сервере съедает 3 нажатия из 4 — «нажимал по
     кулдауну, выстрела не было». Обратный рассинхрон (пистолет локально, SSG на
     сервере) даёт отказы по cooldown и срезанную отдачу.
+
+    Проверяется удержанием: только оно вообще даёт более одного интента на
+    окно, поэтому темп виден как число открытий, а клики по горячему оружию
+    теперь просто съедаются (1.7).
     """
     c = _client_stub()
     clock = _Clock()
@@ -580,15 +619,16 @@ def test_gate_tempo_follows_the_server_weapon():
     c.local_weapon = PISTOL              # ...а сервер держит пистолет
     fast_gate = _gate_seconds(PISTOL)
 
-    # 6 нажатий с интервалом 0.05 с: при пистолетных вратах каждое открытие
-    # пропускает их, при SSG-вратах (1.30 с) прошло бы 3 интента из 6.
-    # Кадры открытий считаются от времени ПРЕДЫДУЩЕГО кадра, а не от номинала:
-    # срок врат накапливает float-ошибку и стоит на 1 ulp выше сетки.
-    frames = [(0.10 + 0.05 * i, True, True) for i in range(6)]
-    t = 0.10 + fast_gate + 0.01
-    for _ in range(5):
-        frames.append((t, False, False))
-        t += fast_gate + 0.01
+    # Кнопка нажата 6 пистолетных окон подряд: ровно 6 интентов.
+    # Время кадра в окне считается от якоря, а не накапливается (`t += step`):
+    # срок врат накапливает ту же float-ошибку, и на шестом окне кадрopen'а
+    # уезжал за последний кадр. +1e-9 — это запас от одного ulp, не сдвиг темпа.
+    step = fast_gate / 4.0
+    frames = []
+    for k in range(6):
+        base = 0.10 + k * fast_gate + 1e-9
+        for j in range(4):
+            frames.append((base + j * step, True, k == 0 and j == 0))
     _run_frames(c, clock, frames)
     assert len(c.network.fires) == 6, c.network.fires
     # и ни один нажатый ствол не подменился: в FIRE уходит локальный выбор
@@ -600,20 +640,27 @@ def test_gate_tempo_follows_the_server_weapon():
     c2.input_handler.weapon_id = PISTOL
     c2.local_weapon = SSG
     clock2 = _Clock()
-    _run_frames(c2, clock2, [(0.10, True, True), (0.40, True, True)])
-    assert len(c2.network.fires) == 1, c2.network.fires
     slow_gate = _gate_seconds(SSG)
-    _run_frames(c2, clock2, [(0.10 + slow_gate + 0.01, False, False)])
+    step = slow_gate / 4.0
+    frames = []
+    for k in range(2):
+        base = 0.10 + k * slow_gate + 1e-9
+        for j in range(4):
+            frames.append((base + j * step, True, k == 0 and j == 0))
+    _run_frames(c2, clock2, frames)
+    # два окна SSG = два интента, хотя пистолетные врата дали бы больше шести
     assert len(c2.network.fires) == 2, c2.network.fires
     print("1.6 gate tempo follows the server's weapon OK")
 
 
-def test_every_press_gets_its_own_shot():
-    """1.7 Очередь нажатий: каждое нажатие = свой выстрел.
+def test_a_burst_of_presses_becomes_one_shot_per_opening():
+    """1.7 Серия нажатий = выстрел на открытие, а не очередь выстрелов.
 
-    Было: одна защёлка на всё окно, поэтому из десяти нажатий в закрытых вратах
-    выстрел был один — «стреляет раз в 10 нажатий». Теперь у каждого нажатия
-    своя запись, и каждое открытие врат отдаёт ровно одно.
+    Было: очередь нажатий копилась со скоростью кликов и расходовалась со
+    скоростью кулдауна — для SSG (врата 1.30 с) при клике 10 Гц это ~39 отложенных
+    выстрелов на три секунды, залп после отпускания кнопки. Память ровно на одно
+    нажатие: клик не теряется (иначе дробовик «стреляет раз в 10 кликов»), но и
+    не копится.
     """
     c = _client_stub()
     clock = _Clock()
@@ -623,54 +670,97 @@ def test_every_press_gets_its_own_shot():
     # десять нажатий за 0.2 с — все в первом закрытом окне врат
     _run_frames(c, clock, [(0.05 + 0.02 * i, True, True) for i in range(presses)])
     assert len(c.network.fires) == 1, c.network.fires
-    # девять нажатий ждут своей очереди, а не схлопнулись в один флаг
-    assert len(c._fire_press_queue) == presses - 1, len(c._fire_press_queue)
+    # из девяти нажатий в закрытом окне запомнено ровно одно
+    assert c._fire_press_buffered is True, c._fire_press_buffered
 
-    # каждое следующее открытие отдаёт ровно один отложенный выстрел
+    # ближайшее открытие отдаёт этот один запомненный выстрел, и всё
+    _run_frames(c, clock, [(0.05 + gate + 0.01, False, False)])
+    assert len(c.network.fires) == 2, c.network.fires
+    assert c._fire_press_buffered is False, c._fire_press_buffered
+
+    # дальше тишина: кнопка отпущена, память пуста
     t = 0.05 + gate + 0.01
-    for k in range(1, presses):
+    for _ in range(presses):
         _run_frames(c, clock, [(t, False, False)])
-        assert len(c.network.fires) == k + 1, (k, c.network.fires)
+        assert len(c.network.fires) == 2, (t, c.network.fires)
         t += gate + 0.01
-    assert len(c.network.fires) == presses, c.network.fires
 
-    # очередь пуста, лишних выстрелов не появится
-    _run_frames(c, clock, [(t, False, False)])
-    assert len(c.network.fires) == presses, c.network.fires
-    print("1.7 every press fires once, queue is not coalesced OK")
+    # то же самое на медленном оружии: 20 кликов за 2 с при вратах SSG (1.30 с).
+    # Открытия врат — на 0.05 и на 1.45, то есть два интента, а не двадцать.
+    # На втором открытии приходит свой клик, поэтому он и стреляет, а
+    # запомненное нажатие просто погашается вместе с ним.
+    c2 = _client_stub()
+    c2.local_weapon = SSG
+    clock2 = _Clock()
+    _run_frames(c2, clock2, [(0.05 + 0.10 * i, True, True) for i in range(20)])
+    assert len(c2.network.fires) == 2, c2.network.fires
+    slow = _gate_seconds(SSG)
+    _run_frames(c2, clock2, [(0.05 + slow + 0.01, False, False)])
+    assert len(c2.network.fires) == 2, c2.network.fires
+    print("1.7 a burst of clicks fires once per opening, nothing queues up OK")
 
 
-def test_stale_presses_do_not_burst():
-    """1.7 Давно нажатое не превращается в залп после фриза."""
-    from client.client import FIRE_INTENT_MAX_AGE
-
+def test_held_fire_is_the_only_way_to_keep_shooting():
+    """1.7 Удержание — единственный способ стрелять чаще, чем открываются врата."""
     c = _client_stub()
     clock = _Clock()
     gate = _gate_seconds(PISTOL)
 
-    # нажатия копятся, потом клиент подвисает (alt-tab / длинный кадр)
+    # удержание: интент на каждом открытии врат, темп оружия соблюдён
+    frames = []
+    t = 0.05
+    for i in range(int(4 * gate / 0.05) + 1):
+        frames.append((t, True, i == 0))
+        t += 0.05
+    _run_frames(c, clock, frames)
+    shots = len(c.network.fires)
+    assert shots >= 4, shots
+    assert shots <= int(4 * gate / 0.05) / int(gate / 0.05) + 1, shots
+
+    # а после отпускания — тишина, сколько бы врат ни открылось
+    before = len(c.network.fires)
+    for _ in range(5):
+        _run_frames(c, clock, [(t, False, False)])
+        t += gate + 0.01
+    assert len(c.network.fires) == before, c.network.fires
+    print("1.7 held fire shoots per gate, release stops it dead OK")
+
+
+def test_a_stall_produces_one_shot_not_a_burst():
+    """1.7 После фриза — ровно один выстрел, а не залп.
+
+    Запомненное нажатие переживает простой (оно и предназначено следующему
+    открытию), но переживает РОВНО ОДНО. Восемь нажатий, фриз на 5 с, и на
+    первом открытии после фриза стреляет одно — из восьми, а не из восьми.
+    """
+    c = _client_stub()
+    clock = _Clock()
+    gate = _gate_seconds(PISTOL)
+
+    # нажатия идут, потом клиент подвисает (alt-tab / длинный кадр)
     _run_frames(c, clock, [(0.05 + 0.02 * i, True, True) for i in range(8)])
     assert len(c.network.fires) == 1, c.network.fires
-    assert len(c._fire_press_queue) == 7, len(c._fire_press_queue)
+    assert c._fire_press_buffered is True, c._fire_press_buffered
 
-    last_press = 0.05 + 0.02 * 7
-    stale = last_press + FIRE_INTENT_MAX_AGE + 0.05
+    # первое открытие после фриза отдаёт ровно один запомненный выстрел
+    stale = 0.05 + 0.02 * 7 + 5.0
     _run_frames(c, clock, [(stale, False, False)])
-    assert len(c._fire_press_queue) == 0, len(c._fire_press_queue)
-    # и залпа нет: следующее открытие врат не имеет ничего обслуживать
+    assert len(c.network.fires) == 2, "после фриза выстрелов больше двух"
+    assert c._fire_press_buffered is False, c._fire_press_buffered
+
+    # и дальше тишина: залпа нет ни на первом, ни на последующих открытиях
     _run_frames(c, clock, [(stale + gate + 0.01, False, False)])
-    assert len(c.network.fires) == 1, c.network.fires
-    print("1.7 stale presses do not burst after a stall OK")
+    assert len(c.network.fires) == 2, c.network.fires
+    print("1.7 a stall yields one shot, not a burst OK")
 
 
-def test_cooldown_refusal_returns_the_press():
-    """1.8 Отказ по cooldown возвращает нажатие; остальные отказы — нет.
+def test_cooldown_refusal_waits_the_weapon_out():
+    """1.8 Отказ по кулдауну отодвигает врата и НЕ порождает повторных интентов.
 
-    Врата клиента и тики сервера — независимые часы, и запаса в один тик при
-    реальном джиттере не хватает: интент приходит, пока ствол горячий. Нажатие
-    не потрачено, поэтому оно возвращается в очередь и повторяется на
-    открытии, отодвинутом серверным остатком кулдауна. Отказ по патронам — это
-    решение, нажатие расходуется.
+    Возвращать нажатие было можно только потому, что оно хранилось. Хранилища
+    больше нет, поэтому повторять нечего: единственное действие — дождаться
+    серверного остатка кулдауна. Иначе клик, отказанный кулдауном, превратился бы
+    в цикл попыток.
     """
     from shared.combat import fire_reason_code
 
@@ -680,58 +770,159 @@ def test_cooldown_refusal_returns_the_press():
 
     _run_frames(c, clock, [(0.10, True, True)])
     assert len(c.network.fires) == 1
-    served = c._fire_served_press_time
-    assert served is not None, "интент должен помнить своё нажатие"
+    assert c._fire_undecided == 1, c._fire_pending
 
     # сервер отказал: ствол был горячий, и остаток кулдауна больше локальных врат
     c._sync_fire_anim(0, 8, fire_reason_code('cooldown'), PISTOL, 0.11)
-    assert len(c._fire_press_queue) == 1, len(c._fire_press_queue)
-    assert c._fire_press_queue[0] == served, "нажатие возвращено с исходным штампом"
-    assert c._fire_undecided == 0, c._fire_undecided
+    assert c._fire_undecided == 0, c._fire_pending
     assert c._fire_anim_until == 0.0, c._fire_anim_until
 
     # остаток кулдауна отодвинул врата, поэтому мгновенный повтор не бьёт снова
     ready_gate = 0.11 + (8 + 1) * TICK_INTERVAL
     assert c._next_fire_time == ready_gate, (c._next_fire_time, ready_gate)
-    _run_frames(c, clock, [(0.10 + gate + 0.01, False, False)])
+    _run_frames(c, clock, [(0.10 + gate + 0.01, True, True)])
     assert len(c.network.fires) == 1, "повтор ушёл в горячий ствол"
-    _run_frames(c, clock, [(ready_gate + 0.01, False, False)])
+    _run_frames(c, clock, [(ready_gate + 0.01, True, True)])
     assert len(c.network.fires) == 2, c.network.fires
-    assert c._fire_served_press_time == served
 
     # локальный срок позже серверного — остаётся локальный (max, а не min)
     refusal_now = ready_gate + 0.02
     c._sync_fire_anim(1, 1, fire_reason_code('cooldown'), PISTOL, refusal_now)
-    implied = refusal_now + 2 * TICK_INTERVAL
     local = ready_gate + 0.01 + gate
-    assert c._next_fire_time >= implied, (c._next_fire_time, implied)
-    assert abs(c._next_fire_time - local) < 1e-9, (c._next_fire_time, local)
+    assert c._next_fire_time >= local, (c._next_fire_time, local)
 
-    # отказ по патронам нажатие не возвращает
+    # отказ по патронам — это решение: отдача снята, и повторов тоже нет
     t = ready_gate + 0.01 + gate + 0.01
     _run_frames(c, clock, [(t, True, True)])
     assert len(c.network.fires) == 3, c.network.fires
-    c._sync_fire_anim(1, 3, fire_reason_code('no_ammo'), PISTOL, t + 0.01)
-    assert len(c._fire_press_queue) == 0, len(c._fire_press_queue)
+    c._sync_fire_anim(1, 0, fire_reason_code('no_ammo'), PISTOL, t + 0.01)
+    assert c._fire_anim_until == 0.0, c._fire_anim_until
+    assert c._fire_undecided == 0, c._fire_pending
+    for _ in range(3):
+        t += gate + 0.01
+        _run_frames(c, clock, [(t, False, False)])
+    assert len(c.network.fires) == 3, "отказ по патронам породил повторные выстрелы"
+    print("1.8 a cooldown refusal waits the weapon out, nothing retries OK")
 
-    # вечно отклоняемое нажатие не бессмертно: штамп стареет и оно уходит
-    from client.client import FIRE_INTENT_MAX_AGE
 
-    t += gate + 0.01
-    _run_frames(c, clock, [(t, True, True)])
-    c._sync_fire_anim(1, 3, fire_reason_code('cooldown'), PISTOL, t + 0.01)
-    assert len(c._fire_press_queue) == 1, len(c._fire_press_queue)
-    _run_frames(c, clock, [(t + FIRE_INTENT_MAX_AGE + 0.06, False, False)])
-    assert len(c._fire_press_queue) == 0, len(c._fire_press_queue)
-    print("1.8 a cooldown refusal re-queues the press, others consume it OK")
+def test_refusal_does_not_cut_the_confirmed_shot():
+    """1.9 Отказ списывается со СВОЕГО интента, а не с чужого.
+
+    Снимок «fire_seq прыгнул И пришла причина» — это ровно «#1 принят, #2 отказ,
+    #3 ещё в полёте». Старый код разбирал снимок в обратном порядке: сначала
+    принятие обнуляло счётчик нерешённых интентов, и отказ в том же снимке
+    проходил мимо — отдача принятого выстрела обрывалась, и на экране было
+    «анимация прервалась, выстрела нет».
+    """
+    from shared.combat import fire_reason_code
+
+    c = _client_stub()
+    clock = _Clock()
+    gate = _gate_seconds(PISTOL)
+
+    # три интента в полёте: клик, удержание, удержание — на трёх открытиях врат
+    first = 0.10
+    _run_frames(c, clock, [(first, True, True),
+                            (first + gate + 0.01, True, True),
+                            (first + 2 * gate + 0.02, True, True)])
+    assert list(c._fire_pending) == [1, 2, 3], c._fire_pending
+
+    ready = wpn_cooldown_ticks(16)
+    now = first + 2 * gate + 0.04
+    c._sync_fire_anim(1, ready, fire_reason_code('cooldown'), PISTOL, now)
+
+    # #1 принят (сброшен), #2 отказан (списан), #3 ещё ждёт решения
+    assert list(c._fire_pending) == [3], c._fire_pending
+    assert c._fire_undecided == 1, c._fire_pending
+    # отказ достался не новейшему (#3), поэтому отдача принятого выстрела выжила:
+    # сервер прямо говорит, что ствол горячий, то есть выстрел был
+    assert c._fire_anim_until >= now + ready * TICK_INTERVAL, c._fire_anim_until
+
+    # тот же снимок повторно: липкая причина всё ещё приходит, и пока в полёте
+    # есть интент выше fire_seq, отказ достаётся ему — единственный случай, где
+    # причина может быть списана на ещё не решённый интент (см. design.md,
+    # остаток)
+    c._sync_fire_anim(1, ready, fire_reason_code('cooldown'), PISTOL, now + 0.5)
+    assert c._fire_undecided == 0, c._fire_pending
+
+    # когда в полёте не осталось ничего, повтор той же причины — уже не решение
+    c._fire_anim_until = now + 0.7
+    c._sync_fire_anim(1, ready, fire_reason_code('cooldown'), PISTOL, now + 0.7)
+    assert c._fire_anim_until == now + 0.7, c._fire_anim_until
+    print("1.9 a refusal is charged to its own intent, not to a confirmed shot OK")
+
+
+def test_stale_refusal_does_not_shadow_a_later_shot():
+    """1.9 Поздняя повторная доставка отказа не затирает более новое решение.
+
+    Надёжный канал передоставляет пакеты. Старый код решал отказ заново, если его
+    номер просто не совпадал с последним принятым, — и поздняя копия отказа №6
+    публиковала ложный «cooldown» поверх принятого выстрела №7.
+    """
+    from server.server import GameServer
+    from server.lobby import Party
+    from server.player import PlayerSession
+    from server.weapons import apply_weapon_switch
+    from shared.components import WeaponComponent
+
+    party = Party(1, 'p', 'pve')
+    session = PlayerSession(1, 'A', ('127.0.0.1', 1))
+    party.add_member(session)
+    eid = party.world.get_player_entity(1)
+    wp = party.world.entities.get_component(eid, WeaponComponent)
+    wp.ammo['pstl'] = 50
+    apply_weapon_switch(party.world, eid, PISTOL)
+
+    server = object.__new__(GameServer)
+    server.lobby = type('_L', (), {'find_party_of': lambda self, s: party})()
+
+    server._on_player_fire(session, 5, PISTOL)      # принят
+    server._on_player_fire(session, 6, PISTOL)      # отказ по кулдауну
+    assert session.last_fire_result.fired is False, session.last_fire_result
+    assert session.last_fire_result.reason == 'cooldown', session.last_fire_result
+
+    wp.fire_cooldown = 0
+    server._on_player_fire(session, 7, PISTOL)      # принят снова
+    assert session.last_fire_seq == 7, session.last_fire_seq
+    assert session.last_fire_result.fired is True, session.last_fire_result
+
+    # отказ №6 приходит повторно уже ПОСЛЕ принятия №7
+    server._on_player_fire(session, 6, PISTOL)
+    assert session.last_fire_seq == 7, session.last_fire_seq
+    assert session.last_fire_result.fired is True, \
+        f"поздний отказ затёр принятый выстрел: {session.last_fire_result}"
+    assert session.last_fire_result.reason == '', session.last_fire_result
+    print("1.9 a late duplicate refusal never overwrites a newer decision OK")
+
+
+def test_unhandled_intent_is_answered():
+    """1.9 Интент, который сервер не может разобрать, всё равно получает ответ.
+
+    Молчание по интенту оставляло его в полёте навсегда: счётчик нерешённых
+    интентов рос, и поверх него копилась очередь нажатий. Теперь это решение
+    `noop`, и очередь нерешённых интентов опустошается.
+    """
+    from server.server import GameServer
+    from server.player import PlayerSession
+
+    session = PlayerSession(1, 'A', ('127.0.0.1', 1))
+    server = object.__new__(GameServer)
+    server.lobby = type('_L', (), {'find_party_of': lambda self, s: None})()
+
+    server._on_player_fire(session, 4, PISTOL)
+    res = session.last_fire_result
+    assert res is not None, "интент без партии остался без решения"
+    assert res.fired is False, res
+    assert res.reason == 'noop', res
+    print("1.9 an unhandled intent is answered with noop OK")
 
 
 if __name__ == '__main__':
-    test_client_edge_survives_closed_gate()
+    test_client_press_on_a_closed_gate_is_remembered_once()
     test_client_held_fire_sends_every_gate()
     test_input_does_not_shoot_on_server()
     test_handle_shoot_reports_decision()
-    test_clicks_faster_than_cooldown_are_not_lost()
+    test_clicks_on_a_hot_weapon_never_reach_the_server()
     test_shooting_flag_is_one_tick()
     test_fire_seq_only_advances_on_accept()
     test_decision_reaches_every_client()
@@ -740,7 +931,11 @@ if __name__ == '__main__':
     test_recoil_follows_server_decision()
     test_in_flight_intent_is_not_mistaken_for_refusal()
     test_gate_tempo_follows_the_server_weapon()
-    test_every_press_gets_its_own_shot()
-    test_stale_presses_do_not_burst()
-    test_cooldown_refusal_returns_the_press()
+    test_a_burst_of_presses_becomes_one_shot_per_opening()
+    test_held_fire_is_the_only_way_to_keep_shooting()
+    test_a_stall_produces_one_shot_not_a_burst()
+    test_cooldown_refusal_waits_the_weapon_out()
+    test_refusal_does_not_cut_the_confirmed_shot()
+    test_stale_refusal_does_not_shadow_a_later_shot()
+    test_unhandled_intent_is_answered()
     print("ALL FIRE INTENT SMOKE TESTS PASSED")

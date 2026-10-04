@@ -30,9 +30,16 @@ async def run_live():
     assert c1.state == "game" and c2.state == "game"
 
     # 5.3: fire RIFLE (weapon 3) from c1; both clients must see the from_player ball
+    #
+    # The shot goes through the reliable FIRE intent, NOT through the shoot flag
+    # of PLAYER_INPUT: since fire-intent-single-path the flag is display state
+    # only and the server never shoots from it, so this loop used to assert on
+    # balls that could not exist ("never saw a player ball") — a stale premise,
+    # not a live defect.
     c1_balls = 0
     c2_balls = 0
     for _ in range(60):
+        c1.send_fire(3)
         c1.send_input(0, 0, 0.0, True, 3)
         c2.send_input(0, 0, 0.0, False, 1)
         await asyncio.sleep(0.03)
@@ -46,6 +53,7 @@ async def run_live():
     c1_imps = 0
     c2_imps = 0
     for _ in range(40):
+        c1.send_fire(1)
         c1.send_input(0, 0, 0.0, True, 1)
         c2.send_input(0, 0, 0.0, False, 1)
         await asyncio.sleep(0.03)
