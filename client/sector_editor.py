@@ -10,7 +10,8 @@ from __future__ import annotations
 import math
 
 from shared.sector_map import (
-    MAX_SECTOR_HEIGHT, MIN_SECTOR_HEIGHT, STEP_HEIGHT,
+    DOOR_LOCK_BY_TEXTURE, DOOR_TEXTURE_BY_LOCK, DOOR_TEXTURE_NONE,
+    MAX_SECTOR_HEIGHT, MIN_SECTOR_HEIGHT, SPECIAL_DOORS, STEP_HEIGHT,
     LineDef, Sector, SectorMap, SideDef, Thing, Vertex,
 )
 
@@ -710,6 +711,52 @@ class SectorEditor:
         self.lines[idx].tag = int(tag)
         self._after_mutate()
 
+    def line_door_lock(self, idx: int) -> tuple[bool, str | None]:
+        """``(is_door, lock)`` for the panel: lock is a colour word or None."""
+        if not (0 <= idx < len(self.lines)):
+            return (False, None)
+        ld = self.lines[idx]
+        if ld.special != SPECIAL_DOORS or ld.front < 0:
+            return (False, None)
+        return (True, DOOR_LOCK_BY_TEXTURE.get(self.sides[ld.front].mid))
+
+    def set_line_door(self, idx: int, lock: str | None = None) -> bool:
+        """Turn a two-sided linedef into a door with the given lock colour.
+
+        The lock is carried by the middle texture of BOTH sides (``door_D`` /
+        ``door_R`` / ``door_Y`` / ``door_B``), so the two visible twins agree
+        about the key; ``solid`` is cleared because a door is a portal. A
+        one-sided wall cannot be a door (there is no second sector) and the
+        call is refused.
+        """
+        if not (0 <= idx < len(self.lines)):
+            return False
+        ld = self.lines[idx]
+        if ld.front < 0 or ld.back < 0:
+            return False
+        tex = DOOR_TEXTURE_BY_LOCK.get(lock, DOOR_TEXTURE_NONE)
+        self._record()
+        ld.special = SPECIAL_DOORS
+        ld.solid = False
+        self.sides[ld.front].mid = tex
+        self.sides[ld.back].mid = tex
+        self._after_mutate()
+        return True
+
+    def clear_line_door(self, idx: int) -> bool:
+        """Drop the door special; a door-tagged texture resets to the plain one."""
+        if not (0 <= idx < len(self.lines)):
+            return False
+        ld = self.lines[idx]
+        self._record()
+        ld.special = 0
+        for side in (ld.front, ld.back):
+            if 0 <= side < len(self.sides) \
+                    and self.sides[side].mid in DOOR_LOCK_BY_TEXTURE:
+                self.sides[side].mid = self.cur_line_mid
+        self._after_mutate()
+        return True
+
     def set_line_solid(self, idx: int, solid: bool) -> bool:
         """Toggle the "solid wall" flag on a two-sided linedef.
 
@@ -752,6 +799,8 @@ class SectorEditor:
         if not (0 <= idx < len(self.lines)):
             return "open"
         ld = self.lines[idx]
+        if ld.special == SPECIAL_DOORS and ld.back >= 0:
+            return "door"
         if ld.solid or ld.back < 0:
             return "wall"
         delta = self._floor_delta(idx)

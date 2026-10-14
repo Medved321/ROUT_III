@@ -43,6 +43,7 @@ class InputHandler:
         self.shoot_pressed: bool = False  # fresh fire intent this frame
         self.dash: bool = False          # dash key held
         self.dash_pressed: bool = False  # fresh dash key press this frame (one dash)
+        self.use: bool = False           # "use" key (E) held: opens a door
         self.weapon_id: int = 1  # index into WPN (0=chainsaw ... 5=SSG)
         self.quit_requested: bool = False
         self.pause_requested: bool = False
@@ -104,6 +105,7 @@ class InputHandler:
         self.shoot_pressed = False
         self.dash = False
         self.dash_pressed = False
+        self.use = False
         self.pause_requested = False
         self.window_events.clear()
 
@@ -182,6 +184,12 @@ class InputHandler:
 
         if not tractor and pygame.mouse.get_pressed()[0]:
             self.shoot = True
+
+        # "Use" (E) is a plain held flag: the server reacts on the rising edge,
+        # so a held key is exactly one attempt, and the bit simply rides along
+        # in the existing PLAYER_INPUT flag byte.
+        if keys[pygame.K_e]:
+            self.use = True
 
     def _update_keyboard_turn(self, keys) -> None:
         """Steer with Left/Right at a frame-rate independent rate.

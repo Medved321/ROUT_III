@@ -14,8 +14,8 @@ fire-no-shot-backlog):
   1.8  отказ по cooldown отодвигает врата по серверному остатку и НЕ порождает
        повторов (возвращать нечего: нажатий не хранится)
   1.9  решение адресуется к своему интенту, а не к самому свежему; поздний
-       повтор отказа не затирает более новое решение; интент без партии получает
-       решение `noop`
+       повтор отказа не затирает более новое решение и не решается заново;
+       интент без партии получает решение `noop`
 
 Сценарии детерминированные: без UDP, без pygame-окна, без живого сервера.
 
@@ -29,6 +29,7 @@ Baseline до правки (зафиксировано, чтобы отлича�
 """
 from __future__ import annotations
 
+import math
 from collections import deque
 
 from shared.combat import wpn_cooldown_ticks, TICK_INTERVAL
@@ -134,6 +135,63 @@ def _run_frames(c, clock, times_and_presses):
             c._process_input()
     finally:
         cc.time = real
+
+
+class _StopLoop(Exception):
+    """Останавливает прогон серверного цикла по виртуальному времени."""
+
+
+class _WindowsClock:
+    """Часы с квантованием, как на Windows.
+
+    Настоящий ProactorEventLoop округляет `await asyncio.sleep` вверх до
+    системного тика таймера (~15.6 мс): `sleep(0.05)` возвращается через ~63 мс.
+    Именно это ломало частоту тиков сервера, поэтому часы повторяют именно его,
+    а не идеальные: иначе проверка проходила бы на баге, который нельзя увидеть
+    на идеальных часах. `time.sleep(0.001)` при этом стоит 1.9 мс — квантует
+    именно asyncio, поэтому фиксированной части не избежать ни при каком
+    ожидании, и чинить надо сам цикл, а не сон.
+    """
+
+    GRANULARITY = 0.016
+
+    def __init__(self, stop_at: float | None = None) -> None:
+        self.t = 0.0
+        self.stop_at = stop_at
+
+    def monotonic(self) -> float:
+        return self.t
+
+    async def sleep(self, delay: float) -> None:
+        if self.stop_at is not None and self.t >= self.stop_at:
+            raise _StopLoop
+        if delay <= 0.0:
+            self.t += self.GRANULARITY
+        else:
+            self.t += math.ceil(delay / self.GRANULARITY) * self.GRANULARITY
+
+
+def _run_server_loop(server, clock: _WindowsClock) -> None:
+    """Прогоняет НАСТОЯЩИЙ GameServer._game_loop на виртуальных часах.
+
+    Часы подменяются на уровне модуля (`server.server.time`), а ожидание — на
+    уровне `asyncio.sleep`, ровно как их видит `_game_loop`. Сам цикл не
+    переписывается: тест ломается, если сломается он.
+    """
+    import asyncio
+    import server.server as ss
+
+    real_sleep, real_time = asyncio.sleep, ss.time
+    asyncio.sleep, ss.time = clock.sleep, clock
+    try:
+        coro = server._game_loop()
+        try:
+            while True:
+                coro.send(None)
+        except (_StopLoop, StopIteration):
+            pass
+    finally:
+        asyncio.sleep, ss.time = real_sleep, real_time
 
 
 def test_client_press_on_a_closed_gate_is_remembered_once():
@@ -470,7 +528,7 @@ def test_fire_decision_in_snapshot():
         'ammo': {'pstl': 1, 'shl': 0, 'slg': 0, 'rck': 0, 'BFG': 0},
         'fire_seq': 9, 'fire_ready': 0, 'fire_reason': 0,
     }]
-    _t, pl, _en, _bl, _co, _mode, _im = decode_world_state(
+    _t, pl, _en, _bl, _co, _mode, _im, _it, _doors = decode_world_state(
         encode_world_state(7, players)
     )
     assert len(pl) == 2, pl
@@ -917,6 +975,158 @@ def test_unhandled_intent_is_answered():
     print("1.9 an unhandled intent is answered with noop OK")
 
 
+def test_redelivered_refusal_is_not_decided_twice():
+    """1.9 Передоставленный ОТКАЗ решается один раз, а не два.
+
+    Надёжный канал передоставляет, и rto растёт экспоненциально — так что
+    повторно пришедший отказ это не теория, а обычное дело. Старый фильтр смотрел
+    на `last_fire_seq`, который двигается ТОЛЬКО при принятом интенте: номер
+    отказа оставался ниже него, и повтор решался заново. К моменту повтора
+    кулдаун мог уже истечь, и сервер стрелял из интента, который клиент давно
+    списал, — выстрел, который никто не нажимал, да ещё и опубликованный как
+    свежее принятие поверх решения, пришедшего следом.
+
+    Отдельно проверяется, что отказ не «съедает» номер: после него обычный
+    следующий интент (номер выше) по-прежнему принимается.
+    """
+    from server.server import GameServer
+    from server.lobby import Party
+    from server.player import PlayerSession
+    from server.weapons import apply_weapon_switch
+    from shared.components import WeaponComponent
+
+    party = Party(1, 'p', 'pve')
+    session = PlayerSession(1, 'A', ('127.0.0.1', 1))
+    party.add_member(session)
+    eid = party.world.get_player_entity(1)
+    wp = party.world.entities.get_component(eid, WeaponComponent)
+    wp.ammo['pstl'] = 50
+    apply_weapon_switch(party.world, eid, PISTOL)
+
+    server = object.__new__(GameServer)
+    server.lobby = type('_L', (), {'find_party_of': lambda self, s: party})()
+
+    server._on_player_fire(session, 1, PISTOL)        # принят -> кулдаун
+    server._on_player_fire(session, 2, PISTOL)        # отказ по кулдауну
+    assert session.last_fire_result.fired is False, session.last_fire_result
+    refused_result = session.last_fire_result
+
+    # кулдаун истёк, и отказ №2 приходит повторно (потерянный ACK)
+    wp.fire_cooldown = 0
+    ammo_before = wp.ammo['pstl']
+    server._on_player_fire(session, 2, PISTOL)        # redelivery
+    assert wp.ammo['pstl'] == ammo_before, \
+        f"передоставленный отказ выстрелил: {ammo_before} -> {wp.ammo['pstl']}"
+    assert session.last_fire_result == refused_result, \
+        f"передоставленный отказ опубликовал новое решение: {session.last_fire_result}"
+    assert session.last_fire_seq == 1, session.last_fire_seq
+
+    # отказ не занял номер: следующий интент (номер выше) принимается
+    server._on_player_fire(session, 3, PISTOL)
+    assert session.last_fire_seq == 3, session.last_fire_seq
+    assert session.last_fire_result.fired is True, session.last_fire_result
+    assert wp.ammo['pstl'] == ammo_before - 1, wp.ammo['pstl']
+    print("1.9 a redelivered refusal is decided once OK")
+
+
+def test_server_tick_loop_holds_the_rate_the_fire_gate_is_built_on():
+    """1.10 Тиковый цикл держит TICK_RATE — на котором стоят врата выстрела.
+
+    Симптом: при долгой стрельбе «через раз» — отдача начинается, патрон
+    пропадает, анимация обрывается, урона нет. Это отказ по cooldown, и он
+    возникал систематически из-за частоты тиков, а не из-за клика.
+
+    `TICK_RATE` — это то, чем `wpn_cooldown_ticks` переводит темп оружия, и
+    переводят ОБЕ стороны, поэтому врата клиента посчитаны в номинальных тиках,
+    а сервер сливает их в настоящих. Старый цикл делал `last_tick = now` и
+    просыпался через `asyncio.sleep(0.001)` — на Windows это 15.8 tps вместо 20,
+    то есть 21 % медленнее. Кулдаун пистолета в 5 тиков растягивался с 0.25 с до
+    0.32 с при вратах 0.30 с, и КАЖДЫЙ ВТОРОЙ интент приходил в горячий ствол.
+    Запас в один тик — это весь запас, и он уходил целиком.
+
+    Часы здесь намеренно квантуют ожидание по-виндовски, поэтому проверка
+    воспроизводит баг детерминированно, а не «если у машины плохой таймер».
+    """
+    import asyncio
+    from server.server import GameServer
+    from server.game_data import TICK_RATE, WPN
+    from server.game_world import GameWorld
+    from server.player import PlayerSession
+    from server.weapons import apply_weapon_switch
+    from shared.components import WeaponComponent
+
+    seconds = 6.0
+    window = seconds * 1000.0
+    latency = 0.060           # 3 тика пути туда-обратно — обычная локальная сеть
+
+    for wpn in (PISTOL, 2, SSG):
+        ticks = wpn_cooldown_ticks(int(WPN[wpn]['f']))
+        gate = ticks * TICK_INTERVAL + TICK_INTERVAL
+
+        world = GameWorld(mode='pve')
+        eid = world.add_player(1, 'A')
+        comp = world.entities.get_component(eid, WeaponComponent)
+        comp.ammo['pstl'] = 9999
+        comp.ammo['shl'] = 9999
+        apply_weapon_switch(world, eid, wpn)
+
+        server = object.__new__(GameServer)
+        server.running = False
+        session = PlayerSession(1, 'A', ('127.0.0.1', 1))
+        fired = refused = 0
+        reasons: list[str] = []
+        sent = 0
+        next_fire = 0.0
+        inflight: list[tuple[float, int]] = []
+        n_ticks = 0
+
+        class _Lobby:
+            def update_all(self):
+                nonlocal n_ticks, fired, refused, sent, next_fire
+                n_ticks += 1
+                world.update()
+                now = clock.t
+                # клиентские врата живут на тех же часах, что и сервер
+                if now >= next_fire:
+                    sent += 1
+                    inflight.append((now + latency, sent))
+                    next_fire += gate
+                while inflight and inflight[0][0] <= now:
+                    _, s = inflight.pop(0)
+                    server._on_player_fire(session, s, wpn)
+                    res = session.last_fire_result
+                    if res.fired:
+                        fired += 1
+                    else:
+                        refused += 1
+                        reasons.append(res.reason)
+
+        _party = type('_P', (), {'world': world})()
+        server.lobby = type('_L', (), {
+            'update_all': _Lobby().update_all,
+            'find_party_of': lambda self, sess: _party,
+            'parties': {1: _party},
+        })()
+        server.network = type('_N', (), {'tick': lambda self: None})()
+        server._broadcast_parties = lambda: None
+        server._remove_stale_players = lambda: None
+        server.running = True
+
+        clock = _WindowsClock(stop_at=seconds)
+        _run_server_loop(server, clock)
+
+        rate = n_ticks / seconds
+        assert abs(rate - TICK_RATE) <= TICK_RATE * 0.1, \
+            f"{WPN[wpn]['n']}: {rate:.2f} tps вместо {TICK_RATE}"
+        assert refused == 0, \
+            (f"{WPN[wpn]['n']}: {refused} отказов из {sent} интентов "
+             f"({reasons[:4]}) при {rate:.2f} tps")
+        print(f"1.10 {WPN[wpn]['n']:9s} gate={gate:.2f}s -> {rate:5.2f} tps, "
+              f"{sent} интентов, {fired} выстрелов, 0 отказов OK")
+
+    _ = asyncio  # импорт нужен ради единообразия прогона
+
+
 if __name__ == '__main__':
     test_client_press_on_a_closed_gate_is_remembered_once()
     test_client_held_fire_sends_every_gate()
@@ -937,5 +1147,7 @@ if __name__ == '__main__':
     test_cooldown_refusal_waits_the_weapon_out()
     test_refusal_does_not_cut_the_confirmed_shot()
     test_stale_refusal_does_not_shadow_a_later_shot()
+    test_redelivered_refusal_is_not_decided_twice()
     test_unhandled_intent_is_answered()
+    test_server_tick_loop_holds_the_rate_the_fire_gate_is_built_on()
     print("ALL FIRE INTENT SMOKE TESTS PASSED")

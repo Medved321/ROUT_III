@@ -9,6 +9,7 @@ Covers the three things the feature is made of:
 
 Run: py -3.13 smoke_dash_fx.py
 """
+import math
 import os
 import sys
 
@@ -39,7 +40,7 @@ def _update(b, px=500.0, py=500.0, players=(), impacts=(), local_state=0,
     """Publish one frame of state *without* rendering, so a test can look at
     the effect pool right after a spawn and before the TTL step."""
     b.update(px, py, 0.0, health, list(players), [], [], [], 1, AMMO,
-             fire, 'pve', list(impacts), local_state)
+             fire, 'pve', list(impacts), local_state=local_state)
 
 
 def _frame(b, px=500.0, py=500.0, players=(), impacts=(), local_state=0,
@@ -254,10 +255,10 @@ def test_screen_streaks():
         field = rendering._ray_field
         if field is None:
             return -1
-        return sum(1 for spr, _a, _o, _p, _d, _t, _l in field
-                   for y in range(0, spr.get_height())
-                   for x in range(0, spr.get_width(), 2)
-                   if spr.get_at((x, y))[3] > 0)
+        return sum(1 for ray in field
+                   for y in range(0, ray.spr.get_height())
+                   for x in range(0, ray.spr.get_width(), 2)
+                   if ray.spr.get_at((x, y))[3] > 0)
 
     # At rest: nothing is drawn, and not even the ray sprites are baked.
     gs.screen.fill((10, 20, 30))
@@ -274,41 +275,85 @@ def test_screen_streaks():
     assert gs.dash_fx == 1.0 - const.DASH_FX_FADE, gs.dash_fx
     assert lit_pixels() > 0, 'ray field is empty while dashing'
 
-    # Every ray is a triangle pointing at the aim point: transparent at the apex
-    # and at the border end, brightest past the middle, and feathered across its
-    # width. Solid rects with hard ends are what this replaces -- they are what
+    # Every wedge is a triangle pointing at the aim point: transparent at the apex
+    # and at the border end, brightest in the middle stretch, and feathered across
+    # its width. Solid rects with hard ends are what this replaces -- they are what
     # made the cue read as tearing.
-    for spr, arm, _off, _peak, _dead, _travel, _length in rendering._ray_field:
-        sw, sh = spr.get_size()
-        horiz = arm == 'L' or arm == 'R'
-        ln, th = (sw, sh) if horiz else (sh, sw)
-        mid_c = th // 2
+    #
+    # Read the profile off the TEMPLATE, not off the baked field sprites. Every
+    # field sprite is turned to its own angle, so "along the length" and "across
+    # the width" are not screen axes anymore and reading them off a rotated sprite
+    # would only measure the rotation. The template is the single unturned shape
+    # all of them are scaled from, and the scaling cannot turn a clear alpha at an
+    # end into a hard edge.
+    tpl = rendering._ray_template()
+    ln, th = tpl.get_size()
+    mid_c = th // 2
 
-        def along(t):
-            return spr.get_at((t, mid_c))[3] if horiz else spr.get_at((mid_c, t))[3]
+    def along(t):
+        return tpl.get_at((t, mid_c))[3]
 
-        # Both ends of the length reach zero in the template, but a heavily
-        # downscaled ray averages the whole fade-out tail into its last pixel, so
-        # the criterion is relative: an end may only be a sliver of the peak. A
-        # hard end would be a visible fraction of it.
-        samples = [along((ln - 1) * k // 15) for k in range(16)]
-        peak = max(samples)
-        assert peak > 8, f'ray is flat at {peak}, not a gradient'
-        assert samples[0] * 6 <= peak, f'ray starts on a hard edge ({samples[0]}/{peak})'
-        assert samples[-1] * 6 <= peak, f'ray ends on a hard edge ({samples[-1]}/{peak})'
-        if th >= 3:
-            # A ray only has sides once it is three pixels or more across: two
-            # rows are both inside the wedge, and averaging the template down to
-            # them cannot produce a feather that was never there.
-            # The wedge widens towards the border, so the column at the peak is
-            # the widest one and the only fair place to read the profile.
-            col = min(ln - 1, int(ln * 0.68))
-            mid = along(col)
-            top = spr.get_at((col, 0))[3] if horiz else spr.get_at((0, col))[3]
-            bot = (spr.get_at((col, th - 1))[3] if horiz
-                   else spr.get_at((th - 1, col))[3])
-            assert max(top, bot) * 2 < mid * 3, (
-                f'{sw}x{sh} ray has hard side edges: {top}/{bot} vs {mid}')
+    # Both ends of the length reach zero in the template itself. The criterion is
+    # still relative: an end may only be a sliver of the peak, because averaging
+    # the fade-out tail into the last pixel is expected, a hard end is not.
+    samples = [along((ln - 1) * k // 15) for k in range(16)]
+    peak = max(samples)
+    assert peak > 8, f'wedge is flat at {peak}, not a gradient'
+    assert samples[0] * 6 <= peak, f'wedge starts on a hard edge ({samples[0]}/{peak})'
+    assert samples[-1] * 6 <= peak, f'wedge ends on a hard edge ({samples[-1]}/{peak})'
+    # The brightest stretch is in the middle, not pinned to one end: a wedge that
+    # peaks at its base would read as a solid bar with a fade, not a triangle.
+    assert samples.index(peak) > 2 and samples.index(peak) < len(samples) - 3, (
+        f'wedge peaks at {samples.index(peak)} of {len(samples) - 1}, not in the middle')
+    if th >= 3:
+        # The wedge widens towards the border, so the column at the peak is the
+        # widest one and the only fair place to read the side profile.
+        col = int(ln * 0.5)
+        mid = along(col)
+        top = tpl.get_at((col, 0))[3]
+        bot = tpl.get_at((col, th - 1))[3]
+        assert max(top, bot) * 2 < mid * 3, (
+            f'wedge has hard side edges: {top}/{bot} vs {mid}')
+    # And it is WHITE, which is the whole difference between a speed cue and the
+    # blue hit-flash this replaced.
+    lit_cols = [tpl.get_at((x, mid_c)) for x in range(ln)
+                if tpl.get_at((x, mid_c))[3] > 32]
+    assert lit_cols, 'template has no lit centre line'
+    for px in lit_cols:
+        r, g, b, _a = px
+        assert r > 200 and abs(r - g) < 12 and abs(g - b) < 12, (
+            f'wedge is not white: {px}')
+    assert const.DASH_FX_STREAK_RGB == (255, 255, 255), const.DASH_FX_STREAK_RGB
+
+    # The field is a full circle, not four bars on the screen axes. Every quadrant
+    # has to carry ink, and the gaps BETWEEN wedges have to stay small, or the cue
+    # reads as a "+" or a star of spokes glued to the edges of the view. Counted
+    # as the largest angular hole between neighbours, because "every quadrant has
+    # something in it" passes for a field with one wedge in three of them.
+    field = rendering._ray_field
+    assert len(field) == const.DASH_FX_STREAKS, len(field)
+    quads = {0: 0, 1: 0, 2: 0, 3: 0}
+    angs = sorted(math.degrees(math.atan2(r.uy, r.ux)) % 360.0 for r in field)
+    for r in field:
+        quads[(0 if r.ux >= 0 else 1) | (2 if r.uy >= 0 else 0)] += 1
+    assert all(v > 0 for v in quads.values()), f'quadrants {quads}'
+    assert len(quads) == 4
+    gaps = [angs[0] + 360.0 - angs[-1]] + [b - a for a, b in zip(angs, angs[1:])]
+    # One ring is 360/32 = 11.25 deg apart; the jitter in the table is a share of
+    # that, so the widest hole must stay under a full step and some.
+    assert max(gaps) < 360.0 / const.DASH_FX_STREAK_RING * 1.5, max(gaps)
+    # The rings must be at different radii, or "three rings" is one ring drawn
+    # three times and the field has no depth.
+    rings = {round(r.r0 / 8.0) for r in field}
+    assert len(rings) >= len(rendering._RAY_RING_OFF), sorted(rings)
+
+    # Area budget. A turned sprite is blitted as its axis-aligned bounding box and
+    # SDL blends every pixel of that box, empty ones included -- which for a long
+    # thin triangle is a couple of dozen times the ink. The first full-radius
+    # version measured 87 % of a 4K frame in boxes to paint 3.6 % of it and cost
+    # 13 ms a frame. This is the guard that keeps the length from creeping back.
+    box = sum(r.spr.get_width() * r.spr.get_height() for r in field)
+    assert box < w * h * 0.06, f'wedges cover {box / (w * h) * 100:.1f}% of the frame'
 
     # Nothing may reach the aim point: the crosshair sits on top of it and a ray
     # through the middle is what makes the cue unreadable exactly when it fires.
@@ -380,10 +425,10 @@ def test_streaks_armed_only_by_own_dash():
     _frame(b, local_state=DASH)
     assert gs.dash_fx > 0.0, 'own dash did not arm the overlay'
     field = rendering._ray_field
-    lit = sum(1 for spr, _a, _o, _p, _d, _t, _l in field
-              for y in range(0, spr.get_height())
-              for x in range(0, spr.get_width(), 2)
-              if spr.get_at((x, y))[3] > 0)
+    lit = sum(1 for r in field
+              for y in range(0, r.spr.get_height())
+              for x in range(0, r.spr.get_width(), 2)
+              if r.spr.get_at((x, y))[3] > 0)
     assert lit > 0, 'no ray drawn at effects_factor 0'
     assert len(field) == const.DASH_FX_STREAKS_MIN, (
         f'{len(field)} rays at effects_factor 0')

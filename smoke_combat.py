@@ -42,7 +42,7 @@ def test_protocol_roundtrip():
         {'x': 140.0, 'y': 150.0, 'type': 'enemy'},
     ]
     data = encode_world_state(1234, players, enemies, bullets, corpses, 'pvp', impacts)
-    tick, pl, en, bl, co, mode, im = decode_world_state(data)
+    tick, pl, en, bl, co, mode, im, it, _doors = decode_world_state(data)
     assert tick == 1234, tick
     assert mode == 'pvp', mode
     assert len(pl) == 1 and pl[0]['name'] == 'Bob' and pl[0]['wpn'] == 3
@@ -57,7 +57,7 @@ def test_protocol_roundtrip():
 
     # impacts round-trip with 0 events
     data0 = encode_world_state(1, [], [], [], [], 'pve')
-    _t, _p, _e, _b, _c, _m, im0 = decode_world_state(data0)
+    _t, _p, _e, _b, _c, _m, im0, _it, _d = decode_world_state(data0)
     assert im0 == [], im0
 
     # create party (pve / pvp)
@@ -103,12 +103,18 @@ def test_pvp_damage():
     p2 = w.entities.get_component(eid2, Position); p2.x, p2.y = 360.0, 300.0
     apply_weapon_switch(w, eid1, 2)  # shotgun
     wp = w.entities.get_component(eid1, WeaponComponent)
+    hp2 = w.entities.get_component(eid2, Health)
+    # Damage is asserted on the lowest HP seen, not on the final one: a killed
+    # player respawns immediately (see smoke_respawn), so the survivor teleports
+    # back to its join point and stops taking pellets, ending the volley at full
+    # HP with the damage already dealt.
+    lowest = hp2.value
     for _ in range(5):
         handle_shoot(w, eid1)
         wp.fire_cooldown = 0
         w.update()
-    hp2 = w.entities.get_component(eid2, Health)
-    assert hp2.value < 200, hp2.value
+        lowest = min(lowest, hp2.value)
+    assert lowest < 200, lowest
     print("pvp damage OK")
 
 
@@ -206,23 +212,62 @@ def test_ball_flies_damages_wall():
     wp = w.entities.get_component(eid, WeaponComponent)
     apply_weapon_switch(w, eid, 3)
     wp.ammo['slg'] = 10
-    w.enemies.append({
-        'id': 1, 'x': 400.0, 'y': 300.0, 't': 'imp', 'hp': 4, 'max_hp': 60,
-        'spd': 0.0, 'col': (180, 130, 80), 'a': True, 'dying': 0,
-        'anim_frame': 0, 'anim_state': 0, 'stun': 0, 'alert': True,
-        'pa': 0.0, 'ls': 0, 'd_flash': 0, 'spawn_x': 400.0, 'spawn_y': 300.0,
-    })
+
+    def imp_at(hp):
+        return {
+            'id': 1, 'x': 400.0, 'y': 300.0, 't': 'imp', 'hp': hp, 'max_hp': 60,
+            'spd': 0.0, 'col': (180, 130, 80), 'a': True, 'dying': 0,
+            'anim_frame': 0, 'anim_state': 0, 'stun': 0, 'alert': True,
+            'pa': 0.0, 'ls': 0, 'd_flash': 0,
+            'spawn_x': 400.0, 'spawn_y': 300.0,
+        }
+
+    # A surviving target, so the damage the ball dealt can actually be read:
+    # a lethal hit and the immediate respawn both land inside one update().
+    w.enemies.append(imp_at(60))
     handle_shoot(w, eid)
-    assert w.enemies and w.enemies[0]['hp'] == 4, "instant damage should not happen"
-    reached = False
+    assert w.enemies[0]['hp'] == 60, "instant damage should not happen"
     ticks = 0
-    while ticks < 30:
+    while ticks < 30 and w.enemies[0]['hp'] >= 60:
         w.update()
         ticks += 1
-        if (not w.enemies) or w.enemies[0]['hp'] <= 0:
-            reached = True
+    assert ticks < 30 and w.enemies[0]['hp'] < 60, (
+        "ball never reached enemy (enemy survived/dissipated)", ticks)
+
+    # A lethal hit: the enemy dies and STAYS dead -- it has no timer of its own,
+    # so nothing but a player's death can start the wave over.  The kill is
+    # observable as hp == 0 for as long as the player lives, which is exactly
+    # what used to be impossible to see (the old one-tick timer revived it
+    # inside the same update() the ball landed in).
+    wk = GameWorld(mode='pve')
+    ek = wk.add_player(1, 'A')
+    pk = wk.entities.get_component(ek, Position); pk.x, pk.y = 300.0, 300.0
+    wk.entities.get_component(ek, Rotation).angle = 0.0
+    wpk = wk.entities.get_component(ek, WeaponComponent)
+    apply_weapon_switch(wk, ek, 3)
+    wpk.ammo['slg'] = 10
+    wk.enemies.append(imp_at(4))
+    assert handle_shoot(wk, ek).fired
+    assert wk.enemies[0]['hp'] == 4, "instant damage should not happen"
+    killed = False
+    for _ in range(30):
+        wk.update()
+        if wk.enemies[0]['hp'] == 0:
+            killed = True
             break
-    assert reached, "ball never reached enemy (enemy survived/dissipated)"
+    assert killed, "ball never reached enemy (enemy survived)"
+    for _ in range(30):
+        wk.update()
+    down = wk.enemies[0]
+    assert down['hp'] == 0 and down['a'] is False, "a dead enemy revived itself"
+    assert (down['x'], down['y']) == (400.0, 300.0), down
+
+    # ...and a player's death is the one thing that does bring it back.
+    wk.damage_player(ek, 1000)
+    wk.update()
+    back = wk.enemies[0]
+    assert back['hp'] == 60 and back['a'] is True, back
+    assert (back['x'], back['y']) == (400.0, 300.0), back
 
     # -- wall: ball dissipates, no damage --
     from shared.map_data import GameMap

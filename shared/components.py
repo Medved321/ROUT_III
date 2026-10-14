@@ -50,6 +50,43 @@ class WeaponComponent(Component):
 
 
 @dataclass
+class Armor(Component):
+    """Server-side armor: soaks damage before ``Health`` does.
+
+    ``kind`` is ``'green'`` / ``'blue'`` and only picks the HUD colour -- both
+    behave identically, so there is no second rule to keep in sync.  Absorb is
+    total, not a fraction of the hit (see ``ARMOR_MAX``).
+    """
+    value: int = 0
+    max_value: int = 200
+    kind: str = "green"
+
+
+@dataclass
+class Powerup(Component):
+    """Server-side timed buff.
+
+    ``kind`` is ``'BERSERK'`` / ``'HASTE'`` / ``'INVULN'`` -- the same uppercase
+    spellings the HUD matches on, so the snapshot carries it verbatim.  ``ticks``
+    counts down in server ticks and the buff is gone at zero; a re-pickup
+    refreshes it rather than stacking a second copy of the same effect.
+    """
+    kind: str = ""
+    ticks: int = 0
+
+
+@dataclass
+class Keys(Component):
+    """Per-player key bitmask (see ``shared.sector_map.KEY_BITS``).
+
+    Bits: red = 0x01, yellow = 0x02, blue = 0x04.  A key is a normal pickup
+    that never respawns on a timer -- the level restart puts it back on the map
+    (design D9).
+    """
+    mask: int = 0
+
+
+@dataclass
 class Dash(Component):
     """Server-side dash state for a player.
 

@@ -74,7 +74,7 @@ def test_protocol_roundtrip():
         {'x': 120.0, 'y': 130.0, 'type': 'wall', 'id': 41},
         {'x': 140.0, 'y': 150.0, 'type': 'enemy', 'id': 42},
     ]
-    _t, pl, en, bl, co, mode, im = decode_world_state(
+    _t, pl, en, bl, co, mode, im, _it, _doors = decode_world_state(
         encode_world_state(123, players, [], [], [], 'pve', impacts)
     )
     assert [i['id'] for i in im] == [41, 42], im

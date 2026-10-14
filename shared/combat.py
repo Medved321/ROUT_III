@@ -53,3 +53,25 @@ def fire_reason_code(reason: str) -> int:
 def fire_reason_name(code: int) -> str:
     """Wire code -> reason string ('' means the intent was accepted)."""
     return FIRE_REASON_NAMES.get(code, '')
+
+
+# Wire codes for the server's decision about one "use" (door) intent.  Advisory:
+# the client only shows a short hint, so a single byte with no sequence number is
+# enough (design D6).
+USE_REASON_OK = 0
+USE_REASON_CODES = {
+    '': USE_REASON_OK,
+    'locked': 1,
+}
+USE_REASON_LOCKED = USE_REASON_CODES['locked']
+USE_REASON_NAMES = {v: k for k, v in USE_REASON_CODES.items()}
+
+
+def use_reason_code(reason: str) -> int:
+    """Server-side reason string -> the code that goes on the wire."""
+    return USE_REASON_CODES.get(reason, USE_REASON_OK)
+
+
+def use_reason_name(code: int) -> str:
+    """Wire code -> reason string ('' means the attempt was accepted)."""
+    return USE_REASON_NAMES.get(code, '')

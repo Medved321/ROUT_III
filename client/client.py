@@ -13,8 +13,8 @@ from shared.map_data import GameMap
 from shared.sector_map import MAP_FORMAT_SECTOR, SectorMap
 from shared.combat import (
     wpn_cooldown_ticks, TICK_INTERVAL, FPS_60, TAU, normalize_angle,
-    FIRE_REASON_CODES)
-from shared.protocol import INPUT_FLAG_DASH
+    FIRE_REASON_CODES, USE_REASON_LOCKED)
+from shared.protocol import INPUT_FLAG_DASH, INPUT_FLAG_USE
 from client.raycaster import SCREEN_WIDTH, SCREEN_HEIGHT
 from client.renderer import Renderer
 from client.bridge import RenderBridge
@@ -43,6 +43,8 @@ UPDATE_TIMEOUT = 30.0
 # player let go (the SSG's 1.30 s gate against a 10 Hz clicker used to queue ~39
 # shots for three seconds).
 FIRE_REASON_COOLDOWN = FIRE_REASON_CODES['cooldown']
+# How long the "нужен ключ" message stays on screen after the player presses E.
+USE_HINT_SECONDS = 1.5
 
 
 def _angle_diff(a: float, b: float) -> float:
@@ -114,6 +116,18 @@ class GameClient:
         self.local_state: int = 0
         self.mode: str = 'pve'
         self.impacts: list[dict] = []
+        self.items: list[dict] = []
+        self.doors: list[dict] = []
+        self.local_keys: int = 0
+        self.local_use_reason: int = 0
+        # A "use" refusal is advisory and would otherwise sit in the snapshot
+        # forever, so the HUD shows it only for a short spell after the player
+        # actually pressed E (design D6). The window is armed on the press edge
+        # and read by the renderer through the bridge.
+        self._use_hint_until: float = 0.0
+        self._prev_use: bool = False
+        self.local_armor: dict | None = None
+        self.local_powerup: str = ''
 
         self.other_players: list[dict] = []
         self.enemies: list[dict] = []
@@ -662,6 +676,16 @@ class GameClient:
         # over duration and cooldown and ignores duplicates anyway.
         flags = INPUT_FLAG_DASH if self._dash_pending else 0
         self._dash_pending = False
+        # "Use" rides along while E is held; the server collapses it to one
+        # attempt per rising edge, so no latching is needed on the client.
+        if self.input_handler.use:
+            flags |= INPUT_FLAG_USE
+        # Arm the refusal hint on the press edge, not on the (sticky) refusal
+        # itself: the server keeps the last result in `use_reason`, so a raw
+        # "is it locked?" check would leave the message on screen forever.
+        if self.input_handler.use and not self._prev_use:
+            self._use_hint_until = time.monotonic() + USE_HINT_SECONDS
+        self._prev_use = self.input_handler.use
         return (
             self.input_handler.move_x,
             self.input_handler.move_y,
@@ -995,12 +1019,20 @@ class GameClient:
         # Remote entities are rendered interpolated (smoothed) between the last
         # two snapshots; the local player uses the authoritative latest state
         # with no interpolation delay (prediction).
-        _tick, players, enemies, bullets, corpses, mode, impacts = render_state
+        (_tick, players, enemies, bullets, corpses,
+         mode, impacts, items, doors) = render_state
         self.other_players = [p for p in players if p["id"] != self.player_id]
         self.enemies = enemies
         self.bullets = bullets
         self.corpses = corpses
         self.impacts = impacts
+        # Pickups are taken straight from the snapshot: the server owns both
+        # the position and the moment of disappearance, so there is nothing
+        # here to predict and nothing to smooth.
+        self.items = items
+        # Doors send only their non-closed state, keyed by linedef id (see
+        # shared/protocol.py). The bridge joins them to the map's door lines.
+        self.doors = doors
         self.mode = mode
 
         latest = self.network.latest_state
@@ -1020,6 +1052,17 @@ class GameClient:
                 # (cooldown, no movement input) must not flash, and the effect
                 # then arrives exactly when the body starts moving.
                 self.local_state = p.get("state", 0)
+                # Armor and the active buff are stored verbatim from the
+                # snapshot and handed to the bridge unchanged. They are not
+                # derived here: the server decides both, and a local guess
+                # would be a second source of truth for how protected the
+                # player is.
+                self.local_armor = p.get("armor")
+                self.local_powerup = p.get("powerup", "")
+                # Key bitmask and the advisory "use" result, taken verbatim
+                # from the snapshot: the server owns both (design D6/D9).
+                self.local_keys = p.get("keys", 0)
+                self.local_use_reason = p.get("use_reason", 0)
                 # Fire decision from the snapshot: drives the local recoil's
                 # length instead of the key press, so a refused intent cannot
                 # leave a phantom shot behind.
@@ -1052,11 +1095,15 @@ class GameClient:
             self.enemies, self.bullets, self.corpses,
             self.local_weapon, self.local_ammo,
             self._fire_anim_frames(time.monotonic()),
-            self.mode, self.impacts, self.local_state,
+            self.mode, self.impacts, self.items, self.local_state,
             # clock.get_fps() is the rolling average over the frames just
             # drawn, which is what a readout should show: an instantaneous
             # 1/frame_ms would flicker on every slow frame.
             self.renderer.clock.get_fps(),
+            armor=self.local_armor, powerup=self.local_powerup,
+            doors=self.doors, keys=self.local_keys,
+            use_hint=(self.local_use_reason == USE_REASON_LOCKED
+                      and time.monotonic() < self._use_hint_until),
         )
         self.bridge.render()
         pygame.display.flip()

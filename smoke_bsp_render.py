@@ -190,14 +190,21 @@ def _make_window_step():
     return sm
 
 
-def _window_seg_id(scene, side=0):
-    """The window linedef's seg on the requested side (0 = faces room A)."""
+def _window_seg_id(scene, side=1):
+    """The window linedef's seg on the requested side (1 = the B-side face).
+
+    The portal line's direction is fixed by the sector polygon closure, so for
+    the camera in room A looking +x the kept (back-face cull, change
+    ``sector-step-down-pit``) twin is the ``side=1`` seg — its direction has
+    the camera on its right.  The ``side=0`` seg is the culled back face and
+    must stay silent.
+    """
     bsp = scene.ensure_bsp()
     lds = scene.sm.linedefs
     verts = scene.sm.verts
     li = next(i for i, ld in enumerate(lds)
-              if verts[ld.v1].x == 512 and verts[ld.v1].y == 224
-              and verts[ld.v2].x == 512 and verts[ld.v2].y == 288)
+              if verts[ld.v1].x == 512 and verts[ld.v2].x == 512
+              and {verts[ld.v1].y, verts[ld.v2].y} == {224.0, 288.0})
     out = [i for i in _segs_of(bsp, li) if bsp.segs[i].side == side]
     assert out, "window seg missing"
     return out[0]
@@ -264,7 +271,7 @@ def test_two_sided_clips():
     _frame_state(_make_window_step)
     scene = gs.sec_scene
     bsp = scene.ensure_bsp()
-    si = _window_seg_id(scene, side=0)
+    si = _window_seg_id(scene, side=1)
     iw, ih = 1000, 700
     clip_top = [0.0] * iw
     clip_bot = [float(ih)] * iw
@@ -273,10 +280,21 @@ def test_two_sided_clips():
                                   gs.px, gs.py, gs.pa, 750.0, 350.0,
                                   iw, ih, 41.0, 900.0, clip_top, clip_bot)
     assert bands, "window seg must emit upper/lower lip bands"
-    # Columns inside the opening stay open and pinch exactly to the lip edges.
+    # The back-facing twin (side 0) contributes nothing: one seg per column
+    # owns the clip movement, so the pit/stair floor is never evicted by the
+    # reversed face (sector-step-down-pit back-face cull).
+    si_back = _window_seg_id(scene, side=0)
+    back_bands = []
+    sector_render._seg_wall_bands(back_bands, scene, bsp, si_back,
+                                  gs.px, gs.py, gs.pa, 750.0, 350.0,
+                                  iw, ih, 41.0, 900.0, clip_top[:], clip_bot[:])
+    assert not back_bands, f"back-facing twin must be culled: {back_bands}"
+    # Columns inside the opening stay open and pinch exactly to the lip edges:
+    # the camera-facing twin closes the ceiling to B's ceiling (the higher
+    # bound) and the floor to ITS front floor line (the visible face).
     ct, cb = clip_top[400], clip_bot[400]
     assert 176.0 <= ct <= 179.0, f"opening ceiling bound: {ct}"
-    assert 416.0 <= cb <= 419.0, f"opening floor bound: {cb}"
+    assert 656.0 <= cb <= 659.0, f"opening floor bound: {cb}"
     print("  two-sided clips OK")
 
 
@@ -286,7 +304,7 @@ def test_clip_discard():
     _frame_state(_make_window_step)
     scene = gs.sec_scene
     bsp = scene.ensure_bsp()
-    si = _window_seg_id(scene, side=0)
+    si = _window_seg_id(scene, side=1)
     iw, ih = 1000, 700
     clip_top = [0.0] * iw
     clip_bot = [float(ih)] * iw
@@ -313,8 +331,8 @@ def test_flats_span_clips():
     _frame_state(_make_window_step)
     scene = gs.sec_scene
     bsp = scene.ensure_bsp()
-    si = _window_seg_id(scene, side=0)
-    # Window lays out over cols ~223..777; leave [300, 600) open.
+    si = _window_seg_id(scene, side=1)
+    # Window lies over cols ~223..777; leave [300, 600) open.
     iw, ih = 1000, 700
     clip_top = [0.0] * iw
     clip_bot = [float(ih)] * iw
@@ -332,16 +350,17 @@ def test_flats_span_clips():
     seen_floor = False
     for (x, y0, y1, sid, floor) in flat_spans:
         assert 300 <= x < 600, f"span leaked into a closed column: {x}"
-        assert sid == 0, f"window front sector is A (sid 0): {sid}"
+        assert sid == 1, f"camera-facing window seg front is B (sid 1): {sid}"
         if not floor:
-            # Front ceiling row is off-screen above the frame -> empty.
-            assert y1 <= y0
+            # Front ceiling row (B ceiling 64) sits mid-frame here -> non-empty.
+            assert y1 > y0
         else:
-            # Floor of A in front of the step: from the step base ~657 down.
-            assert 650.0 <= y0 <= 665.0, f"A floor bound: {y0}"
+            # B floor behind the window: from the step base ~417 (B floor)
+            # down to the frame bottom.
+            assert 415.0 <= y0 <= 420.0, f"B floor bound: {y0}"
             assert y1 == ih
             seen_floor = True
-    assert seen_floor, "A floor span missing in the open columns"
+    assert seen_floor, "B floor span missing in the open columns"
     # Fully closed columns: whole seg discarded, no spans, clips untouched.
     clip_top = [350.0] * iw
     clip_bot = [350.0] * iw

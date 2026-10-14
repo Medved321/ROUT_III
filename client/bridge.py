@@ -241,8 +241,14 @@ class RenderBridge:
         fire_timer: int = 0,
         mode: str = 'pve',
         impacts: list[dict] | None = None,
+        items: list[dict] | None = None,
         local_state: int = 0,
         fps: float = 0.0,
+        armor: dict | None = None,
+        powerup: str = '',
+        doors: list[dict] | None = None,
+        keys: int = 0,
+        use_hint: bool = False,
     ) -> None:
         # The animation clock runs on the frame period, not on snapshots, so a
         # 20 Hz snapshot stream still animates at the display rate.  Fed here
@@ -304,6 +310,32 @@ class RenderBridge:
             else:
                 gs.bul.append(entry)
         gs.corpses = [self._corpse_dict(c) for c in (corpses or [])]
+        # Pickups keep the wire keys plus the renderer's own 'a' (active)
+        # flag: the engine draws anything with a 't', and 'a' lets a
+        # fade-out/pop effect key off it without a second list.
+        gs.items = [
+            {'x': it['x'], 'y': it['y'], 't': it['type'],
+             'a': True, 'id': it.get('id', 0)}
+            for it in (items or [])
+        ]
+        # Armor and the active buff are per-player HUD state read straight
+        # from the snapshot. The server is the only writer: deriving either
+        # client-side would be a second opinion about how much protection a
+        # player has, which is exactly the state the server owns.
+        player_dict['armor'] = armor
+        player_dict['powerup'] = powerup or ''
+        # Keys are a per-player bitmask on the wire and a colour->held dict in
+        # the engine's HUD (design D9).  The bits come from
+        # shared.sector_map.KEY_BITS; the letters are the HUD's own labels.
+        player_dict['keys'] = {
+            'R': 1 if keys & 0x01 else 0,
+            'Y': 1 if keys & 0x02 else 0,
+            'B': 1 if keys & 0x04 else 0,
+        }
+        # Advisory "you need a key" banner. The client owns the timeout (the
+        # server keeps the last result), the engine only paints the flag.
+        player_dict['use_hint'] = bool(use_hint)
+        self._update_doors(doors)
         self._spawn_impact_particles(impacts)
         self._dash_fx(
             [(pl['id'], pl['x'], pl['y'], pl.get('state', 0),
@@ -352,6 +384,26 @@ class RenderBridge:
                 acc -= const.DASH_FX_TRAIL_PX
                 particles.spawn_dash_puff(x, y, col, math.atan2(dy, dx))
             self._dash_px[sid] = acc
+
+    def _update_doors(self, doors: list[dict] | None) -> None:
+        """Publish per-door opening fractions to the sector scene (design D8).
+
+        The wire carries only NON-closed doors keyed by linedef id with a
+        ``progress`` byte; anything absent is shut.  Rebuilding the dict each
+        frame is how a door that has just closed reverts to 0 without a
+        special "closed" message.
+        """
+        scene = gs.sec_scene
+        if scene is None:
+            return
+        prog = scene.door_progress
+        prog.clear()
+        for d in (doors or []):
+            li = d.get('li')
+            if li is None:
+                continue
+            raw = d.get('progress', 0)
+            prog[li] = min(1.0, max(0.0, raw / 255.0))
 
     def _spawn_impact_particles(self, impacts: list[dict] | None) -> None:
         """Spawn local tracer particles for impact events (deduped + budgeted)."""

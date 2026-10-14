@@ -42,6 +42,10 @@ class PacketType(IntEnum):
 # rather than a dedicated bool so the next input action (sprint, double tap)
 # costs no protocol change.
 INPUT_FLAG_DASH = 0x01
+# "Use" action (open a nearby door).  A bit, not a message: the action is
+# idempotent over the door's hold window, so the 25 Hz input channel is enough
+# and the server reacts to its rising edge (design D4).
+INPUT_FLAG_USE = 0x02
 
 
 @dataclass
@@ -76,6 +80,25 @@ ENEMY_TYPES = (
 )
 
 AMMO_KEYS = ("pstl", "shl", "slg", "rck", "BFG")
+
+# Pickup types, as one wire index. The order must stay identical to
+# server/game_data.py:ITEM_DB -- protocol.py cannot import the server, so the two
+# tables are kept in sync by a smoke test asserting the key sets match, not by a
+# shared import. Appending is safe; reordering silently re-labels every item
+# placed on an existing map.
+ITEM_TYPES = (
+    "med", "med_small", "heart", "amm", "amm_small",
+    "armor_green", "armor_blue",
+    "berserk", "haste", "invuln",
+    "wpn_0", "wpn_2", "wpn_3", "wpn_4", "wpn_5",
+    "key_red", "key_yellow", "key_blue",
+)
+
+# Armor colour: both behave identically, this only picks the HUD colour.
+ARMOR_TYPES = ("green", "blue")
+# Active timed buff. Index 0 is "none", so an empty byte means no buff and the
+# names travel verbatim -- the HUD already matches on these exact spellings.
+POWERUP_TYPES = ("", "BERSERK", "HASTE", "INVULN")
 
 MODES = {"pve": 0, "pvp": 1}
 MODE_NAMES = {v: k for k, v in MODES.items()}
@@ -204,6 +227,26 @@ def decode_fire(data: bytes) -> tuple[int, int]:
     return struct.unpack("!IB", data)
 
 
+def _u8(value) -> int:
+    """Fit a byte-sized field instead of letting struct raise on it.
+
+    The byte range is a wire constraint, not a game rule: the rules live
+    wherever the value is produced (AMMO_MAX for a reserve, PLAYER_MAX_HP for
+    health), and a stray one here used to take the whole broadcast -- with it
+    the game loop -- down with ``struct.error``.  Clamping keeps the server
+    running and the snapshot decodable; masking would not (9999 & 0xFF is 15,
+    a number nobody ever had).  Values below 0 are clamped too: struct rejects
+    those with the same error, and negative ammo is not a thing.
+    """
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return 0
+    if v < 0:
+        return 0
+    return 255 if v > 255 else v
+
+
 def encode_world_state(
     tick: int,
     players: list[dict],
@@ -212,6 +255,8 @@ def encode_world_state(
     corpses: list[dict] | None = None,
     mode: str = 'pve',
     impacts: list[dict] | None = None,
+    items: list[dict] | None = None,
+    doors: list[dict] | None = None,
 ) -> bytes:
     mode_byte = MODES.get(mode, 0)
     header = struct.pack("!HBB", tick, mode_byte, len(players))
@@ -223,18 +268,42 @@ def encode_world_state(
         # last processed intent was not accepted (0 = accepted).  Together they
         # are the server's decision about the fire intent, so a refused shot is
         # visible instead of being dropped in silence (fire-intent-single-path).
+        # armor/powerup are per-player state with no other source in the
+        # snapshot; armor_type/powerup carry wire indices so an unknown value
+        # from a future build degrades to "no armor"/"no buff" instead of
+        # crashing an old client on an index error.
+        armor = p.get("armor") or {}
+        powerup = p.get("powerup") or ""
+        armor_type = armor.get("type", "green")
+        armor_idx = ARMOR_TYPES.index(armor_type) if armor_type in ARMOR_TYPES else 0
+        pu_idx = POWERUP_TYPES.index(powerup) if powerup in POWERUP_TYPES else 0
         body += struct.pack(
-            "!BfffBBBBBBBBIBB",
-            p["id"],
+            # player_id is uint16 on purpose: it comes from a monotonic join
+            # counter with no 255 ceiling, and as a byte it was the second way
+            # to crash the server with the very same struct.error (the first
+            # was an uncapped ammo stack).  An id is an identity, so it is
+            # widened rather than clamped -- a clamped id would collide with
+            # another live player instead of failing loudly.
+            # keys: the player's key bitmask (R/Y/B), use_reason: advisory code
+            # for the last "use" attempt (0 = none/ok).  Both are per-player
+            # state with no other source in the snapshot.
+            "!HfffBBBBBBBBIBBBBBBB",
+            p["id"] & 0xFFFF,
             p["x"], p["y"], p["angle"],
-            p["health"],
-            p["state"],
-            p.get("wpn", 1),
-            ammo.get("pstl", 0), ammo.get("shl", 0),
-            ammo.get("slg", 0), ammo.get("rck", 0), ammo.get("BFG", 0),
+            _u8(p["health"]),
+            _u8(p["state"]),
+            _u8(p.get("wpn", 1)),
+            _u8(ammo.get("pstl", 0)), _u8(ammo.get("shl", 0)),
+            _u8(ammo.get("slg", 0)), _u8(ammo.get("rck", 0)),
+            _u8(ammo.get("BFG", 0)),
             p.get("fire_seq", 0) & 0xFFFFFFFF,
             p.get("fire_ready", 0) & 0xFF,
             p.get("fire_reason", 0) & 0xFF,
+            int(armor.get("value", 0)) & 0xFF,
+            armor_idx,
+            pu_idx,
+            int(p.get("keys", 0)) & 0xFF,
+            int(p.get("use_reason", 0)) & 0xFF,
         )
         body += _encode_string(p.get("name", ""))
     # Enemies
@@ -279,18 +348,42 @@ def encode_world_state(
             itype = IMPACT_TYPES.index(itype) if itype in IMPACT_TYPES else 0
         body += struct.pack("!ffBI", im["x"], im["y"], itype & 0xFF,
                             im.get("id", 0) & 0xFFFFFFFF)
+    # Pickups (id, x, y, type). Only items currently on the floor are sent: a
+    # taken item is absent rather than flagged, so a client cannot draw a ghost
+    # of something the server has already given away. The id is stable across the
+    # item's whole life including its respawn, which is what lets the client
+    # reconcile instead of guessing from position.
+    items = items or []
+    body += struct.pack("!H", len(items))
+    for it in items:
+        itype = it.get("type", it.get("t", ""))
+        if isinstance(itype, str):
+            itype = ITEM_TYPES.index(itype) if itype in ITEM_TYPES else 0
+        body += struct.pack("!HffB",
+                            it.get("id", 0) & 0xFFFF,
+                            it["x"], it["y"], itype & 0xFF)
+    # Doors: sparse block of NON-closed doors only (linedef_id u16, progress u8
+    # where 0 = shut ... 255 = fully open).  A silent door is therefore a closed
+    # one, which is exactly the map default, so an idle level costs nothing
+    # (design D5).
+    doors = doors or []
+    body += struct.pack("!H", len(doors))
+    for d in doors:
+        body += struct.pack("!HB",
+                            d.get("li", d.get("id", 0)) & 0xFFFF,
+                            _u8(d.get("progress", 0)))
     return header + body
 
 
-def decode_world_state(data: bytes) -> tuple[int, list[dict], list[dict], list[dict], list[dict], str, list[dict]]:
+def decode_world_state(data: bytes) -> tuple[int, list[dict], list[dict], list[dict], list[dict], str, list[dict], list[dict], list[dict]]:
     tick, mode_byte, count = struct.unpack("!HBB", data[:4])
     players = []
     offset = 4
     for _ in range(count):
-        pid, x, y, angle, hp, state, wpn, ap, ash, asg, ark, abfg, fire_seq, fire_ready, fire_reason = struct.unpack(
-            "!BfffBBBBBBBBIBB", data[offset:offset + 27]
+        pid, x, y, angle, hp, state, wpn, ap, ash, asg, ark, abfg, fire_seq, fire_ready, fire_reason, armor_value, armor_idx, pu_idx, keys, use_reason = struct.unpack(
+            "!HfffBBBBBBBBIBBBBBBB", data[offset:offset + 33]
         )
-        offset += 27
+        offset += 33
         name, offset = _decode_string(data, offset)
         players.append({
             "id": pid, "x": x, "y": y, "angle": angle,
@@ -298,6 +391,16 @@ def decode_world_state(data: bytes) -> tuple[int, list[dict], list[dict], list[d
             "ammo": {"pstl": ap, "shl": ash, "slg": asg, "rck": ark, "BFG": abfg},
             "fire_seq": fire_seq, "fire_ready": fire_ready,
             "fire_reason": fire_reason,
+            # Armor is absent (None) rather than a zero-valued dict: the HUD asks
+            # `if arm:` before reading its keys, so a present-but-empty armor
+            # would draw an "ARMOR 0" readout with no armor to justify it.
+            "armor": ({"type": ARMOR_TYPES[armor_idx], "value": armor_value}
+                      if 0 <= armor_idx < len(ARMOR_TYPES) and armor_value > 0
+                      else None),
+            "powerup": (POWERUP_TYPES[pu_idx]
+                        if 0 <= pu_idx < len(POWERUP_TYPES) else ""),
+            "keys": keys,
+            "use_reason": use_reason,
         })
     # Enemies
     e_count = struct.unpack("!H", data[offset:offset + 2])[0]
@@ -338,7 +441,27 @@ def decode_world_state(data: bytes) -> tuple[int, list[dict], list[dict], list[d
             "type": IMPACT_TYPES[itype] if 0 <= itype < len(IMPACT_TYPES) else "wall",
             "id": iid,
         })
-    return tick, players, enemies, bullets, corpses, MODE_NAMES.get(mode_byte, 'pve'), impacts
+    # Pickups (id, x, y, type)
+    it_count = struct.unpack("!H", data[offset:offset + 2])[0]
+    offset += 2
+    items = []
+    for _ in range(it_count):
+        iid, ix, iy, itype = struct.unpack("!HffB", data[offset:offset + 11])
+        offset += 11
+        items.append({
+            "id": iid, "x": ix, "y": iy,
+            "type": ITEM_TYPES[itype] if 0 <= itype < len(ITEM_TYPES) else "med",
+        })
+    # Doors (linedef_id, progress).  Absent door = closed (map default).
+    d_count = struct.unpack("!H", data[offset:offset + 2])[0]
+    offset += 2
+    doors = []
+    for _ in range(d_count):
+        dli, dprog = struct.unpack("!HB", data[offset:offset + 3])
+        offset += 3
+        doors.append({"li": dli, "progress": dprog})
+    return (tick, players, enemies, bullets, corpses,
+            MODE_NAMES.get(mode_byte, 'pve'), impacts, items, doors)
 
 
 def encode_join_request(name: str) -> bytes:

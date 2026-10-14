@@ -356,8 +356,11 @@ class ServerNetwork:
         corpses: list[dict] | None = None,
         mode: str = 'pve',
         impacts: list[dict] | None = None,
+        items: list[dict] | None = None,
+        doors: list[dict] | None = None,
     ) -> None:
-        payload = encode_world_state(tick, player_states, enemies, bullets, corpses, mode, impacts)
+        payload = encode_world_state(tick, player_states, enemies, bullets,
+                                     corpses, mode, impacts, items, doors)
         packet = Packet(PacketType.WORLD_STATE, tick & 0xFFFF, payload)
         data = packet.encode()
         for addr in addresses:

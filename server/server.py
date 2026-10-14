@@ -8,18 +8,18 @@ import math
 from pathlib import Path
 
 from shared.components import (
-    Velocity, Rotation, Player, Dash,
+    Velocity, Rotation, Player, Dash, Powerup,
 )
 from shared.map_data import GameMap
 from shared.sector_map import MAP_FORMAT_SECTOR, SectorMap
 from shared.releases import ReleaseStore, is_newer
 from shared.version import CLIENT_VERSION, PROTOCOL_VERSION
 from shared.combat import normalize_angle, fire_reason_code
-from shared.protocol import INPUT_FLAG_DASH
+from shared.protocol import INPUT_FLAG_DASH, INPUT_FLAG_USE
 from server.game_world import GameWorld
 from server.game_data import (
-    MOVE_SPEED_PX, TICK_RATE, TICK_INTERVAL,
-    DASH_SPEED_MULT, DASH_TICKS, DASH_COOLDOWN_TICKS,
+    MOVE_SPEED_PX, TICK_RATE, TICK_INTERVAL, TICK_DRAIN_MAX,
+    DASH_SPEED_MULT, DASH_TICKS, DASH_COOLDOWN_TICKS, HASTE_SPEED_MULT,
 )
 from server.lobby import Lobby, Party
 from server.network import ServerNetwork
@@ -40,11 +40,9 @@ class GameServer:
             )
         self.releases = ReleaseStore(releases_dir)
         self.running = False
-        self._last_tick_time: float = 0.0
 
     async def start(self) -> None:
         self.running = True
-        self._last_tick_time = time.monotonic()
 
         self.network.on_join(self._on_player_join)
         self.network.on_leave(self._on_player_leave)
@@ -65,16 +63,53 @@ class GameServer:
         await self._game_loop()
 
     async def _game_loop(self) -> None:
+        # The tick period is an ABSOLUTE deadline, not "how long the last
+        # iteration happened to take". Two separate things were wrong before,
+        # and together they put the whole server into permanent slow motion:
+        #
+        # 1. `await asyncio.sleep` on Windows quantizes to the system clock tick
+        #    (~15.6 ms): sleep(0.05) returns after ~63 ms, not 50. A poll loop
+        #    that re-checks `dt >= TICK_INTERVAL` every 1 ms therefore measures
+        #    a steady 62.5 ms period — 15.8 tps instead of 20, and sleeping
+        #    "the right amount" does not help either, it rounds up just the
+        #    same.
+        # 2. `self._last_tick_time = now` threw the overshoot away, so the
+        #    shortfall never compensated: every tick permanently dropped the
+        #    ~12.5 ms it woke up late. Fixing only the sleep is not enough.
+        #
+        # Why a 21 % slow tick rate breaks firing specifically: TICK_RATE is
+        # what `wpn_cooldown_ticks` converts weapon fire rates with, on BOTH
+        # sides of the wire, so the client's fire gate is measured in nominal
+        # ticks while the server drains them in real ones. At 15.8 tps a 5-tick
+        # pistol cooldown takes 0.32 s of wall time while the gate stays 0.30 s,
+        # so every SECOND intent arrives with a hot barrel, is refused for
+        # cooldown, and cuts the recoil the client had already predicted:
+        # "animation, ammo counter, no shot, animation, no shot". The same 21 %
+        # also slowed movement, dash and enemy AI for every player.
+        #
+        # Missed periods are made up by running ticks back to back (bounded by
+        # TICK_DRAIN_MAX), so the cooldowns still drain at the nominal rate even
+        # when the wake-ups are late or uneven.
+        deadline = time.monotonic()
         while self.running:
             now = time.monotonic()
-            dt = now - self._last_tick_time
-            if dt >= TICK_INTERVAL:
-                self._last_tick_time = now
+            ticks = 0
+            while now - deadline >= TICK_INTERVAL:
+                deadline += TICK_INTERVAL
                 self.lobby.update_all()
                 self._broadcast_parties()
                 self._remove_stale_players()
+                ticks += 1
+                if ticks >= TICK_DRAIN_MAX:
+                    # Fell too far behind (map load, GC pause). Replaying the
+                    # whole backlog here would stall the loop even harder, so
+                    # the debt is dropped instead of repaid.
+                    deadline = now
+                    break
+                now = time.monotonic()
             self.network.tick()
-            await asyncio.sleep(0.001)
+            left = deadline - time.monotonic()
+            await asyncio.sleep(left if left > 0.0 else 0.0)
 
     def _broadcast_parties(self) -> None:
         for party in self.lobby.parties.values():
@@ -94,10 +129,12 @@ class GameServer:
             bullets = w.get_bullet_states()
             corpses = w.get_corpse_states()
             impacts = w.get_impact_states()
+            items = w.get_item_states()
+            doors = w.get_door_states()
             addresses = [s.address for s in party.members.values()]
             self.network.broadcast_world_state(
                 addresses, w.tick, players, enemies, bullets, corpses,
-                party.mode, impacts,
+                party.mode, impacts, items, doors,
             )
 
     def _remove_stale_players(self) -> None:
@@ -275,18 +312,31 @@ class GameServer:
     def _on_player_fire(
         self, session: PlayerSession, fire_seq: int, weapon_id: int = 1
     ) -> None:
-        # Idempotent: the reliable channel may redeliver an intent, and it may
-        # redeliver it LATE. The test is therefore "not newer than the last
-        # decided intent", not "equal to the last accepted one": the reliable
-        # channel retransmits with rto=0.2 and exponential backoff, so an intent
-        # refused for cooldown can come back after a later intent was accepted.
-        # Deciding it again would overwrite that acceptance with a bogus refusal,
-        # which the client then charges against whatever it has in flight (the
-        # accepted shot loses its recoil mid-animation). The client numbers its
-        # intents strictly increasing (send_fire bumps the counter on every
-        # send), so "not newer" can never reject a fresh intent.
-        if fire_seq <= session.last_fire_seq:
+        # Exactly once per intent, always answered. Two facts are kept apart:
+        # `last_fire_decided` is the watermark of everything already decided
+        # (accepted or refused) and answers "was this intent dealt with?", while
+        # `last_fire_seq` is the last ACCEPTED one and is what the snapshot
+        # publishes, because the client reads a jump of it as a shot.
+        #
+        # The guard therefore tests the decided watermark, not the accepted
+        # number: a refusal does not move the accepted number, so a redelivered
+        # REFUSED intent used to pass the guard and be decided a second time —
+        # the reliable channel retransmits with rto=0.2 and exponential
+        # backoff, so that is a real arrival, and by then the weapon may well
+        # have cooled down: the retry fired a shot nobody asked for and
+        # published it as a fresh acceptance over the decision that followed.
+        # Deciding it again would also overwrite that newer decision with a
+        # bogus refusal, which the client then charges against whatever it has
+        # in flight (the accepted shot loses its recoil mid-animation).
+        #
+        # The client numbers its intents strictly increasing (send_fire bumps
+        # the counter on every send), so "not newer" can never reject a fresh
+        # intent: everything that arrives here IS accepted and gets a decision.
+        if fire_seq <= session.last_fire_decided:
             return
+        # Stamped before anything can bail out, so no path leaves an intent
+        # unaccounted for and therefore re-decidable.
+        session.last_fire_decided = fire_seq
         party = self.lobby.find_party_of(session)
         if party is None:
             # An intent the server cannot process still gets a decision: a
@@ -336,10 +386,23 @@ class GameServer:
             cos_a = math.cos(rot.angle)
             sin_a = math.sin(rot.angle)
             spd = MOVE_SPEED_PX * TICK_INTERVAL
+            # HASTE and the dash are alternatives, not multipliers of each other:
+            # a dash is already DASH_SPEED_MULT (6x), and stacking the buff on
+            # top would make it a 9x movement button that trivialises the map
+            # for as long as it lasts. While dashing, HASTE is ignored.
             if dashing:
                 spd *= DASH_SPEED_MULT
+            else:
+                pu = world.entities.get_component(entity_id, Powerup)
+                if pu is not None and pu.kind == 'HASTE':
+                    spd *= HASTE_SPEED_MULT
             vel.dx = (move_x * cos_a - move_y * sin_a) * spd
             vel.dy = (move_x * sin_a + move_y * cos_a) * spd
+
+        # "Use" (open a nearby door) is a rising-edge action: the flag is held
+        # while the key is down, and only the transition triggers one attempt
+        # (design D4).  It is independent of movement and the fire button.
+        world.apply_use_input(entity_id, bool(flags & INPUT_FLAG_USE))
 
         # weapon switch
         apply_weapon_switch(world, entity_id, weapon_id)
@@ -348,11 +411,14 @@ class GameServer:
         # only path to a shot is the reliable FIRE intent, so the 25 Hz input
         # channel cannot race it and no intent can be silently eaten by the
         # weapon cooldown here.
-        if pl:
+        if pl and pl.state != 1:
             # Dash state is derived from the authoritative dash component, not
             # from a key press, so a refused dash cannot flash. Shooting is not
             # published from input at all: state = 2 is set by handle_shoot()
             # only when a shot really happened.
+            # A dead player keeps state = 1: input arrives at 25 Hz independently
+            # of the 20 Hz tick, so an unguarded write here can clear the death
+            # that a same-tick respawn timer is about to expire.
             pl.state = 3 if dashing else 0
 
     def _on_player_ping(self, session: PlayerSession, timestamp: float) -> None:

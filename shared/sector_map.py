@@ -38,6 +38,33 @@ LINE_FLAG_SOLID = 0x02
 # wall. Symmetric: passability is one boolean per linedef.
 STEP_HEIGHT = 24
 
+# Linedef special: a door. The number matches ``SPECIAL_NAMES["дверь"]`` in
+# ``shared/text_map.py``. A door is an ordinary two-sided linedef that blocks
+# movement, sight, hitscans and shots only while it is shut; the runtime state
+# lives on the server (see ``server/game_world.py``), never on the map data.
+SPECIAL_DOORS = 2
+
+# Middle textures that mark a door and its lock. ``door_D`` is unkeyed; the
+# colour letters coincide with the key colours (Doom convention).
+DOOR_TEXTURE_NONE = "door_D"
+DOOR_TEXTURES = ("door_D", "door_R", "door_Y", "door_B")
+
+# Lock colour carried by each door texture (``None`` = no key needed).
+DOOR_LOCK_BY_TEXTURE = {
+    "door_D": None,
+    "door_R": "red",
+    "door_Y": "yellow",
+    "door_B": "blue",
+}
+DOOR_TEXTURE_BY_LOCK = {
+    None: "door_D", "red": "door_R", "yellow": "door_Y", "blue": "door_B",
+}
+
+# Key item type per colour, and the per-player bitmask bit of each colour.
+KEY_TYPES = {"red": "key_red", "yellow": "key_yellow", "blue": "key_blue"}
+KEY_BITS = {"red": 0x01, "yellow": 0x02, "blue": 0x04}
+KEY_LOCK_BY_ITEM = {v: k for k, v in KEY_TYPES.items()}
+
 # Bounds used when an editor clamps a sector's floor/ceiling pair.
 MIN_SECTOR_HEIGHT = -512
 MAX_SECTOR_HEIGHT = 1024
@@ -405,11 +432,42 @@ class SectorMap:
             ):
                 errs.append(f"linedef {i}: front side has no valid sector")
 
+        # Doors: a door is a two-sided linedef whose lock is carried by the
+        # middle texture. Both faces must name a door texture and agree on the
+        # lock, so the visible twin never disagrees about whether a key opens.
+        for i, ld in enumerate(self.linedefs):
+            if ld.special != SPECIAL_DOORS:
+                continue
+            if ld.back < 0:
+                errs.append(f"linedef {i}: door must connect two sectors")
+                continue
+            if not (0 <= ld.front < n_sides and 0 <= ld.back < n_sides):
+                continue  # bad sidedef index already reported above
+            ft = self.sidedefs[ld.front].mid
+            bt = self.sidedefs[ld.back].mid
+            if ft not in DOOR_LOCK_BY_TEXTURE:
+                errs.append(
+                    f"linedef {i}: door front texture «{ft}» is not a door "
+                    f"texture ({', '.join(DOOR_TEXTURES)})")
+            if bt not in DOOR_LOCK_BY_TEXTURE:
+                errs.append(
+                    f"linedef {i}: door back texture «{bt}» is not a door "
+                    f"texture ({', '.join(DOOR_TEXTURES)})")
+            if (ft in DOOR_LOCK_BY_TEXTURE and bt in DOOR_LOCK_BY_TEXTURE
+                    and DOOR_LOCK_BY_TEXTURE[ft] != DOOR_LOCK_BY_TEXTURE[bt]):
+                errs.append(
+                    f"linedef {i}: door lock differs between sides "
+                    f"(«{ft}» / «{bt}»)")
+
         if not any(t.type == "player1" for t in self.things):
             errs.append("map has no player1 spawn")
+        key_types = set(KEY_TYPES.values())
         for i, t in enumerate(self.things):
             if not (math.isfinite(t.x) and math.isfinite(t.y)):
                 errs.append(f"thing {i}: non-finite coordinates")
+            elif t.type in key_types and n_secs >= 1 \
+                    and self.find_sector_at(t.x, t.y) < 0:
+                errs.append(f"thing {i}: key «{t.type}» is outside every sector")
 
         return errs
 
@@ -437,14 +495,20 @@ class SectorMap:
                           for i in range(len(self.linedefs))]
         return self._blocking
 
-    def line_blocks(self, li: int) -> bool:
+    def line_blocks(self, li: int, extra_blocked: set[int] | None = None) -> bool:
         """True when linedef ``li`` blocks movement, sight, hitscan, shots.
 
         One-sided linedefs always block. A two-sided linedef with the ``solid``
         flag always blocks. Otherwise it is a portal that an actor may cross
         only when the neighbouring floor heights differ by no more than
         ``STEP_HEIGHT`` — symmetric, so the answer never depends on direction.
+
+        ``extra_blocked`` is the set of linedefs that block for a *dynamic*
+        reason only (shut doors): the map data is immutable, so the caller
+        passes the current set instead of mutating flags.
         """
+        if extra_blocked and li in extra_blocked:
+            return True
         ld = self.linedefs[li]
         if ld.back < 0:
             return True
@@ -460,6 +524,49 @@ class SectorMap:
             return True
         return abs(self.sectors[fs].floor_h
                    - self.sectors[bs].floor_h) > STEP_HEIGHT
+
+    # --- doors (data side) -------------------------------------------------
+    def door_linedefs(self) -> list[int]:
+        """Indices of two-sided door linedefs (``special == SPECIAL_DOORS``)."""
+        return [i for i, ld in enumerate(self.linedefs)
+                if ld.special == SPECIAL_DOORS and ld.back >= 0]
+
+    def door_lock(self, li: int) -> str | None:
+        """Lock colour of door ``li`` from its front mid texture, or None.
+
+        ``None`` means either an unkeyed door (``door_D``) or a texture the
+        door vocabulary does not know; validation rejects the latter for a
+        door linedef, so callers only see a real colour or no lock.
+        """
+        ld = self.linedefs[li]
+        n_sides = len(self.sidedefs)
+        if 0 <= ld.front < n_sides:
+            return DOOR_LOCK_BY_TEXTURE.get(self.sidedefs[ld.front].mid)
+        return None
+
+    def door_hit_px(self, x: float, y: float, radius: float,
+                    blocked: set[int] | None = None) -> bool:
+        """True when ``(x, y)`` lies within ``radius`` of a listed linedef.
+
+        Used for projectiles, which test a point (not a circle pass) against
+        closed doors that ``is_wall_px`` cannot see (the point is inside a
+        neighbouring sector, not in void).
+        """
+        if not blocked:
+            return False
+        verts = self.verts
+        r2 = radius * radius
+        for li in blocked:
+            if not (0 <= li < len(self.linedefs)):
+                continue
+            ld = self.linedefs[li]
+            if not (0 <= ld.v1 < len(verts) and 0 <= ld.v2 < len(verts)):
+                continue
+            x1, y1 = verts[ld.v1].x, verts[ld.v1].y
+            x2, y2 = verts[ld.v2].x, verts[ld.v2].y
+            if _dist2_point_seg(x, y, x1, y1, x2, y2) < r2:
+                return True
+        return False
 
     def _ensure_polys(self):
         if self._polys is not None:
@@ -621,8 +728,13 @@ class SectorMap:
         """True if the point is solid (void or outside all sectors)."""
         return self.find_sector_at(x, y) < 0
 
-    def can_move_px(self, x: float, y: float, r: float) -> bool:
-        """True if a circle of radius ``r`` at (x, y) stays in walkable area."""
+    def can_move_px(self, x: float, y: float, r: float,
+                    extra_blocked: set[int] | None = None) -> bool:
+        """True if a circle of radius ``r`` at (x, y) stays in walkable area.
+
+        ``extra_blocked`` lists linedefs that block dynamically (shut doors);
+        they are not in the static index, so they are tested directly.
+        """
         if self.find_sector_at(x, y) < 0:
             return False
         verts = self.verts
@@ -633,6 +745,17 @@ class SectorMap:
             x2, y2 = verts[ld.v2].x, verts[ld.v2].y
             if _dist2_point_seg(x, y, x1, y1, x2, y2) < r2:
                 return False
+        if extra_blocked:
+            for li in extra_blocked:
+                if not (0 <= li < len(self.linedefs)):
+                    continue
+                ld = self.linedefs[li]
+                if not (0 <= ld.v1 < len(verts) and 0 <= ld.v2 < len(verts)):
+                    continue
+                x1, y1 = verts[ld.v1].x, verts[ld.v1].y
+                x2, y2 = verts[ld.v2].x, verts[ld.v2].y
+                if _dist2_point_seg(x, y, x1, y1, x2, y2) < r2:
+                    return False
         return True
 
     def build_reject(self) -> bytes:
@@ -748,8 +871,12 @@ class SectorMap:
                 return True
         return False
 
-    def has_los_px(self, x1: float, y1: float, x2: float, y2: float) -> bool:
-        """True if no one-sided linedef crosses the segment."""
+    def has_los_px(self, x1: float, y1: float, x2: float, y2: float,
+                   extra_blocked: set[int] | None = None) -> bool:
+        """True if no one-sided linedef crosses the segment.
+
+        ``extra_blocked`` adds shut doors to the blocking set.
+        """
         if math.hypot(x2 - x1, y2 - y1) < 1.0:
             return True
         if self._reject is not None:
@@ -781,6 +908,15 @@ class SectorMap:
             bx, by = verts[ld.v2].x, verts[ld.v2].y
             if _segments_cross(x1, y1, x2, y2, ax, ay, bx, by):
                 return False
+        if extra_blocked:
+            for li in extra_blocked:
+                if not (0 <= li < len(self.linedefs)):
+                    continue
+                ld = self.linedefs[li]
+                ax, ay = verts[ld.v1].x, verts[ld.v1].y
+                bx, by = verts[ld.v2].x, verts[ld.v2].y
+                if _segments_cross(x1, y1, x2, y2, ax, ay, bx, by):
+                    return False
         return True
 
     def spawn_px(self) -> list[tuple[float, float]]:

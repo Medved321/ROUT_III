@@ -102,6 +102,39 @@ DARK_CELLAR = """\
 ИГРОК 320 320
 """
 
+# Комната с двумя вложенными комнатами (дырами): внешний контур + один общий
+# контур-дыра (объединение двух внутренних квадратов), затем сами внутренние
+# комнаты. Общая грань двух внутренних комнат двусторонняя, но не граничит с
+# внешней — она должна получить front = меньший индекс.
+NESTED_HOLE = """\
+КОМНАТА Внешняя
+угол 0 0
+угол 0 400
+угол 400 400
+угол 400 0
+контур
+угол 100 100
+угол 100 300
+угол 200 300
+угол 300 300
+угол 300 100
+угол 200 100
+
+КОМНАТА Левая
+угол 100 100
+угол 100 300
+угол 200 300
+угол 200 100
+
+КОМНАТА Правая
+угол 200 100
+угол 200 300
+угол 300 300
+угол 300 100
+
+ИГРОК 200 50
+"""
+
 
 # ── сигнатура модели, не зависящая от направления линий ─────────────────────
 
@@ -324,6 +357,107 @@ def test_triangle_needs_explicit_close() -> None:
     assert sm.validate() == [], sm.validate()
     assert len(sm.sectors) == 1
     assert len(sm.linedefs) == 3, len(sm.linedefs)
+
+
+def _two_sided_profile(sm: SectorMap) -> list:
+    """Двусторонние линии как (пара высот секторов, solid) — индексы не важны."""
+    def sec(si: int) -> tuple:
+        s = sm.sectors[si]
+        return (round(s.floor_h, 2), round(s.ceil_h, 2))
+    return sorted(
+        (frozenset((sec(sm.sidedefs[ld.front].sector),
+                    sec(sm.sidedefs[ld.back].sector))),
+         bool(getattr(ld, "solid", False)))
+        for ld in sm.linedefs if ld.back >= 0)
+
+
+def test_room_with_hole() -> None:
+    """Spec: вложенный `контур` = дыра сектора, её грани двусторонние."""
+    sm = text_map.parse(NESTED_HOLE)
+    assert sm.validate() == [], sm.validate()
+    assert len(sm.sectors) == 3, len(sm.sectors)
+    assert len(text_map._sector_loops(sm, 0)) == 2, "внешняя имеет дыру"
+    assert len(text_map._sector_loops(sm, 1)) == 1, "левая — одна петля"
+    assert len(text_map._sector_loops(sm, 2)) == 1, "правая — одна петля"
+    assert sm.find_sector_at(200, 50) == 0, "точка спавна — во внешней"
+    assert sm.find_sector_at(150, 200) == 1, "левая комната"
+    assert sm.find_sector_at(250, 200) == 2, "правая комната"
+
+    shared = [ld for ld in sm.linedefs if ld.back >= 0]
+    assert len(shared) == 7, len(shared)
+    # грани внешнего сектора с дырой: front = внешняя (индекс 0)
+    outer_edges = [ld for ld in shared
+                   if 0 in (sm.sidedefs[ld.front].sector,
+                            sm.sidedefs[ld.back].sector)]
+    assert outer_edges, "есть грани внешней комнаты с внутренними"
+    for ld in outer_edges:
+        assert sm.sidedefs[ld.front].sector == 0, "front = внешняя комната"
+        assert sm.sidedefs[ld.front].sector < sm.sidedefs[ld.back].sector
+    # общая грань двух внутренних комнат: front = меньший индекс
+    inner = [ld for ld in shared if sm.sidedefs[ld.front].sector == 1][0]
+    assert sm.sidedefs[inner.back].sector == 2
+
+    # двусторонность переживает render → parse
+    again = text_map.parse(text_map.render(sm))
+    assert again.validate() == [], again.validate()
+    assert _two_sided_profile(again) == _two_sided_profile(sm)
+    assert signature(again) == signature(sm)
+    assert text_map.render(again) == text_map.render(sm), "текст канонический"
+
+
+def test_hole_triangle_and_single_loop() -> None:
+    """Треугольник-дыра разбирается; сектор из одной петли не даёт `контур`."""
+    single = text_map.parse(SIMPLE_ROOM)
+    assert "контур" not in text_map.render(single), \
+        "одноконтурный сектор не печатает строк `контур`"
+
+    tri_hole = """\
+КОМНАТА Внешняя
+угол 0 0
+угол 0 400
+угол 400 400
+угол 400 0
+контур
+угол 100 100
+угол 200 300
+угол 300 100
+угол 100 100
+
+КОМНАТА Внутренняя
+угол 100 100
+угол 200 300
+угол 300 100
+угол 100 100
+
+ИГРОК 200 50
+"""
+    # как и «КОМНАТА», треугольный контур требует явного замыкания
+    open_hole = tri_hole.replace("угол 300 100\nугол 100 100\n\nКОМНАТА Внутренняя",
+                                 "угол 300 100\n\nКОМНАТА Внутренняя")
+    err = _error(open_hole)
+    assert "не замкнут" in err, err
+
+    sm = text_map.parse(tri_hole)
+    assert sm.validate() == [], sm.validate()
+    assert len(sm.sectors) == 2, len(sm.sectors)
+    assert len(text_map._sector_loops(sm, 0)) == 2, "внешняя: контур + дыра"
+    assert len(text_map._sector_loops(sm, 1)) == 1, "внутренний треугольник"
+    assert len([ld for ld in sm.linedefs if ld.back >= 0]) == 3, "3 общей грани"
+    again = text_map.parse(text_map.render(sm))
+    assert _two_sided_profile(again) == _two_sided_profile(sm)
+
+
+def test_real_maps_keep_two_sided() -> None:
+    """Реальные карты: дыры и двусторонность переживают render → parse."""
+    for name, expected in (("sector1", 7), ("sector2", 6)):
+        path = ROOT / "maps" / (name + ".mt1")
+        if not path.exists():
+            continue
+        sm = SectorMap.load(str(path))
+        assert sum(1 for ld in sm.linedefs if ld.back >= 0) == expected, name
+        again = text_map.parse(text_map.render(sm))
+        assert again.validate() == [], (name, again.validate())
+        assert _two_sided_profile(again) == _two_sided_profile(sm), name
 
 
 # ── 1.3: render → parse round-trip ─────────────────────────────────────────
@@ -637,6 +771,9 @@ def main() -> int:
             test_solid_shared_wall,
             test_solid_round_trip,
             test_triangle_needs_explicit_close,
+            test_room_with_hole,
+            test_hole_triangle_and_single_loop,
+            test_real_maps_keep_two_sided,
             test_round_trip,
             test_canonical_text_is_stable,
             test_render_covers_sectors_with_rooms,

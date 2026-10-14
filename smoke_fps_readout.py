@@ -5,7 +5,7 @@ import sys
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
-ROOT = r"C:\Users\misha\PycharmProjects\ROUT III"
+ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
 import pygame

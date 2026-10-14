@@ -11,6 +11,8 @@ import random
 import sys
 import time
 
+sys.stdout.reconfigure(encoding="utf-8")  # labels contain arrows
+
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 os.environ["SDL_AUDIODRIVER"] = "dummy"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -160,6 +162,11 @@ def _check_selection_survives_nothing(scr, surface) -> None:
     # selected index, whereas deleting a lower one just renumbers the target.
     ed = scr.editor
     assert ed.things, "the fixture map must have things to delete"
+    # The map fixtures hold a single player1, so deleting the last thing would
+    # remove the only spawn and invalidate the map for the "play" check below.
+    # Append a throwaway so the last thing is disposable -- the array-shrink
+    # path under test is the same, the spawn stays put.
+    ed.add_thing(0.0, 0.0, "imp")
     last_thing = len(ed.things) - 1
     scr._set_sel(line=0, thing=last_thing, sector=0)
     ed.delete_thing(last_thing)
@@ -269,26 +276,34 @@ def _check_map_list(scr, surface) -> None:
 
     renderer = Renderer((1000, 700))
     mapper = _Mapper(renderer)
-    for size in ((640, 480), (1000, 700), (1600, 900), (3840, 2160)):
-        renderer.set_window_size(size)
-        dst = renderer.canvas_rect()
-        for key, want in (("play", "play"), ("back", "back"), ("save", None)):
-            rect = scr.buttons[key]
-            win = (dst.x + int(rect.centerx * dst.w / SCREEN_WIDTH),
-                   dst.y + int(rect.centery * dst.h / SCREEN_HEIGHT))
-            before = (scr.map_name, scr.editor)
-            got = scr.handle(mapper._menu_events(
-                [_evt(pygame.MOUSEBUTTONDOWN, pos=win, button=1)]))
-            assert got == want, f"{key} at {size} gave {got!r}, want {want!r}"
-            # A toolbar click must never leak into the canvas it sits above.
-            if want is None:
-                assert scr.map_name == before[0] and scr.editor is before[1]
-        # The bottom toolbar sits on the canvas row below it; a click in a black
-        # bar must not reach any of it.
-        if dst.x or dst.y:
-            assert mapper._menu_events(
-                [_evt(pygame.MOUSEBUTTONDOWN, pos=(0, 0), button=1)]) == []
-    renderer.set_window_size((1000, 700))
+    # "play" saves the current map to maps/<map_name>.mt1 when it is valid. The
+    # hit-box check only reads the returned action, so the write is stubbed out:
+    # otherwise every run would overwrite the shared fixture map on disk.
+    real_save = scr._save
+    scr._save = lambda: None
+    try:
+        for size in ((640, 480), (1000, 700), (1600, 900), (3840, 2160)):
+            renderer.set_window_size(size)
+            dst = renderer.canvas_rect()
+            for key, want in (("play", "play"), ("back", "back"), ("save", None)):
+                rect = scr.buttons[key]
+                win = (dst.x + int(rect.centerx * dst.w / SCREEN_WIDTH),
+                       dst.y + int(rect.centery * dst.h / SCREEN_HEIGHT))
+                before = (scr.map_name, scr.editor)
+                got = scr.handle(mapper._menu_events(
+                    [_evt(pygame.MOUSEBUTTONDOWN, pos=win, button=1)]))
+                assert got == want, f"{key} at {size} gave {got!r}, want {want!r}"
+                # A toolbar click must never leak into the canvas it sits above.
+                if want is None:
+                    assert scr.map_name == before[0] and scr.editor is before[1]
+            # The bottom toolbar sits on the canvas row below it; a click in a
+            # black bar must not reach any of it.
+            if dst.x or dst.y:
+                assert mapper._menu_events(
+                    [_evt(pygame.MOUSEBUTTONDOWN, pos=(0, 0), button=1)]) == []
+    finally:
+        scr._save = real_save
+        renderer.set_window_size((1000, 700))
     print("  toolbar hit through the window→canvas mapping OK")
 
 

@@ -11,11 +11,13 @@ import random
 from typing import NamedTuple
 
 from shared.combat import wpn_cooldown_ticks
-from shared.components import Position, Rotation, Health, Player, WeaponComponent
+from shared.components import (Position, Rotation, Health, Player,
+                             WeaponComponent, Powerup)
 from server.game_data import (
     WPN, MELEE_RANGE, PLAYER_MELEE_DMG, MELEE_ANGLE_THRESHOLD,
     PLAYER_RADIUS, ENEMY_RADIUS,
     PLAYER_PROJ_SPEED, PLAYER_PROJ_MAX_DIST, MAX_PLAYER_PROJ,
+    BERSERK_DMG_MULT,
 )
 
 MAX_HP = 200
@@ -65,7 +67,7 @@ def _ray_wall_dist(world, x: float, y: float, angle: float, dist: float) -> floa
         travelled += step
         nx = x + math.cos(angle) * travelled
         ny = y + math.sin(angle) * travelled
-        if world.game_map.is_wall_px(nx, ny):
+        if world.is_wall_px(nx, ny):
             return travelled
     return dist
 
@@ -116,16 +118,7 @@ def _damage_enemy(world, en, dmg: int, shooter_name: str = '') -> None:
 
 
 def _damage_player(world, target_eid: int, dmg: int) -> None:
-    hp = world.entities.get_component(target_eid, Health)
-    if hp is None or hp.value <= 0:
-        return
-    hp.value = max(0, hp.value - dmg)
-    if hp.value <= 0:
-        from server.game_data import TICK_RATE
-        pl = world.entities.get_component(target_eid, Player)
-        if pl:
-            pl.state = 1
-            world._respawn[target_eid] = TICK_RATE * 3
+    world.damage_player(target_eid, dmg)
 
 
 def _hitscan_players(world, shooter_eid: int, x: float, y: float,
@@ -174,11 +167,18 @@ def handle_shoot(world, entity_id: int) -> FireResult:
         return FireResult(False, 'cooldown', wp.fire_cooldown)
     wdef = WPN[wp.current]
 
+    # BERSERK is read once, here, and both of its effects hang off it: it doubles
+    # damage and makes shots free. Reading it at each of the two places it
+    # applies would be two chances to apply one of them and forget the other.
+    pu = world.entities.get_component(entity_id, Powerup)
+    berserk = pu is not None and pu.kind == 'BERSERK'
+    dmg_mult = BERSERK_DMG_MULT if berserk else 1
+
     # melee weapon (chainsaw)
     if wdef.get('melee'):
         wp.fire_cooldown = wpn_cooldown_ticks(wdef['f'])
         pl.state = 2
-        _fire_melee(world, entity_id, pos, rot)
+        _fire_melee(world, entity_id, pos, rot, dmg_mult)
         return FireResult(True, '', wp.fire_cooldown)
 
     # ammo
@@ -192,7 +192,11 @@ def handle_shoot(world, entity_id: int) -> FireResult:
             # cannot spam dry-fire intents at the input rate.
             wp.fire_cooldown = wpn_cooldown_ticks(wdef['f'])
             return FireResult(False, 'no_ammo', wp.fire_cooldown)
-        wp.ammo[ammo_key] = cur - cost
+        # BERSERK skips only the deduction, never the check above: an empty
+        # magazine has to keep refusing, or a berserk player would dry-fire
+        # forever with no cost to stop it.
+        if not berserk:
+            wp.ammo[ammo_key] = cur - cost
 
     wp.fire_cooldown = wpn_cooldown_ticks(wdef['f'])
     pl.state = 2
@@ -202,7 +206,7 @@ def handle_shoot(world, entity_id: int) -> FireResult:
 
     pellets = wdef.get('pellets', 1)
     cone = wdef.get('cone', 0.0)
-    dmg = wdef['d']
+    dmg = wdef['d'] * dmg_mult
     rng = wdef['r'] if wdef['r'] else 100000
 
     # Projectile weapon: spawn a server-side player ball (plasma for RIFLE).
@@ -261,7 +265,8 @@ def handle_shoot(world, entity_id: int) -> FireResult:
     return FireResult(True, '', wp.fire_cooldown)
 
 
-def _fire_melee(world, entity_id: int, pos: Position, rot: Rotation) -> None:
+def _fire_melee(world, entity_id: int, pos: Position, rot: Rotation,
+                dmg_mult: int = 1) -> None:
     x, y = pos.x, pos.y
     best = None
     best_d = MELEE_RANGE
@@ -275,4 +280,4 @@ def _fire_melee(world, entity_id: int, pos: Position, rot: Rotation) -> None:
                 best = e
                 best_d = d
     if best is not None:
-        _damage_enemy(world, best, PLAYER_MELEE_DMG)
+        _damage_enemy(world, best, PLAYER_MELEE_DMG * dmg_mult)

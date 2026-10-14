@@ -5,7 +5,9 @@ try:
 except Exception:
     np = None
     _HAVE_NP = False
-from engine.constants import SCALE, TILE, FOV, TEX_W, WPN, ENEMY_DB, EYE_H, CAM_Z, ENEMY_GAME_HEIGHTS, FALLBACK_SPRITE_MAX
+from engine.constants import (SCALE, TILE, FOV, TEX_W, WPN, ENEMY_DB, EYE_H,
+                               CAM_Z, ENEMY_GAME_HEIGHTS, FALLBACK_SPRITE_MAX,
+                               ITEM_GAME_HEIGHTS, ITEM_FLOAT_HEIGHT)
 from engine import constants as const
 from engine import game_state as gs
 from engine.framebuffer import depth_col
@@ -808,29 +810,45 @@ def _render_sector_scene_legacy():
 # overlay always pays for the whole screen even though the field covers a few
 # percent of it -- the ink has to be blitted as small rects instead.
 #
-# A ray is therefore a triangle: its apex points at the aim point and it widens
-# towards the border, with a soft triangular alpha profile along its length and
-# feathered sides. Alpha reaches exactly zero at both ends, so a ray can be born
-# out of the aim point and leave the screen without a seam or a hard cut. The
-# profile is baked once into two tiny templates (one per axis) and scaled per
-# ray, so a whole field costs a fraction of a millisecond and is rebuilt only
-# when the viewport or the quality-derived count changes.
+# A wedge is therefore a triangle: its apex points at the aim point and it widens
+# towards the border. Alpha climbs to full over the first third of the length and
+# fades back out over the last quarter, so both ends reach exactly zero and a wedge
+# can be born out of the aim point and leave the screen without a seam or a hard
+# cut. The sides are feathered, because an unfeathered triangle at 4K is a stair
+# step. The profile is baked once into a single small template, scaled per wedge
+# and turned to its angle, so a whole field costs a fraction of a millisecond and
+# is rebuilt only when the viewport or the quality-derived count changes.
 #
-# Rays sweep outward along their own side and wrap: their inner end walks from
-# the dead zone past the border, where the transparent apex makes the reset
-# invisible. Travel is a share of the distance to the border rather than a fixed
-# number of pixels, so a dash reads the same on a 640x480 window and at 4K, and
-# the pattern streams instead of flashing on the spot.
+# The field is a full circle, not four bars on the screen axes: wedges are laid
+# out in three rings around the aim point, and each one is clamped to the border
+# of the view band ALONG ITS OWN DIRECTION, so the aperture is radially symmetric
+# on any window shape. Four axis-aligned wedges read as a "+" pasted onto the
+# edges of the view and as nothing at all in the corners; on a 16:9 window the
+# vertical bars could not even get as long as the horizontal ones.
 #
-# The rays stay axis aligned. A slanted ray would need its rotated bounding box
-# blitted: at 45 degrees that is roughly fifty times the area of the line itself,
-# which at 4K is more than the renderer's whole frame budget.
-_RAY_TPL_W = 64
-_RAY_TPL_H = 16
-_RAY_PEAK = 0.68       # where along a ray the alpha tops out
-_RAY_EDGE = 0.30       # feather of the wedge sides, as a share of half its width
-_ray_tpl_h = None
-_ray_tpl_v = None
+# Wedges are SHORT, and that is a budget decision as much as a look one. A turned
+# sprite is blitted as its axis-aligned bounding box, and for a long thin triangle
+# that box is a couple of dozen times the ink inside it: measured here, a 4K field
+# of full-radius wedges covered 87 % of the frame in boxes while painting 3.6 % of
+# it, and cost 13 ms a frame -- SDL blends every pixel of the rectangle, empty
+# ones included. Sizing the length in layout units and keeping it a small multiple
+# of the width keeps the box a few times the ink instead of two dozen, which is
+# also what a speed line looks like in every other game: a streak, not a spear.
+#
+# Wedges sweep outward along their own ray and wrap: the apex walks from the dead
+# zone past the border, where the transparent apex makes the reset invisible.
+# Travel is a share of the distance to the border rather than a fixed number of
+# pixels, so a dash reads the same on a 640x480 window and at 4K, and the pattern
+# streams instead of flashing on the spot.
+_RAY_TPL_W = 128
+_RAY_TPL_H = 24
+_RAY_RISE = 0.30        # share of the length over which a wedge reaches full alpha
+_RAY_FALL = 0.26        # share of the length over which it fades back out to zero
+_RAY_EDGE = 0.22        # feather of the wedge sides, as a share of half its width
+_RAY_RINGS = 3
+_RAY_RING_OFF = (0.0, 0.17, 0.31)   # inner radius of each ring, as a share of the border
+_ray_tpl = None
+_ray_rng = random.Random(0xD45A5)
 
 
 def _ramp(u):
@@ -839,126 +857,182 @@ def _ramp(u):
     return u * u * (3.0 - 2.0 * u)
 
 
-def _soft_triangle(t, peak):
-    """Smooth 0 -> 1 -> 0 ramp, maximum at ``peak``, zero at both ends.
+def _ray_alpha(t):
+    """0 -> full -> 0 along a wedge's length, maximum across the middle stretch.
 
-    The zeros at the endpoints are the point: they are what lets a ray appear
+    The zeros at the endpoints are the point: they are what lets a wedge appear
     out of nothing and run off the border without a visible cut. It is also why
     this must not be reused for a feather -- a saturating ramp there would put a
-    hole down the middle of every ray.
+    hole down the middle of every wedge.
     """
     if t <= 0.0 or t >= 1.0:
         return 0.0
-    u = t / peak if t <= peak else (1.0 - t) / (1.0 - peak)
-    return _ramp(u)
+    up = t / _RAY_RISE if t < _RAY_RISE else 1.0
+    left = (1.0 - t) / _RAY_FALL if t > 1.0 - _RAY_FALL else 1.0
+    return _ramp(up) * _ramp(left)
 
 
-def _ray_templates():
-    """Build the wedge template for both axes (64x16 and 16x64).
-
-    Width along the ray grows linearly from a narrow apex to the full base, so
-    the result is a triangle rather than a bar, and both the apex and the base
-    reach zero alpha.
-    """
-    global _ray_tpl_h, _ray_tpl_v
-    if _ray_tpl_h is not None:
-        return _ray_tpl_h, _ray_tpl_v
-    r, g, b = const.DASH_FX_COLOR[:3]
-    hz = pygame.Surface((_RAY_TPL_W, _RAY_TPL_H), pygame.SRCALPHA)
-    vt = pygame.Surface((_RAY_TPL_H, _RAY_TPL_W), pygame.SRCALPHA)
+def _ray_template():
+    """The one baked wedge every field sprite is scaled and turned from."""
+    global _ray_tpl
+    if _ray_tpl is not None:
+        return _ray_tpl
+    r, g, b = const.DASH_FX_STREAK_RGB[:3]
+    tpl = pygame.Surface((_RAY_TPL_W, _RAY_TPL_H), pygame.SRCALPHA)
     half_max = _RAY_TPL_H * 0.5 - 1.0
     for x in range(_RAY_TPL_W):
         t = (x + 0.5) / _RAY_TPL_W
-        prof = _soft_triangle(t, _RAY_PEAK)
-        half = 0.08 + 0.92 * t            # wedge: apex -> full base
+        prof = _ray_alpha(t)
+        half = 0.10 + 0.90 * t            # wedge: apex -> full base
         for y in range(_RAY_TPL_H):
             d = abs(y - half_max) / half_max
             if d >= half:
                 a = 0.0
             else:
                 a = prof * _ramp((half - d) / _RAY_EDGE)
-            px = (r, g, b, int(255.0 * a))
-            hz.set_at((x, y), px)
-            vt.set_at((y, x), px)
-    _ray_tpl_h, _ray_tpl_v = hz, vt
-    return hz, vt
+            tpl.set_at((x, y), (r, g, b, int(255.0 * a)))
+    _ray_tpl = tpl
+    return tpl
 
 
-_ray_rng = random.Random(0xD45A5)
+def _ray_sprite(tpl, length, width, ang):
+    """Scale the wedge template to ``length`` x ``width`` and point it along ``ang``.
+
+    pygame.rotate spins a surface about its centre, so where the apex lands is
+    not something to re-derive here from its matrix -- and getting it wrong
+    would fling every wedge sideways, which is exactly the bug the axis-aligned
+    version could not have had. One opaque pixel goes through the very same call
+    and is read back with getbbox(); both are C-level, and this only runs when
+    the viewport or the count changes.
+    """
+    deg = -math.degrees(ang)             # screen y points down, so a positive
+    spr = pygame.transform.smoothscale(tpl, (length, width))   # angle is CW on screen
+    mark = pygame.Surface((length, width), pygame.SRCALPHA)
+    mark.set_at((0, width >> 1), (255, 255, 255, 255))
+    # get_bounding_rect, not Surface.get_bbox: on a Surface the name belongs to
+    # the old pygame 1.x API that pygame 2 no longer has.
+    bb = pygame.transform.rotate(mark, deg).get_bounding_rect()
+    if bb.width < 1 or bb.height < 1:    # pragma: no cover - the marker is opaque
+        return spr, 0, width >> 1
+    rot = pygame.transform.rotate(spr, deg)
+    # The rotated rectangle is a superset of the triangle's own footprint; the
+    # empty corners would be blended every frame, so the ink is cropped to it.
+    rbb = rot.get_bounding_rect()
+    if rbb.width < 1 or rbb.height < 1:  # pragma: no cover - the template has ink
+        rbb = pygame.Rect(0, 0, *rot.get_size())
+    return rot.subsurface(rbb).copy(), bb.x - rbb.x, bb.y - rbb.y
 
 
 def _ray_table():
-    """``(arm, side, offset, peak alpha, phase)`` for every ray.
+    """``(angle, ring, len_mult, wid_mult, peak, phase, speed)`` for every wedge.
 
-    Rings are listed side by side and arms inside a ring, so *every* prefix of
-    the table is a symmetric aperture: the quality knob can drop the outer rings
-    and what is left still points at the aim point from all four sides instead of
-    degenerating into streaks on one edge only.
+    Rings are listed one after another -- all of ring 0 first -- so that ANY
+    prefix of the table is a complete circle: the quality knob drops the outer
+    rings and what is left still points at the aim point from every direction
+    instead of degenerating into a fan over the eight angles that happened to be
+    interleaved first.
     """
+    per_ring = const.DASH_FX_STREAK_RING
+    spread = 2.0 * math.pi / per_ring
     out = []
-    for side, ring in ((-1, 0.15), (1, 0.15), (-1, 0.30), (1, 0.30)):
-        for arm in ('L', 'R', 'T', 'B'):
-            out.append((arm, side,
-                        ring * _ray_rng.uniform(0.92, 1.08),
-                        _ray_rng.randint(90, 155),
-                        _ray_rng.random()))
+    for ring_i in range(_RAY_RINGS):
+        ring = _RAY_RING_OFF[ring_i]
+        for k in range(per_ring):
+            out.append((
+                (k + _ray_rng.uniform(-0.30, 0.30)) * spread,
+                ring,
+                _ray_rng.uniform(0.62, 1.45),
+                _ray_rng.uniform(0.60, 1.30),
+                _ray_rng.randint(105, 195),
+                _ray_rng.random(),
+                _ray_rng.uniform(0.75, 1.30),
+            ))
     return tuple(out)
 
 
 _DASH_RAYS = _ray_table()
+
+
+class _Ray:
+    """One baked white wedge plus everything its per-frame blit needs."""
+
+    __slots__ = ('spr', 'ax', 'ay', 'ux', 'uy', 'peak', 'travel', 'spd',
+                 'phase', 'r0', 'd')
+
+
 _ray_field = None
 _ray_key = None
-_ray_tip = []
-_ray_tip0 = []
 _ray_env = 0.0
 
 
 def _build_ray_field(w, rh, n):
-    """Bake the wedge sprites for a ``w`` x ``rh`` view band holding ``n`` of them."""
-    global _ray_tip, _ray_tip0
-    tips = []
+    """Bake ``n`` white wedges radiating from the aim point of a ``w`` x ``rh`` view band.
+
+    Takes the first ``n`` wedges that FIT rather than the first ``n`` of the table:
+    on a short viewport the outer rings have no room to travel, and dropping a
+    wedge the quality knob asked for would make the field thinner exactly where
+    it has least to show.
+    """
+    rays = []
     if w <= 0 or rh <= 0:
-        _ray_tip = tips
-        _ray_tip0 = tips
-        return []
-    tpl_h, tpl_v = _ray_templates()
-    cx, cy = w * 0.5, rh * 0.5
+        return rays
+    tpl = _ray_template()
     dead = min(w, rh) * const.DASH_FX_STREAK_DEADZONE
-    # Thickness is a layout unit too: at 4K a literal 2px ray is invisible.
-    th = max(1, ui_px(const.DASH_FX_STREAK_WIDTH))
-    out = []
-    for arm, side, offf, peak, phase in _DASH_RAYS[:n]:
-        horiz = arm == 'L' or arm == 'R'
-        span = cx if horiz else cy
-        reach = span - dead
-        if reach <= 2.0:
+    for ang, ring, lmul, wmul, peak, phase, spd in _DASH_RAYS:
+        if len(rays) >= n:
+            break
+        ux = math.cos(ang)
+        uy = math.sin(ang)
+        # Thickness is a layout unit too: at 4K a literal 2px wedge is invisible.
+        width = ui_px(const.DASH_FX_STREAK_WIDTH * wmul) or 1
+        # How far the wedge may reach along its own direction before its WIDE END
+        # leaves the view band. The band is a rectangle and the wedge is not, so
+        # its half width eats into the room at an angle: reaching the border and
+        # then adding the width would put ink on the HUD bands above and below,
+        # and a 45-degree wedge overshoots further than one aimed at the short
+        # side. Solving for the reach directly is what keeps the field inside the
+        # band for every angle without a per-wedge fudge.
+        hw = width * 0.5
+        ex, ey = abs(ux), abs(uy)
+        bx = ((w * 0.5) - hw * ey) / ex if ex > 1e-6 else 1e9
+        by = ((rh * 0.5) - hw * ex) / ey if ey > 1e-6 else 1e9
+        border = bx if bx < by else by
+        if border <= dead:
             continue
-        length = max(6, int(reach * 0.5))
-        # The apex may only walk as far as the border minus the ray itself:
-        # letting it past that would put the far end over the HUD band, which is
-        # drawn on top of the view and must stay clean.
-        travel = reach - length
-        if travel <= 2.0:
+        r0 = dead + border * ring
+        room = border - r0
+        # Length is a layout unit, scaled off the border only so that a small
+        # window still gets streaks proportional to its size instead of a fixed
+        # count of full-length spears, and trimmed to what this direction leaves:
+        # a wide, short band gives a wedge aimed up or down a fraction of the room
+        # one aimed sideways has, and dropping those instead would leave a bare gap
+        # in the vertical -- thinning the field on the shapes that can least afford it.
+        length = min(ui_px(const.DASH_FX_STREAK_LEN * lmul) + 4,
+                     max(6, int(border * 0.45)))
+        length = min(length, int(room) - 2)
+        travel = room - length
+        if travel <= 2.0 or length < 6:
             continue
-        spr = pygame.transform.smoothscale(
-            tpl_h if horiz else tpl_v,
-            (length, th) if horiz else (th, length))
-        off = side * int((rh if horiz else w) * offf)
-        out.append((spr, arm, off, peak, dead, travel, length))
-        tips.append(dead + travel * phase)
-    _ray_tip = tips
-    _ray_tip0 = list(tips)
-    return out
+        spr, ax, ay = _ray_sprite(tpl, length, width, ang)
+        r = _Ray()
+        r.spr, r.ax, r.ay = spr, ax, ay
+        r.ux, r.uy = ux, uy
+        r.peak, r.travel, r.spd = peak, travel, spd
+        r.phase = phase
+        r.r0 = r0
+        r.d = r0 + travel * phase
+        rays.append(r)
+    return rays
 
 
 def draw_dash_streaks(rh=None, ry=None):
-    """Radial speed rays for the local player's own dash.
+    """Radial speed wedges for the local player's own dash.
 
-    Decays ``gs.dash_fx`` and, while it is positive, sweeps the ray sprites
+    Decays ``gs.dash_fx`` and, while it is positive, sweeps the wedge sprites
     outward from the aim point over the world. Costs nothing at rest: the first
     check is a float compare, and nothing is baked before the first dash.
     """
-    global _ray_field, _ray_key, _ray_tip, _ray_env
+    global _ray_field, _ray_key, _ray_env
     fx = gs.dash_fx
     if fx <= 0.0:
         return
@@ -972,50 +1046,37 @@ def draw_dash_streaks(rh=None, ry=None):
         ry = _RY
     w = const.W
     # The cue is the only screen-space signal of a dash, so the quality knob
-    # scales the count down but never to zero.
+    # scales the count down but never below one whole ring.
     n = int(const.DASH_FX_STREAKS * gs.effects_factor)
     n = max(const.DASH_FX_STREAKS_MIN, min(const.DASH_FX_STREAKS, n))
     if _ray_field is None or _ray_key != (w, rh, n):
         _ray_field = _build_ray_field(w, rh, n)
         _ray_key = (w, rh, n)
     if fx > _ray_env:
-        # Rising edge: a fresh dash re-seeds the sweep, so the rays start spread
-        # over their travel again instead of continuing wherever the last one
-        # left them. A wrap mid-dash stays invisible either way (transparent apex).
-        _ray_tip = list(_ray_tip0)
+        # Rising edge: a fresh dash re-seeds the sweep, so the wedges start spread
+        # over their travel again instead of continuing wherever the last one left
+        # them. A wrap mid-dash stays invisible either way (both ends are clear).
+        for r in _ray_field:
+            r.d = r.r0 + r.travel * r.phase
     _ray_env = fx
     # Travel follows the envelope -- fastest while the dash bites, down to a
     # crawl as it fades -- so one dash is roughly one sweep to the border.
     step = const.DASH_FX_STREAK_FLOW * fx
-    tips = _ray_tip
     cx, cy = w * 0.5, rh * 0.5
     screen = gs.screen
-    for i in range(len(_ray_field)):
-        spr, arm, off, peak, dead, travel, length = _ray_field[i]
-        d = tips[i] + travel * step
-        if d >= dead + travel:
-            # The apex has walked its whole range: the ray sits at the border and
-            # re-seeds at the dead zone, which is invisible because both of its
-            # ends reach zero alpha.
-            d -= travel
-        tips[i] = d
-        a = int(peak * fx)
+    for r in _ray_field:
+        d = r.d + r.travel * step * r.spd
+        if d >= r.r0 + r.travel:
+            # The apex has walked its whole range: the wedge sits at the border and
+            # re-seeds at the dead zone, which is invisible because both of its ends
+            # reach zero alpha.
+            d -= r.travel
+        r.d = d
+        a = int(r.peak * fx)
         if a <= 2:
             continue
-        spr.set_alpha(a)
-        if arm == 'L':
-            x = int(cx - d) - spr.get_width()
-            y = int(cy + off) - (spr.get_height() >> 1)
-        elif arm == 'R':
-            x = int(cx + d)
-            y = int(cy + off) - (spr.get_height() >> 1)
-        elif arm == 'T':
-            x = int(cx + off) - (spr.get_width() >> 1)
-            y = int(cy - d) - spr.get_height()
-        else:
-            x = int(cx + off) - (spr.get_width() >> 1)
-            y = int(cy + d)
-        screen.blit(spr, (x, ry + y))
+        r.spr.set_alpha(a)
+        screen.blit(r.spr, (int(cx + r.ux * d) - r.ax, ry + int(cy + r.uy * d) - r.ay))
 
 
 def render(vh=None, vy=None):
@@ -1272,6 +1333,16 @@ def render(vh=None, vy=None):
                     world_h = ENEMY_GAME_HEIGHTS.get(s_obj['t'], 50)
                 elif s_obj.get('type') == 'barrel':
                     world_h = 48
+                elif 't' in s_obj and 'id' in s_obj:
+                    # Pickup. Enemies and corpses also carry a 't', but they
+                    # are matched by 'hp' / 'time' above, so a 't' that
+                    # reaches this branch is a pickup -- told apart by the id
+                    # the snapshot carries, which is also what lets the client
+                    # reconcile a respawn instead of drawing a second copy.
+                    # The height is per type: a flat 64 here drew a medkit as
+                    # tall as a BFG pickup and made the floor look littered
+                    # with billboards.
+                    world_h = ITEM_GAME_HEIGHTS.get(s_obj['t'], 48)
                 else:
                     world_h = 64
                 proj = sector_render.project_object(
@@ -1288,6 +1359,15 @@ def render(vh=None, vy=None):
                 spr_flr = _RY + _RH // 2 + int(CAM_Z * sh / TILE) - sh // 4
                 sh = min(sh, _RH * 2)
                 occ = dst
+            # Pickups hover instead of lying on the floor line. The offset is
+            # a ratio of the height the projection just gave us, not a second
+            # projection of ITEM_FLOAT_HEIGHT: recomputing FOCAL / perp here
+            # would be the copy of that arithmetic that put particles under
+            # the floor once already. In sector mode sh is the item's own
+            # height; the legacy tile path has no per-type item heights (tile
+            # maps carry no things), so there the ratio is against a tile.
+            if 't' in s_obj and 'id' in s_obj:
+                spr_flr -= int(sh * ITEM_FLOAT_HEIGHT)
             idx = depth_col(z_b, sx, const.W)
             if idx >= 0 and z_b[idx] > occ:
                 if s_obj.get('type') == 'barrel':
@@ -2146,3 +2226,11 @@ def render(vh=None, vy=None):
         pygame.draw.line(gs.screen, ch_col, (ch_x + ch_gap, ch_y), (ch_x + ch_arm, ch_y), ch_w)
         pygame.draw.line(gs.screen, ch_col, (ch_x, ch_y - ch_arm), (ch_x, ch_y - ch_gap), ch_w)
         pygame.draw.line(gs.screen, ch_col, (ch_x, ch_y + ch_gap), (ch_x, ch_y + ch_arm), ch_w)
+
+    # Advisory "you need a key" banner: the client arms it only for a short
+    # spell after a "use" press (the server keeps the last refusal in the
+    # snapshot), so the engine just paints the flag it is handed.
+    if gs.p.get('use_hint'):
+        lbl = gs.sm_font.render("НУЖЕН КЛЮЧ", True, (255, 220, 60))
+        gs.screen.blit(lbl, (const.W // 2 - lbl.get_width() // 2,
+                             const.H // 2 + ui_px(40)))

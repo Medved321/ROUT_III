@@ -20,6 +20,7 @@ import os
 import sys
 import tempfile
 
+sys.stdout.reconfigure(encoding="utf-8")  # labels contain Ш×В
 os.environ.setdefault('SDL_VIDEODRIVER', 'dummy')
 import pygame
 

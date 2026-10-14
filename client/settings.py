@@ -131,8 +131,9 @@ def control_hints(mode) -> str:
     """Control layout shown in the lobby and in the party-start log."""
     if is_tractor(mode):
         return ("WASD — движение | ←/→ — обзор | Пробел — огонь | "
-                "Левый Shift — дэш")
-    return "WASD — движение | Мышь — обзор | ЛКМ — огонь | Пробел — дэш"
+                "Левый Shift — дэш | E — использовать")
+    return ("WASD — движение | Мышь — обзор | ЛКМ — огонь | Пробел — дэш | "
+            "E — использовать")
 
 
 def is_tractor(values) -> bool:

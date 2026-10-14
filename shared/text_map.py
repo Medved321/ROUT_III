@@ -43,6 +43,8 @@ import math
 from pathlib import Path
 
 from shared.sector_map import (
+    DOOR_TEXTURE_BY_LOCK, DOOR_TEXTURE_NONE, KEY_LOCK_BY_ITEM, KEY_TYPES,
+    SPECIAL_DOORS,
     LineDef, Sector, SectorMap, SideDef, Thing, Vertex,
 )
 
@@ -110,11 +112,25 @@ ITEM_TYPES = {
     "сердце": "heart",
     "броня_зеленая": "armor_green",
     "броня_синяя": "armor_blue",
+    "ключ_красный": "key_red",
+    "ключ_желтый": "key_yellow",
+    "ключ_синий": "key_blue",
 }
 EXTRA_TYPES = {"выход": "exit"}
 THING_TYPES = {**ITEM_TYPES, **EXTRA_TYPES}
 ENEMY_BY_TYPE = {t: n for n, t in ENEMY_TYPES.items()}
 THING_BY_TYPE = {t: n for n, t in THING_TYPES.items()}
+
+# Door/key vocabulary. ''замок'' and ''цвет'' use colour words; ''нет'' = no
+# key. ``ё`` is normalised to ``е`` so both spellings are accepted.
+_KEY_COLORS = {
+    "нет": None,
+    "красный": "red", "красная": "red", "красное": "red",
+    "желтый": "yellow",
+    "синий": "blue", "синяя": "blue", "синее": "blue",
+}
+_KEY_COLOR_WORD = {None: "нет", "red": "красный",
+                   "yellow": "жёлтый", "blue": "синий"}
 
 MAX_HEIGHT = 32767
 MIN_HEIGHT = -32768
@@ -215,15 +231,17 @@ def _special_name(code: int) -> str:
 # ── document model (pre-geometry) ─────────────────────────────────────────
 
 class _Room:
-    __slots__ = ("line", "name", "corners", "corner_lines", "floor_h",
+    __slots__ = ("line", "name", "contours", "contour_lines", "floor_h",
                  "ceil_h", "floor_tex", "ceil_tex", "light", "upper", "mid",
                  "lower", "special", "tag")
 
     def __init__(self, line: int, name: str):
         self.line = line
         self.name = name
-        self.corners: list[tuple[float, float]] = []
-        self.corner_lines: list[int] = []
+        # A room starts with one contour; ``контур`` opens extra ones (holes /
+        # islands of the same sector).  A plain room never grows past one.
+        self.contours: list[list[tuple[float, float]]] = [[]]
+        self.contour_lines: list[list[int]] = [[]]
         self.floor_h = 0
         self.ceil_h = 128
         self.floor_tex = "floor"
@@ -234,6 +252,14 @@ class _Room:
         self.lower: str | None = None
         self.special = 0
         self.tag = 0
+
+    def add_corner(self, point: tuple[float, float], line: int) -> None:
+        self.contours[-1].append(point)
+        self.contour_lines[-1].append(line)
+
+    def new_contour(self) -> None:
+        self.contours.append([])
+        self.contour_lines.append([])
 
 
 class _Wall:
@@ -279,15 +305,27 @@ class _Document:
 _ROOM_PARAM_HELP = "пол, потолок, свет, пол_текстура, потол_текстура, " \
                    "стена, текстура, текстура_верх, текстура_низ, тег, триггер"
 _WALL_PARAM_HELP = "текстура, стена, текстура_верх, текстура_низ, тег, " \
-                   "триггер, сплошная"
+                   "триггер, сплошная, замок"
 _THING_PARAM_HELP = "направление, высота"
 
 _KEYWORDS = frozenset((
-    "комната", "угол", "стена", "текстура", "игрок", "враг", "аптечка",
-    "патроны", "вещь", "пол", "потолок", "свет", "пол_текстура",
+    "комната", "угол", "контур", "стена", "дверь", "ключ", "текстура",
+    "игрок", "враг",
+    "аптечка", "патроны", "вещь", "пол", "потолок", "свет", "пол_текстура",
     "потол_текстура", "текстура_верх", "текстура_низ", "тег", "триггер",
-    "направление", "высота", "сплошная",
+    "направление", "высота", "сплошная", "замок",
 ))
+
+_KEY_COLOR_KNOWN = "красный, жёлтый, синий, нет"
+
+
+def _key_color(tok: str, line: int, what: str) -> str | None:
+    key = tok.strip().lower().replace("ё", "е")
+    if key not in _KEY_COLORS:
+        raise TextMapError(
+            line, f"{what}: неизвестный цвет ключа «{tok}» "
+                  f"(доступно: {_KEY_COLOR_KNOWN})")
+    return _KEY_COLORS[key]
 
 
 def _parse_document(text: str) -> _Document:
@@ -314,8 +352,18 @@ def _parse_document(text: str) -> _Document:
             if len(args) != 2:
                 raise TextMapError(lineno, f"{what} требует 2 числа (x y)")
             point = (_coord(args[0], lineno, what), _coord(args[1], lineno, what))
-            current.corners.append(point)
-            current.corner_lines.append(lineno)
+            current.add_corner(point, lineno)
+            continue
+        if kw == "контур":
+            if not isinstance(current, _Room):
+                raise TextMapError(lineno, f"{what} без КОМНАТЫ")
+            if args:
+                raise TextMapError(lineno, f"{what} не принимает значений")
+            if len(current.contours[-1]) < 3:
+                raise TextMapError(
+                    lineno, f"{what}: у комнаты «{current.name}» нет "
+                            f"замкнутого контура перед новым «{parts[0]}»")
+            current.new_contour()
             continue
         if kw == "стена" and len(args) == 4:
             coords = [_coord(a, lineno, what) for a in args]
@@ -335,6 +383,32 @@ def _parse_document(text: str) -> _Document:
             continue
         if kw == "вещь":
             current = _item(doc, lineno, args, what)
+            continue
+        if kw == "дверь":
+            if len(args) not in (4, 5):
+                raise TextMapError(
+                    lineno, f"{what} требует 4 числа (x1 y1 x2 y2) и "
+                            f"необязательный цвет замка")
+            coords = [_coord(a, lineno, what) for a in args[:4]]
+            wall = _Wall(lineno, *coords)
+            lock = _key_color(args[4], lineno, what) if len(args) == 5 else None
+            wall.special = SPECIAL_DOORS
+            wall.mid = DOOR_TEXTURE_BY_LOCK.get(lock, DOOR_TEXTURE_NONE)
+            doc.walls.append(wall)
+            current = wall
+            continue
+        if kw == "ключ":
+            if len(args) != 3:
+                raise TextMapError(lineno, f"{what} требует 3 значения (x y цвет)")
+            x = _coord(args[0], lineno, what)
+            y = _coord(args[1], lineno, what)
+            color = _key_color(args[2], lineno, what)
+            if color is None:
+                raise TextMapError(
+                    lineno, f"{what}: «нет» — недопустимый цвет ключа "
+                            f"(доступно: {_KEY_COLOR_KNOWN})")
+            current = _Thing(lineno, x, y, KEY_TYPES[color])
+            doc.things.append(current)
             continue
 
         if kw not in _KEYWORDS:
@@ -445,6 +519,10 @@ def _wall_param(wall: _Wall, kw: str, args: list[str], lineno: int,
             raise TextMapError(lineno, f"{what}: «сплошная» не принимает "
                                        f"значений")
         wall.solid = True
+    elif kw == "замок":
+        lock = _key_color(_arg(args, lineno, what, "замок"), lineno, what)
+        wall.special = SPECIAL_DOORS
+        wall.mid = DOOR_TEXTURE_BY_LOCK.get(lock, DOOR_TEXTURE_NONE)
     else:
         raise TextMapError(lineno, f"{what} не подходит к СТЕНЕ "
                                    f"(допустимо: {_WALL_PARAM_HELP})")
@@ -531,13 +609,13 @@ class _Builder:
         self.sm.invalidate()
         return self.sm
 
-    def _contour(self, room: _Room) -> list[tuple[float, float]]:
-        points = list(room.corners)
+    def _contour(self, room: _Room, ci: int) -> list[tuple[float, float]]:
+        points = list(room.contours[ci])
         closed = False
         if len(points) >= 2 and points[-1] == points[0]:
             points.pop()
             closed = True
-        lines = room.corner_lines[:len(points)]
+        lines = room.contour_lines[ci][:len(points)]
         line = lines[-1] if lines else room.line
         seen: set[tuple[float, float]] = set()
         for point, ln in zip(points, lines):
@@ -546,22 +624,24 @@ class _Builder:
                     ln, f"угол ({_fmt(point[0])}, {_fmt(point[1])}) "
                        f"дублируется в комнате «{room.name}»")
             seen.add(point)
+        subject = (f"комната «{room.name}»" if ci == 0
+                   else f"контур комнаты «{room.name}»")
         if len(points) < 3:
             raise TextMapError(
-                line, f"комната «{room.name}» не замкнута "
+                line, f"{subject} не замкнута "
                       f"(мало углов: {len(points)})")
         if len(points) == 3 and not closed:
             raise TextMapError(
-                line, f"комната «{room.name}» не замкнута "
+                line, f"{subject} не замкнута "
                       f"(повторите первый угол в конце)")
         if abs(_area(points)) < _AREA_EPS:
             raise TextMapError(
-                line, f"комната «{room.name}» не замкнута "
-                      f"(вырожденный контур)")
+                line, f"{subject} не замкнута (вырожденный контур)")
         return points
 
     def _room(self, room: _Room) -> None:
-        points = self._contour(room)
+        contours = [self._contour(room, ci)
+                    for ci in range(len(room.contours))]
         si = len(self.sm.sectors)
         self._names.append(room.name)
         self.sm.sectors.append(Sector(
@@ -569,15 +649,25 @@ class _Builder:
             floor_tex=room.floor_tex, ceil_tex=room.ceil_tex,
             light=room.light, special=room.special, tag=room.tag,
         ))
+        # The first contour is the room's own boundary; later ones are holes
+        # (or islands) of the same sector, so their front -- the sector's own
+        # material -- faces away from the loop's centroid, not towards it.
+        for ci, points in enumerate(contours):
+            self._add_loop(points, room, si, ci, hole=ci > 0)
+
+    def _add_loop(self, points: list[tuple[float, float]], room: _Room,
+                  si: int, ci: int, *, hole: bool) -> None:
         cx = sum(p[0] for p in points) / len(points)
         cy = sum(p[1] for p in points) / len(points)
         ids = [self.vertex(x, y) for x, y in points]
+        lines = room.contour_lines[ci]
         n = len(ids)
         for i in range(n):
             j = (i + 1) % n
             (ax, ay), (bx, by) = points[i], points[j]
             cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
-            v1, v2 = (ids[i], ids[j]) if cross < 0 else (ids[j], ids[i])
+            keep = cross > 0 if hole else cross < 0
+            v1, v2 = (ids[i], ids[j]) if keep else (ids[j], ids[i])
             key = (v1, v2) if v1 <= v2 else (v2, v1)
             li = self._lines.get(key)
             if li is None:
@@ -586,13 +676,13 @@ class _Builder:
                 self._lines[key] = len(self.sm.linedefs) - 1
                 continue
             ld = self.sm.linedefs[li]
+            where = lines[i] if i < len(lines) else room.line
             if (v1, v2) == (ld.v1, ld.v2):
                 other = self._names[self.sm.sidedefs[ld.front].sector]
                 if self.sm.sidedefs[ld.front].sector == si:
                     continue        # the same room, the same face: ignore
                 raise TextMapError(
-                    room.corner_lines[i] if i < len(room.corner_lines)
-                    else room.line,
+                    where,
                     f"комнаты «{other}» и «{room.name}» лежат по одну "
                     f"сторону общей стены")
             if ld.back >= 0:
@@ -600,8 +690,7 @@ class _Builder:
                     continue
                 other = self._names[self.sm.sidedefs[ld.back].sector]
                 raise TextMapError(
-                    room.corner_lines[i] if i < len(room.corner_lines)
-                    else room.line,
+                    where,
                     f"грань «{other}»/«{room.name}»: третья комната "
                     f"на одной стене невозможна")
             ld.back = self.side(room.upper, room.mid, room.lower, si)
@@ -786,6 +875,9 @@ def _thing_lines(t: Thing) -> list[str]:
         head = f"АПТЕЧКА {_fmt(t.x)} {_fmt(t.y)}"
     elif t.type == "amm":
         head = f"ПАТРОНЫ {_fmt(t.x)} {_fmt(t.y)}"
+    elif t.type in KEY_LOCK_BY_ITEM:
+        color = _KEY_COLOR_WORD[KEY_LOCK_BY_ITEM[t.type]]
+        head = f"КЛЮЧ {_fmt(t.x)} {_fmt(t.y)} {color}"
     elif t.type in THING_BY_TYPE:
         head = f"ВЕЩЬ {_fmt(t.x)} {_fmt(t.y)} {THING_BY_TYPE[t.type]}"
     else:
@@ -805,8 +897,9 @@ def render(sm: SectorMap) -> str:
     lines that the room contours do not describe exactly (mechanics, free
     walls, offsets, foreign flags) are emitted as explicit ``СТЕНА``
     commands.  ``parse(render(m))`` reproduces ``m`` for every map the format
-    can express: a sector is one simple contour, a two-sided line separates
-    exactly two sectors and its sides carry the texture of their own room.
+    can express: a sector is one contour plus optional holes (nested rooms, an
+    extra ``контур`` per loop), a two-sided line separates exactly two sectors
+    and its sides carry the texture of their own room.
     """
     out: list[str] = [
         MTS_HEADER,
@@ -816,31 +909,33 @@ def render(sm: SectorMap) -> str:
     ]
     n_sectors = len(sm.sectors)
     defaults = [_side_defaults(sm, si) for si in range(n_sectors)]
-    contours: list[list[int] | None] = []
-    for si in range(n_sectors):
-        loops = _sector_loops(sm, si)
-        if not loops:
-            contours.append(None)
-            continue
-        best = max(loops, key=lambda lp: abs(_area(
-            [(sm.verts[i].x, sm.verts[i].y) for i in lp])))
+
+    def _canon(loop: list[int]) -> list[int]:
         # rotate to the lexicographically first corner: the canonical text of a
         # map must not depend on the order its linedefs happen to be built in
-        start = min(range(len(best)), key=lambda i: (sm.verts[best[i]].x,
-                                                      sm.verts[best[i]].y,
-                                                      best[i]))
-        best = best[start:] + best[:start]
-        contours.append(best)
+        start = min(range(len(loop)), key=lambda i: (sm.verts[loop[i]].x,
+                                                     sm.verts[loop[i]].y,
+                                                     loop[i]))
+        return loop[start:] + loop[:start]
+
+    contours: list[list[list[int]]] = []
+    for si in range(n_sectors):
+        loops = [_canon(lp) for lp in _sector_loops(sm, si)]
+        # Biggest loop first: it is the room's own boundary, the rest are its
+        # holes (nested rooms).  Ties break on the loops themselves so the text
+        # stays canonical.
+        loops.sort(key=lambda lp: (-abs(_area(
+            [(sm.verts[i].x, sm.verts[i].y) for i in lp])), lp))
+        contours.append(loops)
 
     owners: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
-    for si, loop in enumerate(contours):
-        if not loop:
-            continue
-        n = len(loop)
-        for i in range(n):
-            a, b = loop[i], loop[(i + 1) % n]
-            key = (a, b) if a <= b else (b, a)
-            owners.setdefault(key, []).append((si, a, b))
+    for si, loops in enumerate(contours):
+        for loop in loops:
+            n = len(loop)
+            for i in range(n):
+                a, b = loop[i], loop[(i + 1) % n]
+                key = (a, b) if a <= b else (b, a)
+                owners.setdefault(key, []).append((si, a, b))
 
     lines_by_pair: dict[tuple[int, int], list[int]] = {}
     for i, ld in enumerate(sm.linedefs):
@@ -864,18 +959,21 @@ def render(sm: SectorMap) -> str:
         if _line_matches_room(sm, indexes[0], front, back, defaults):
             covered.add(indexes[0])
 
-    for si, loop in enumerate(contours):
-        if not loop:
+    for si, loops in enumerate(contours):
+        if not loops:
             continue
         sector = sm.sectors[si]
         upper, mid, lower = defaults[si]
         out.append(f"КОМНАТА {si + 1}")
-        for vi in loop:
-            v = sm.verts[vi]
-            out.append(f"угол {_fmt(v.x)} {_fmt(v.y)}")
-        if len(loop) == 3:               # explicit closing corner
-            v = sm.verts[loop[0]]
-            out.append(f"угол {_fmt(v.x)} {_fmt(v.y)}")
+        for ci, loop in enumerate(loops):
+            if ci:
+                out.append("контур")
+            for vi in loop:
+                v = sm.verts[vi]
+                out.append(f"угол {_fmt(v.x)} {_fmt(v.y)}")
+            if len(loop) == 3:           # explicit closing corner
+                v = sm.verts[loop[0]]
+                out.append(f"угол {_fmt(v.x)} {_fmt(v.y)}")
         if sector.floor_h:
             out.append(f"пол {sector.floor_h}")
         if sector.ceil_h != 128:
@@ -903,6 +1001,23 @@ def render(sm: SectorMap) -> str:
         if i in covered:
             continue
         v1, v2 = sm.verts[ld.v1], sm.verts[ld.v2]
+        if ld.special == SPECIAL_DOORS and ld.back >= 0:
+            lock = sm.door_lock(i)
+            head = f"ДВЕРЬ {_fmt(v1.x)} {_fmt(v1.y)} " \
+                   f"{_fmt(v2.x)} {_fmt(v2.y)}"
+            if lock is not None:
+                head += f" {_KEY_COLOR_WORD[lock]}"
+            out.append(head)
+            if 0 <= ld.front < n_sides:
+                sd = sm.sidedefs[ld.front]
+                if sd.upper != "-":
+                    out.append(f"текстура_верх {sd.upper}")
+                if sd.lower != "-":
+                    out.append(f"текстура_низ {sd.lower}")
+            if ld.tag:
+                out.append(f"тег {ld.tag}")
+            out.append("")
+            continue
         out.append(f"СТЕНА {_fmt(v1.x)} {_fmt(v1.y)} "
                    f"{_fmt(v2.x)} {_fmt(v2.y)}")
         if 0 <= ld.front < n_sides:

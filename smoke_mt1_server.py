@@ -122,9 +122,10 @@ def test_steps_solid_on_the_wire():
                                 encode_world_state)
     from shared.version import PROTOCOL_VERSION
 
-    # 8 = the fire decision (fire_seq/fire_ready) in the player record; heights
-    # still ride the map, not the packets
-    assert PROTOCOL_VERSION == 8, PROTOCOL_VERSION
+    # 8 = the fire decision (fire_seq/fire_ready) in the player record; 9 =
+    # armor/powerup/items ride the snapshot; 10 = the key mask/use_reason and
+    # the sparse door block; heights still ride the map
+    assert PROTOCOL_VERSION == 10, PROTOCOL_VERSION
 
     sm = _steps_map()
     raw = sm.to_bytes()
@@ -153,12 +154,14 @@ def test_steps_solid_on_the_wire():
     state = encode_world_state(1, [{"id": 2, "x": 10.0, "y": 20.0, "angle": 0.0,
                                     "health": 100, "state": 0, "name": "A"}],
                                 mode="pve")
-    _tick, players, _e, _b, _c, _mode, _im = decode_world_state(state)
+    _tick, players, _e, _b, _c, _mode, _im, _it, _doors = decode_world_state(state)
     assert len(players) == 1 and "z" not in players[0], players[0]
-    # a player record is exactly id/x/y/angle/health/state/wpn + 5 ammo slots
+    # a player record is exactly id (uint16: join ids are not capped at 255)
+    # /x/y/angle/health/state/wpn + 5 ammo slots
     # + the fire decision (fire_seq uint32 + fire_ready uint8 + fire_reason
-    # uint8); still no z
-    assert 1 + 3 * 4 + 3 + 5 + 4 + 1 + 1 == _struct.calcsize("!BfffBBBBBBBBIBB")
+    # uint8) + armor (value uint8 + type idx) + powerup idx; still no z
+    assert 2 + 3 * 4 + 3 + 5 + 4 + 1 + 1 + 3 == \
+        _struct.calcsize("!HfffBBBBBBBBIBBBBB")
     assert players[0]["fire_seq"] == 0 and players[0]["fire_ready"] == 0, players[0]
     assert players[0]["fire_reason"] == 0, players[0]
 

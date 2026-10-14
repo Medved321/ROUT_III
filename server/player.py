@@ -17,6 +17,15 @@ class PlayerSession:
     party_id: int | None = None
     last_input_tick: int = 0
     last_fire_seq: int = -1        # last ACCEPTED fire intent (fire_seq)
+    # Watermark of every intent already DECIDED, accepted OR refused. It is a
+    # different fact from `last_fire_seq` and the idempotence guard needs
+    # exactly this one: a refusal leaves `last_fire_seq` where it was, so a
+    # redelivered refused intent still looked "not newer" and got decided a
+    # second time — an extra shot the client never asked for, published as an
+    # acceptance over whatever decision followed it. `last_fire_seq` stays
+    # "accepted" because that is the number the client addresses decisions by
+    # (a jump of fire_seq reads as a shot happened).
+    last_fire_decided: int = -1
     # Server decision about the newest fire intent of this session; published
     # to the client in the WORLD_STATE player record so a refused shot is
     # visible instead of being dropped in silence.

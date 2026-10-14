@@ -19,7 +19,13 @@ from client.sector_editor import (
 from client.map_editor import ENEMY_NAMES, ITEM_NAMES
 from client.ui_layout import clip_tail, ellipsize, fit_width, layout_row
 from shared import text_map
+from shared.sector_map import KEY_LOCK_BY_ITEM
 from shared.text_map import WALL_TEXTURE_ORDER
+
+# Key things get their own colour on the 2D overlay so a red key does not read
+# as a generic yellow pickup (the type→colour mirror of DOOM's key cards).
+KEY_COLORS = {"red": (220, 60, 60), "yellow": (220, 210, 60),
+              "blue": (80, 110, 240)}
 
 BG = (14, 14, 20)
 PANEL = (28, 32, 46)
@@ -49,6 +55,7 @@ LINE_KINDS = {
     "wall": ((205, 208, 214), 3),
     "step": ((240, 190, 90), 2),
     "open": (CYAN, 1),
+    "door": ((225, 120, 220), 4),
 }
 
 # panel layout rows (the panel must fit any window height, so the thing
@@ -755,6 +762,22 @@ class SectorEditorScreen:
                                    else "Проём (ступени)")
                 else:
                     self.status = "Признак только для двусторонней линии"
+            elif key == "door":
+                is_door, _lock = self.editor.line_door_lock(self.sel_line)
+                if is_door:
+                    self.editor.clear_line_door(self.sel_line)
+                    self.status = "Дверь снята"
+                elif self.editor.set_line_door(self.sel_line, None):
+                    self.status = "Дверь без ключа (door_D)"
+                else:
+                    self.status = "Дверь — только для двусторонней линии"
+            elif key in ("lockR", "lockY", "lockB"):
+                lock = {"lockR": "red", "lockY": "yellow",
+                        "lockB": "blue"}[key]
+                if self.editor.set_line_door(self.sel_line, lock):
+                    self.status = f"Дверь с ключом: {lock}"
+                else:
+                    self.status = "Дверь — только для двусторонней линии"
             elif key == "flip":
                 if not self.editor.flip_line(self.sel_line):
                     # refused, and the map is untouched — say so instead of
@@ -1090,6 +1113,8 @@ class SectorEditorScreen:
         for i, t in enumerate(self.editor.things):
             if t.type in ENEMY_NAMES.values():
                 col = (220, 90, 90)
+            elif t.type in KEY_LOCK_BY_ITEM:
+                col = KEY_COLORS[KEY_LOCK_BY_ITEM[t.type]]
             elif t.type in ITEM_NAMES.values():
                 col = (240, 220, 90)
             else:
@@ -1159,6 +1184,14 @@ class SectorEditorScreen:
             ld = self.editor.lines[self.sel_line]
             if self.editor.line_two_sided(self.sel_line):
                 chips["solid"] = "сплошная" if ld.solid else "проём"
+                is_door, lock = self.editor.line_door_lock(self.sel_line)
+                chips["door"] = "снять дверь" if is_door else "дверь"
+                chips["lockR"] = "К"
+                chips["lockY"] = "Ж"
+                chips["lockB"] = "С"
+                if is_door:
+                    self._prop_text = (f"дверь: ключ {lock}" if lock
+                                       else "дверь: без ключа")
         elif self.sel_sector is not None and self.sel_sector >= 0:
             s = self.editor.sectors[self.sel_sector]
             self._prop_text = (f"пол {s.floor_h}  потол {s.ceil_h}  "

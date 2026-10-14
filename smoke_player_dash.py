@@ -24,7 +24,7 @@ from server.game_data import (
 )
 from shared.components import Dash, Player, Position, Velocity, WeaponComponent
 from shared.protocol import (
-    INPUT_FLAG_DASH, decode_player_input, encode_player_input,
+    INPUT_FLAG_DASH, INPUT_FLAG_USE, decode_player_input, encode_player_input,
 )
 from shared.sector_map import SectorMap
 from shared.version import PROTOCOL_VERSION
@@ -38,9 +38,11 @@ from smoke_sector_server import _strip_map
 
 def test_flags_roundtrip():
     # 8: the player record also carries the fire decision (fire_seq/fire_ready);
-    # PLAYER_INPUT itself is unchanged, still just flags
-    assert PROTOCOL_VERSION == 8, PROTOCOL_VERSION
+    # 9: armor/powerup/items; 10: key mask + use_reason and the doors block.
+    # PLAYER_INPUT itself is unchanged, still flags.
+    assert PROTOCOL_VERSION == 10, PROTOCOL_VERSION
     assert INPUT_FLAG_DASH == 0x01, INPUT_FLAG_DASH
+    assert INPUT_FLAG_USE == 0x02, INPUT_FLAG_USE
 
     # the packet grew by exactly the flags byte: 8 -> 9
     assert len(encode_player_input(0, 0, 0.0, False, 1)) == 9
@@ -332,6 +334,7 @@ def test_client_pulse_is_one_shot():
         shoot = False
         weapon_id = 1
         dash_pressed = False
+        use = False
 
         def update(self):
             # exactly what InputHandler.update() does each frame
@@ -342,8 +345,19 @@ def test_client_pulse_is_one_shot():
             self.input_handler = FakeHandler()
             self.local_angle = 0.0
             self._dash_pending = False
+            self._prev_use = False
+            self._use_hint_until = 0.0
             from client.client import GameClient
             self._snapshot = GameClient._input_snapshot
+
+        def process_input(self):
+            # The frame-level latch from GameClient._process_input: the press
+            # edge lives one rendered frame, the snapshot only consumes the
+            # latched _dash_pending. The test has no game loop, so it stands
+            # in for the frame that does this.
+            if self.input_handler.dash_pressed:
+                self.input_handler.dash_pressed = False
+                self._dash_pending = True
 
     sent = []
 
@@ -357,9 +371,10 @@ def test_client_pulse_is_one_shot():
             input_send_loop(FakeNet(), lambda: client._snapshot(client),
                             INPUT_SEND_INTERVAL))
         await asyncio.sleep(0.1)
-        # one Space press on a frame; the 25 Hz send loop latches it, and the
-        # following frame clears the edge
+        # one Space press on a frame; that frame latches it, and the 25 Hz
+        # send loop carries it in exactly one packet
         client.input_handler.dash_pressed = True
+        client.process_input()
         await asyncio.sleep(0.08)
         client.input_handler.update()
         await asyncio.sleep(0.2)

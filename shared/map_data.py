@@ -129,8 +129,13 @@ class GameMap:
         tx, ty = int(x) // TILE, int(y) // TILE
         return self.get_tile(tx, ty) != TILE_EMPTY
 
-    def can_move_px(self, x: float, y: float, r: float) -> bool:
-        """True if a circle of radius ``r`` at (x, y) does not overlap a wall."""
+    def can_move_px(self, x: float, y: float, r: float,
+                    extra_blocked=None) -> bool:
+        """True if a circle of radius ``r`` at (x, y) does not overlap a wall.
+
+        ``extra_blocked`` is accepted for interface parity with
+        ``SectorMap.can_move_px`` (dynamic blockers); tile maps have none.
+        """
         tx1 = max(0, int(x - r) // TILE)
         tx2 = min(self.width - 1, int(x + r) // TILE)
         ty1 = max(0, int(y - r) // TILE)
@@ -144,8 +149,13 @@ class GameMap:
                         return False
         return True
 
-    def has_los_px(self, x1: float, y1: float, x2: float, y2: float) -> bool:
-        """Pixel-space LOS (sampling every 8 px), ported from ROUT_II_III."""
+    def has_los_px(self, x1: float, y1: float, x2: float, y2: float,
+                   extra_blocked=None) -> bool:
+        """Pixel-space LOS (sampling every 8 px), ported from ROUT_II_III.
+
+        ``extra_blocked`` is accepted for interface parity with
+        ``SectorMap.has_los_px``; tile maps have no dynamic blockers.
+        """
         dx_ = x2 - x1
         dy_ = y2 - y1
         dist = math.hypot(dx_, dy_)

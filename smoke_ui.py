@@ -1,6 +1,8 @@
 import os
+import sys
 import tempfile
 
+sys.stdout.reconfigure(encoding="utf-8")  # labels contain arrows
 os.environ['SDL_VIDEODRIVER'] = 'dummy'
 import pygame
 pygame.init()

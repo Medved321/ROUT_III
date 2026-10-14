@@ -21,12 +21,24 @@ PLAYER_RADIUS = 16
 ENEMY_RADIUS = 8
 BOT_RADIUS = 10
 BULLET_HIT_RADIUS = 30
-ITEM_PICKUP_DIST = 90
+# Engine-side pickup geometry. These are display heights only: the pickup radius
+# and the respawn timer live on the server (server/game_data.py), which is the
+# side that knows whether an item was actually taken.
+#
+# ITEM_FLOAT_HEIGHT is a *ratio* of the item's own projected height, not a pixel
+# count, so a pickup floats the same visual amount at any distance and at any
+# window size -- the alternative (a fixed pixel offset) lifts a far medkit out of
+# proportion and makes it drift as the window is resized.
 ITEM_FLOAT_HEIGHT = 0.15
+# Every placeable item type must appear here. A missing key is not a harmless
+# omission: the renderer falls back to a default height, so a weapon pickup would
+# silently come out the size of whatever that default happens to be.
 ITEM_GAME_HEIGHTS = {
     'med': 28, 'med_small': 20, 'amm': 24, 'amm_small': 18,
     'armor_green': 28, 'armor_blue': 28, 'berserk': 24,
     'haste': 24, 'invuln': 24, 'heart': 24,
+    'wpn_0': 30, 'wpn_2': 30, 'wpn_3': 30, 'wpn_4': 30, 'wpn_5': 30,
+    'key_red': 18, 'key_yellow': 18, 'key_blue': 18,
 }
 MAX_PARTICLES = 200
 MAX_DECALS = 100
@@ -250,13 +262,25 @@ FALLBACK_SPRITE_MAX = 1024
 DASH_FX_BURST = 9            # puffs thrown out when a dash starts
 DASH_FX_TRAIL = 2            # puffs per trail emission while dashing
 DASH_FX_TRAIL_PX = 16.0      # distance covered between trail emissions
-DASH_FX_COLOR = (120, 200, 255)   # own dash (remote players use shirt color)
+DASH_FX_COLOR = (120, 200, 255)   # own dash world dust (remote players use shirt color)
+DASH_FX_STREAK_RGB = (255, 255, 255)   # speed wedges: white, like every other game's
 DASH_FX_FADE = 0.055         # per-frame decay of the radial-ray envelope
-DASH_FX_STREAKS = 8          # radial speed rays at full quality (four sides, two rings)
-DASH_FX_STREAKS_MIN = 4      # never let the cue disappear at low quality
-DASH_FX_STREAK_FLOW = 0.11   # share of a ray's travel per frame at a full envelope
+# The cue is a full circle of white wedges, not four bars on the screen axes, so
+# it reads the same wherever the player is looking and never as a "+" glued to
+# the edges of the view. Rings are listed one after another, which is what makes
+# any prefix of the table a complete circle (see rendering._ray_table).
+DASH_FX_STREAKS = 96         # white speed wedges at full quality (3 rings x 32)
+DASH_FX_STREAKS_MIN = 32     # one whole ring: the cue is the only dash signal
+DASH_FX_STREAK_RING = 32     # wedges per ring
+DASH_FX_STREAK_FLOW = 0.11   # share of a wedge's travel per frame at a full envelope
 DASH_FX_STREAK_DEADZONE = 0.18   # empty fraction of the short side around the aim point
-DASH_FX_STREAK_WIDTH = 5.0   # layout units across a ray at its wide (outer) end
+DASH_FX_STREAK_WIDTH = 4.0   # layout units across a wedge at its wide (outer) end
+# Length is a layout unit too, but it is deliberately only a few times the width:
+# a turned sprite is blitted as its axis-aligned bounding box, and for a long thin
+# triangle that box is a couple of dozen times the ink in it (measured: a 4K field
+# of full-radius wedges covered 87 % of the frame in boxes to paint 3.6 % of it,
+# 13 ms a frame). Short streaks also just read better as speed.
+DASH_FX_STREAK_LEN = 26.0    # layout units from the apex to the base
 
 # Rendering
 MIN_SHADE = 0.15
@@ -321,8 +345,8 @@ WINDOW_SCALE_VALS = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3, 3.5, 4, 4.5, 
 FPS_CAP_VALS = [30, 60, 120, 144, 0]
 FOV_VALS = [60, 70, 80, 90, 100, 110, 120]
 VIEW_DIST_VALS = [100, 200, 300, 400, 500, 600, 800, 1000, 1500]
-RAY_STEP_VALS = [2, 3, 4, 6, 8, 12, 16, 24, 28]
-RAY_LIGHT_VALS = [2, 3, 4, 6, 8, 12, 16, 20]
+RAY_STEP_VALS = [1, 2, 3, 4, 6, 8, 12, 16, 24, 28]
+RAY_LIGHT_VALS = [1, 2, 3, 4, 6, 8, 12, 16, 20]
 BLOOD_AMOUNT_VALS = [0, 0.5, 1.0, 1.5, 2.0]
 ENEMY_DENSITY_STEP = 0.5
 ENEMY_DENSITY_MAX = 2.0

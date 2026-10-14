@@ -151,6 +151,10 @@ def _make_state(tick, p2_x, enemy_x, bullet_x, local_x=10.0):
         [],
         "pve",
         [],
+        # items: every snapshot tuple is (tick, players, enemies, bullets,
+        # corpses, mode, impacts, items, doors); _blend_state unpacks all nine.
+        [],
+        [],
     )
 
 

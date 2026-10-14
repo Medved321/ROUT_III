@@ -146,6 +146,14 @@ class SectorScene:
                 self.upper_b.append(None)
                 self.mid_b.append(None)
                 self.lower_b.append(None)
+        # Door linedefs (``special == SPECIAL_DOORS``) and their live opening
+        # fraction (0.0 shut ... 1.0 open).  The fraction is pushed in each
+        # frame by the client bridge from the world snapshot; the scene itself
+        # never mutates the map (design D2/D8).  A linedef absent from the
+        # dict reads as shut (``progress == 0``), which is the safe default.
+        door_lister = getattr(sm, 'door_linedefs', None)
+        self.door_lines = set(door_lister()) if door_lister else set()
+        self.door_progress: dict[int, float] = {}
         self.floor_h = [s.floor_h for s in sm.sectors]
         self.ceil_h = [s.ceil_h for s in sm.sectors]
         self.light = [s.light for s in sm.sectors]
@@ -497,7 +505,7 @@ def _walk_subsectors(tree, px, py, pa) -> list:
 
 def _seg_wall_bands(bands, scene, tree, si, px, py, pa, F, hc, iw, ih, eye,
                     view, clip_top=None, clip_bot=None, flat_spans=None,
-                    view_buf=None):
+                    view_buf=None, solid_depth=None):
     """Project one seg into ``bands``, DOOM ``R_RenderSegLoop`` style.
 
     Without clip arrays the seg is emitted as raw projected bands (no
@@ -505,17 +513,25 @@ def _seg_wall_bands(bands, scene, tree, si, px, py, pa, F, hc, iw, ih, eye,
     ``clip_bot`` each band is drawn only into the currently *open* column
     interval and the clips are updated per column:
 
-    * solid wall — mid band inside ``[max(yc,top), min(yf,bot)]``, then the
-      column is closed (``top = ih, bot = 0``);
+    * solid wall — mid band inside ``[max(yc,top), min(yf,bot)]``; the
+      column is NOT closed in the clip arrays (an irreversible close is
+      order-dependent and is exactly what used to evict a nearer wall).
+      Ownership of the column is recorded as ``solid_depth[col] = t``;
     * two-sided wall — only the upper/lower lips are emitted where they
       intersect the open interval; the ceiling bound tightens to the lower
       edge of the upper lip, the floor bound to the upper edge of the lower
       lip (DOOM ``ceilingclip``/``floorclip``).
 
-    A seg whose columns are ALL closed beforehand is discarded entirely and
-    never touches the clip arrays or the buffer.  Because the BSP is walked
-    near->far, walls drawn before the current seg are always nearer, so an
-    all-closed discard can never hide a nearer wall (task 4.2 scenario).
+    **Column ownership is order-independent** (change
+    ``sector-near-wall-occlusion``): ``solid_depth[col]`` carries the depth
+    of the NEAREST solid wall seen so far in that column, and a column whose
+    clip interval is already pinched shut is skipped outright.  Segs inside
+    one subsector arrive in an arbitrary order, so "drawn earlier" never
+    implies "nearer" — only the per-column minimum decides.  A seg lying
+    entirely behind nearer solid walls (``t >= solid_depth[col]`` in every
+    column of its span) is discarded without touching the clips, the flats
+    or the z-buffer, and the nearer wall is always drawn whichever seg came
+    first.
 
     With ``flat_spans`` (task 4.3) the seg ALSO contributes the front
     sector's floor/ceiling visplane spans: in each still-open column the
@@ -523,18 +539,18 @@ def _seg_wall_bands(bands, scene, tree, si, px, py, pa, F, hc, iw, ih, eye,
     ``[max(clip_top, yf), clip_bot]`` — the same bounds the DDA path pushed
     at the sector's far boundary.  The seam rows ``yc/yf`` are read before
     the clip arrays are updated, so the flat of the front sector is always
-    bounded by THIS wall, never by the walls behind it; columns closed by
-    nearer walls reach here with ``top >= bot`` and push nothing.
+    bounded by THIS wall, never by the walls behind it; a column already
+    owned by a nearer solid wall is skipped before the push, so flats never
+    paint over a nearer wall either.
 
     Band tuples mirror the DDA ``wall_bands`` shape; ``u`` is the absolute
     offset along the linedef in world units so split segs and back faces stay
     texture-continuous.
 
-    With ``view_buf`` (task 4.4) the seg records the distance of the wall
-    that CLOSES each column (``clip_top >= clip_bot`` after the update) into
-    ``view_buf[col]`` — the per-column z-buffer for sprites/particles.  Since
-    the walk is near->far the first closer wins, matching the old DDA
-    occlusion distance.
+    With ``view_buf`` (task 4.4) the seg records the occlusion depth of the
+    wall that CLOSES each column — the nearest solid wall (``solid_depth``)
+    or the two-sided lip that pinches the interval shut — into
+    ``view_buf[col]``, the per-column z-buffer for sprites/particles.
     """
     s = tree.segs[si]
     ax1, ay1 = s.x1, s.y1
@@ -553,11 +569,14 @@ def _seg_wall_bands(bands, scene, tree, si, px, py, pa, F, hc, iw, ih, eye,
     s2 = -dx2 * sa + dy2 * ca
     if t1 <= 0.0 and t2 <= 0.0:
         return
-    if t1 < 0.0:
+    # Near-plane clip: a NON-POSITIVE end (``== 0.0`` included — the eye sits
+    # exactly on the vertex) is moved just past the plane before anything is
+    # divided by it.  See change ``sector-near-wall-occlusion``, task 2.1.
+    if t1 <= 0.0:
         k = -t1 / (t2 - t1)
         s1 += (s2 - s1) * k
         t1 = 1e-6
-    elif t2 < 0.0:
+    elif t2 <= 0.0:
         k = -t2 / (t1 - t2)
         s2 += (s1 - s2) * k
         t2 = 1e-6
@@ -571,6 +590,18 @@ def _seg_wall_bands(bands, scene, tree, si, px, py, pa, F, hc, iw, ih, eye,
     c1i = min(iw, int(chi * iw) + 1)
     if c1i <= c0:
         return
+    # Two-sided linedefs store both faces as twin segs; only the face whose
+    # side the camera stands on is ever visible (``cross((v2-v1),(cam-v1))
+    # < 0`` — the camera is on the RIGHT of the seg's own direction, winding
+    # convention independent).  The reversed twin must not contribute bands,
+    # flats or clip movement: whichever of the two the in-leaf seg order visits
+    # first, it would lower ``clip_bot`` to ITS floor line before the visible
+    # twin pushes the lower sector's floor, evicting the pit/stair floor
+    # (change ``sector-step-down-pit``).  One-sided walls have no twin and are
+    # always drawn.
+    if scene.back_sec[li] >= 0:
+        if (ax2 - ax1) * (py - ay1) - (ay2 - ay1) * (px - ax1) >= 0.0:
+            return
     if s.side == 1:
         back = scene.front_sec[li]
         up_tex, mid_tex, low_tex = (scene.upper_b[li], scene.mid_b[li],
@@ -588,13 +619,27 @@ def _seg_wall_bands(bands, scene, tree, si, px, py, pa, F, hc, iw, ih, eye,
         Bc = scene.ceil_h[back]
         if Bf >= Sc or Bc <= Sf:
             two = False
+    # A door is drawn as a mid-texture plate whose vertical extent shrinks with
+    # its opening fraction (design D8): anchored to the ceiling, it covers the
+    # whole opening when shut and has receded entirely at progress 1.  This
+    # reuses the column clip arrays — the plate behaves like an upper lip, so
+    # the far side shows only through the gap below it.
+    is_door = li in scene.door_lines
     if clip_top is not None:
-        closed = True
+        if solid_depth is None:
+            solid_depth = [math.inf] * iw
+        # Early-out (task 1.4): when EVERY column of the span is already
+        # owned by a nearer solid wall the seg can contribute nothing — no
+        # band, no flats, no clip movement.  ``t`` over the span never drops
+        # below ``min(t1, t2)``, so comparing that bound against
+        # ``solid_depth`` is a sound (conservative) whole-seg test.
+        t_lo = t1 if t1 < t2 else t2
+        covered = True
         for col in range(c0, c1i):
-            if clip_top[col] < clip_bot[col]:
-                closed = False
+            if solid_depth[col] > t_lo:
+                covered = False
                 break
-        if closed:
+        if covered:
             return
     seg_len = math.hypot(ax2 - ax1, ay2 - ay1) or 1.0
     u_off = s.u_off
@@ -660,25 +705,56 @@ def _seg_wall_bands(bands, scene, tree, si, px, py, pa, F, hc, iw, ih, eye,
         t = t1 + u * dt
         if t <= 0.0:
             continue
+        # Order-independent gate: this column already has a NEARER solid wall
+        # (tasks 1.2/1.5) — nothing of this seg, flats included, may show.
+        if t >= solid_depth[col]:
+            continue
+        ceilt = clip_top[col]
+        flrob = clip_bot[col]
+        # A column already shut by a nearer two-sided lip stays untouched:
+        # the band interval below would be empty anyway, and re-running the
+        # lip maths would rewrite the clips of a closed column.
+        if ceilt >= flrob:
+            continue
         lv = _light_level(scene.light[cur], t, view)
         tu = u_off + u * seg_len
         yc = hc + (eye - Sc) * F / t
         yf = hc + (eye - Sf) * F / t
-        ceilt = clip_top[col]
-        flrob = clip_bot[col]
         if flat_spans is not None:
             _push_flat(flat_spans, col, ceilt,
                        yc if yc < flrob else flrob, cur, False, ih)
             _push_flat(flat_spans, col,
                        yf if yf > ceilt else ceilt, flrob, cur, True, ih)
+        if is_door:
+            p = scene.door_progress.get(li, 0.0)
+            if p < 1.0:
+                # Ceiling-anchored plate: bottom edge rises toward the ceiling
+                # as the door opens (0 -> full opening, 1 -> gone).
+                pb = yc + (1.0 - p) * (yf - yc)
+                lo = yc if yc > ceilt else ceilt
+                hi = pb if pb < flrob else flrob
+                if hi > lo:
+                    bands.append((col, lo, hi, mid_tex, lv, tu,
+                                  ax1, ay1, ax2, ay2, t))
+                if pb > clip_top[col]:
+                    clip_top[col] = pb
+            if p <= 0.0:
+                # Fully shut: the door owns the column so nothing behind it
+                # shows through, and it is the occlusion distance for sprites.
+                solid_depth[col] = t
+                if view_buf is not None and t < view_buf[col]:
+                    view_buf[col] = t
+            continue
         if not two:
             y0 = yc if yc > ceilt else ceilt
             y1 = yf if yf < flrob else flrob
             if y1 > y0:
                 bands.append((col, y0, y1, mid_tex, lv, tu,
                               ax1, ay1, ax2, ay2, t))
-            clip_top[col] = float(ih)   # solid wall closes the column
-            clip_bot[col] = 0.0
+            # The nearest solid wall owns the column from now on.  The clip
+            # arrays are deliberately NOT closed (task 1.2): an irreversible
+            # close is what used to evict a nearer wall drawn later.
+            solid_depth[col] = t
             if view_buf is not None and t < view_buf[col]:
                 view_buf[col] = t
             continue
@@ -695,15 +771,27 @@ def _seg_wall_bands(bands, scene, tree, si, px, py, pa, F, hc, iw, ih, eye,
             clip_top[col] = r1 if r1 < ycb else ycb
         else:
             clip_top[col] = yl
-        # Lower lip: back floor ABOVE the front floor on screen.
-        if yfb < yf:
-            r0 = yfb if yfb > yl else yl
-            if yh > r0:
-                bands.append((col, r0, yh, low_tex, lv, tu,
-                              ax1, ay1, ax2, ay2, t))
-            clip_bot[col] = r0 if r0 > yfb else yfb
-        else:
-            clip_bot[col] = yh
+        # Lower lip: the band is the difference between the two floor lines
+        # on screen, in BOTH directions — step up (``yfb < yf``) and pit down
+        # (``yfb > yf``).  For the step up this is algebraically the old
+        # ``r0``/``yh`` pair (identity proof — change ``sector-step-down-pit``,
+        # design); for the pit it draws the face that used to be skipped.
+        # ``clip_bot`` follows the BACK floor line (``max(yfb, yl)``), so the
+        # lower sector's floor is not evicted by the front floor line.  It
+        # never moves past the clip the column already has: a farther lip may
+        # not reopen pixels a nearer seg closed (nearer wins), otherwise a
+        # far wall's band dips over the near face it stands behind.
+        lo = yfb if yfb < yf else yf
+        hi = yfb if yfb > yf else yf
+        if lo < yl:
+            lo = yl
+        if hi > flrob:
+            hi = flrob
+        if hi > lo:
+            bands.append((col, lo, hi, low_tex, lv, tu,
+                          ax1, ay1, ax2, ay2, t))
+        nb = yfb if yfb > yl else yl
+        clip_bot[col] = nb if nb < flrob else flrob
         # The first (nearest) wall that closes this column is the occlusion
         # distance for the z-buffer (task 4.4 — sprites/particles/fog).
         if view_buf is not None and clip_top[col] >= clip_bot[col] \
@@ -805,6 +893,11 @@ def bsp_clipped_frame(vh=None, vy=None, view_buf=None) -> tuple:
     bsp = scene.ensure_bsp()
     clip_top = [0.0] * iw
     clip_bot = [float(ih)] * iw
+    # Nearest solid wall that already owns each column (task 1.1).  A farther
+    # solid processed first merely raises it; a nearer one still passes the
+    # per-column gate and repaints, so the result does not depend on the
+    # arbitrary seg order inside a subsector.
+    solid_depth = [math.inf] * iw
     order = _walk_subsectors(bsp, px, py, pa)
     bands = []
     flat_spans = []
@@ -812,7 +905,8 @@ def bsp_clipped_frame(vh=None, vy=None, view_buf=None) -> tuple:
         for si in bsp.sub_segs()[sub_i]:
             _seg_wall_bands(bands, scene, bsp, si, px, py, pa,
                             F, hc, iw, ih, eye, view,
-                            clip_top, clip_bot, flat_spans, view_buf)
+                            clip_top, clip_bot, flat_spans, view_buf,
+                            solid_depth)
     # ---- Phase B: visplane flats (task 4.3) ----
     if flat_spans:
         if gs.flat_textured and HAVE_NP:

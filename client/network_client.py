@@ -53,7 +53,8 @@ class NetworkClient:
         self.map_format: int = 0
         self.party_list: list[dict] = []
         self.last_error: str | None = None
-        self.latest_state: tuple[int, list[dict], list[dict], list[dict], list[dict], str, list[dict]] | None = None
+        # (tick, players, enemies, bullets, corpses, mode, impacts, items, doors)
+        self.latest_state: tuple[int, list[dict], list[dict], list[dict], list[dict], str, list[dict], list[dict], list[dict]] | None = None
         # Recent (recv_time, state) history for interpolation; trimmed to a
         # small window so the renderer can blend between two consecutive states.
         self.snapshots: list[tuple[float, tuple]] = []
@@ -344,14 +345,17 @@ class NetworkClient:
         logger.warning(f"Join failed: {self.last_error}")
 
     def _handle_world_state(self, packet: Packet) -> None:
-        tick, players, enemies, bullets, corpses, mode, impacts = decode_world_state(packet.payload)
-        state = (tick, players, enemies, bullets, corpses, mode, impacts)
+        (tick, players, enemies, bullets, corpses,
+         mode, impacts, items, doors) = decode_world_state(packet.payload)
+        state = (tick, players, enemies, bullets, corpses, mode, impacts, items,
+                 doors)
         self.latest_state = state
         self.snapshots.append((time.monotonic(), state))
         if len(self.snapshots) > 3:
             del self.snapshots[:-3]
         if self._on_state_callback:
-            self._on_state_callback(tick, players, enemies, bullets, corpses, mode, impacts)
+            self._on_state_callback(tick, players, enemies, bullets,
+                                    corpses, mode, impacts, items, doors)
 
     @staticmethod
     def _angle_diff(a: float, b: float) -> float:
@@ -406,8 +410,8 @@ class NetworkClient:
         ``t`` may exceed 1 during bounded extrapolation. The local player is
         always taken from the newest snapshot (no interpolation delay).
         """
-        _t0, p0, e0, b0, _c0, _m0, _im0 = st0
-        _t1, p1, e1, b1, c1, mode1, im1 = st1
+        _t0, p0, e0, b0, _c0, _m0, _im0, _it0, _d0 = st0
+        _t1, p1, e1, b1, c1, mode1, im1, it1, d1 = st1
 
         old_players = {p['id']: p for p in p0}
         players = []
@@ -450,7 +454,13 @@ class NetworkClient:
             })
 
         bullets = self._blend_bullets(b0, b1, t)
-        return _t1, players, enemies, bullets, c1, mode1, im1
+        # Pickups are not interpolated: they never move, so blending them would
+        # only smear a disappearance across the pickup radius. They come from
+        # the newer snapshot, i.e. they vanish the instant the server takes them.
+        # Doors are interpolated by the renderer from their ``progress`` and are
+        # likewise taken from the newer snapshot (a door that has just started
+        # moving must not lag a snapshot behind).
+        return _t1, players, enemies, bullets, c1, mode1, im1, it1, d1
 
     def interpolated_state(self, now: float):
         """Smooth state for rendering at ``now`` (remote entities interpolated).

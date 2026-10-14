@@ -34,9 +34,11 @@ async def main():
 
     await asyncio.sleep(0.3)
     assert c1.latest_state is not None
-    tick, players, enemies, bullets, corpses, mode, impacts = c1.latest_state
+    (tick, players, enemies, bullets, corpses, mode, impacts, items,
+     _doors) = c1.latest_state
     print(f"tick={tick} players={len(players)} enemies={len(enemies)} "
-          f"bullets={len(bullets)} corpses={len(corpses)} mode={mode} impacts={len(impacts)}")
+          f"bullets={len(bullets)} corpses={len(corpses)} mode={mode} "
+          f"impacts={len(impacts)} items={len(items)}")
     assert len(players) == 2, players
     assert mode == 'pve', mode
     assert enemies, "no enemies spawned"

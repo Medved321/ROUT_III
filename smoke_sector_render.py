@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -17,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pygame  # noqa: E402
 
+from engine import constants as const  # noqa: E402
 from engine import game_state as gs  # noqa: E402
 from shared.sector_map import (  # noqa: E402
     LineDef, Sector, SectorMap, SideDef, Thing, Vertex,
@@ -320,8 +322,13 @@ def _two_rooms(solid=False, floor_b=0, lower="-"):
         sm.sidedefs[ld.front].mid = "near_wall" if li < 3 else "far_wall"
     wall = _line(sm, 512, 0, 512, 512, 0, 1)
     sm.linedefs[wall].solid = solid
+    # The step lip carries the CAMERA-facing face's lower texture; which face
+    # that is depends on the winding the sector-polygon closure forces on the
+    # shared line, so set the assigned lower/fallback on BOTH sidedefs and
+    # assert the lip uses it (not the neutral fallback) no matter the side.
     sm.sidedefs[sm.linedefs[wall].front].mid = "wall"
     sm.sidedefs[sm.linedefs[wall].front].lower = lower
+    sm.sidedefs[sm.linedefs[wall].back].lower = lower
     sm.things.append(Thing(256, 256))
     assert not sm.validate(), sm.validate()
     return sm, wall
@@ -378,11 +385,17 @@ def test_solid_wall_and_step():
         f"z-buffer must stop at the solid wall: {z_b[mid]}"
     at_mid = [b[3] for b in bands if b[0] == mid]
     assert at_mid, "the solid wall must contribute bands"
-    assert all(t == "wall" for t in at_mid), \
-        f"only the front mid texture may show, got {set(at_mid)}"
+    # Only the solid wall's OWN depth may visibly show: the back-face cull
+    # (sector-step-down-pit) makes the twin facing the camera the sole owner
+    # of the column, so any band deeper than the wall (e.g. the far room's
+    # far wall, if an intra-leaf order drew it first) is overpainted and must
+    # not leak into what the column shows.
+    visible = {b[3] for b in bands if b[0] == mid and b[10] <= 256.0 + 1.0}
+    assert visible and all(t == "wall" for t in visible), \
+        f"only the front mid texture may visibly show, got {visible}"
 
     # a floor step still renders as an open step, and the lower lip carries the
-    # front side's lower texture
+    # camera-facing face's lower texture (assigned on both faces above)
     sm, wall = _two_rooms(floor_b=16, lower="step_low")
     sc = scene_from(sm)
     assert sc.two_sided[wall] is True, "a step stays a portal"
@@ -404,6 +417,157 @@ def test_solid_wall_and_step():
     z_b, _bands = _render(sm)
     assert z_b[mid] > 512
     print("  solid wall + step  OK")
+
+
+def _grid_map(nx=3, ny=3, cell=512, pillars=((1, 1), (2, 0), (0, 2))):
+    """Grid of equal-height cells — one sector each — portals between them.
+
+    Several subsectors per map (task 3.1): every cell is its own sector, the
+    partitions are two-sided lines with equal floor/ceiling heights (so they
+    pinch no lips and emit no bands), and the pillars are one-sided islands.
+    Front-side convention as in ``_make_room``: the front sector lies on the
+    LEFT of ``v1 -> v2``.
+    """
+    sm = SectorMap()
+    for _ in range(nx * ny):
+        sm.sectors.append(Sector(floor_h=0, ceil_h=128, light=160))
+
+    def sec(i, j):
+        return j * nx + i
+
+    w, h = nx * cell, ny * cell
+    # outer one-sided boundary, split at every grid vertex
+    for i in range(nx):
+        _line(sm, i * cell, 0, (i + 1) * cell, 0, sec(i, 0))
+        _line(sm, (i + 1) * cell, h, i * cell, h, sec(i, ny - 1))
+    for j in range(ny):
+        _line(sm, 0, (j + 1) * cell, 0, j * cell, sec(0, j))
+        _line(sm, w, j * cell, w, (j + 1) * cell, sec(nx - 1, j))
+    # internal two-sided portals, split at every grid vertex
+    for i in range(1, nx):
+        for j in range(ny):
+            _line(sm, i * cell, j * cell, i * cell, (j + 1) * cell,
+                  sec(i - 1, j), sec(i, j))
+    for j in range(1, ny):
+        for i in range(nx):
+            _line(sm, (i + 1) * cell, j * cell, i * cell, j * cell,
+                  sec(i, j - 1), sec(i, j))
+    # pillars (one-sided islands): CW loop keeps the front side — and with it
+    # the surrounding cell — on the left of every edge
+    for ci, cj in pillars:
+        x0, y0 = ci * cell + 64, cj * cell + 64
+        s = sec(ci, cj)
+        _line(sm, x0, y0, x0, y0 + 64, s)
+        _line(sm, x0, y0 + 64, x0 + 64, y0 + 64, s)
+        _line(sm, x0 + 64, y0 + 64, x0 + 64, y0, s)
+        _line(sm, x0 + 64, y0, x0, y0, s)
+    sm.things.append(Thing(cell // 2, cell // 2))
+    errs = sm.validate()
+    assert not errs, errs
+    return sm
+
+
+def _solid_segments(sm):
+    """World segments a ray is stopped by: one-sided or solid-flagged."""
+    segs = []
+    for ld in sm.linedefs:
+        if not (ld.back < 0 or ld.solid):
+            continue
+        a, b = sm.verts[ld.v1], sm.verts[ld.v2]
+        segs.append((a.x, a.y, b.x, b.y))
+    return segs
+
+
+def _ref_solid_depth(segs, px, py, pa, iw):
+    """Per internal column: view-axis depth of the nearest solid the ray hits.
+
+    Independent of the renderer (raw linedefs, no BSP, no clip state) — the
+    эталон for the differential check of task 3.1.
+    """
+    ca, sa = math.cos(pa), math.sin(pa)
+    tan_h = math.tan(const.FOV * 0.5)
+    refs = [math.inf] * iw
+    for col in range(iw):
+        k = (2.0 * ((col + 0.5) / iw) - 1.0) * tan_h
+        rx, ry = ca - k * sa, sa + k * ca
+        best = math.inf
+        for (ax, ay, bx, by) in segs:
+            dx, dy = bx - ax, by - ay
+            den = rx * dy - ry * dx
+            if abs(den) < 1e-12:
+                continue
+            w = ((ax - px) * dy - (ay - py) * dx) / den
+            if w <= 1e-9:
+                continue
+            s = ((ax - px) * ry - (ay - py) * rx) / den
+            if s < 0.0 or s > 1.0:
+                continue
+            t = w * (rx * ca + ry * sa)
+            if 0.0 < t < best:
+                best = t
+        refs[col] = best
+    return refs
+
+
+def test_near_wall_ordering():
+    """Order-independent near-solid occlusion (task 3.1).
+
+    Sweep angles and positions over the grid map, capture every band the
+    renderer hands to ``_draw_wall_bands`` and compare the MINIMUM drawn
+    depth of each column with the analytic nearest solid along that column's
+    ray.  A farther solid wall processed before a nearer one used to close
+    the column and evict it, which shows up exactly here: everything drawn
+    in the column is deeper than the true nearest wall.
+    """
+    sm = _grid_map()
+    segs = _solid_segments(sm)
+    iw = 1000 // 4
+    positions = [(256, 256), (768, 256), (1280, 256),
+                 (256, 768), (768, 768), (1280, 768),
+                 (256, 1280), (768, 1280), (1280, 1280),
+                 (640, 768), (860, 700), (768, 400)]
+    angles = [0.0, 0.6, 1.2, math.pi / 2, 2.1, 3.0, 3.6, 4.2,
+              3 * math.pi / 2, 5.3, -0.5, -1.3]
+    cols_total = 0
+    for (px, py) in positions:
+        for pa in angles:
+            _z, bands = _render(sm, px, py, pa, record_bands=True)
+            refs = _ref_solid_depth(segs, px, py, pa, iw)
+            by_col = {}
+            for b in bands:
+                by_col.setdefault(b[0], []).append(b[10])
+            for col in range(iw):
+                ref = refs[col]
+                if not math.isfinite(ref):
+                    continue
+                cols_total += 1
+                ts = by_col.get(col, [])
+                eps = max(1.0, 1e-3 * ref)
+                assert ts and min(ts) <= ref + eps, \
+                    (px, py, pa, col, round(ref, 1),
+                     [round(t, 1) for t in ts[:6]])
+    assert cols_total > 10000, cols_total
+    print("  near wall ordering OK")
+
+
+def test_on_vertex_observer():
+    """Observer exactly level with a vertex (task 3.2).
+
+    ``pa = 0.0`` gives ``ca = 1.0, sa = 0.0`` exactly, so a seg endpoint with
+    ``x == px`` yields ``t1 == 0.0``; the near-plane clip used to test
+    ``t1 < 0.0`` and the frame died with ``ZeroDivisionError`` a few lines
+    below.  Integer poses, integer angles — no exception and a real frame.
+    """
+    sm = _grid_map()
+    for px, py, pa in ((640, 768, 0.0),        # pillar vertex x = 640
+                       (1152, 768, 0.0),       # pillar vertex x = 1152
+                       (640, 768, math.pi),
+                       (768, 1152, math.pi / 2)):
+        z_b, _ = _render(sm, px, py, pa)
+        assert z_b and all(0.0 < v <= 1400.0 for v in z_b), (px, py, pa, z_b)
+        assert min(z_b) < 1400.0, \
+            f"pose ({px},{py},{pa}) drew no wall at all"
+    print("  on-vertex observer  OK")
 
 
 def test_coop_player_render():
@@ -478,6 +642,8 @@ def main():
     test_coop_player_render()
     test_tier_frames()
     test_solid_wall_and_step()
+    test_near_wall_ordering()
+    test_on_vertex_observer()
     test_strip_cache_two_frames()
     test_adaptive_ladder()
     print("smoke_sector_render: ALL OK")

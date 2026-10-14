@@ -93,8 +93,12 @@ def test_bridge_particles_and_render():
     b.render()
     empty = pygame.image.tostring(gs.screen, 'RGB')
 
-    # frame with a from_player ball in front of the camera
-    b.update(500.0, 500.0, 0.0, 200, [], [], [{'x': 560.0, 'y': 500.0, 'col': (40, 60, 40),
+    # frame with a from_player ball, off centre and well above the HUD bar and
+    # the weapon model (centre-bottom): an orb painted behind either of them is
+    # real behaviour but not an observable one, and a frame comparison only
+    # works where the ball is actually visible.
+    b.update(500.0, 500.0, 0.0, 200, [], [], [{'x': 782.0, 'y': 397.0,
+                                               'col': (40, 60, 40),
                                                'from_player': True}], [], 3,
              {'pstl': 10, 'shl': 10, 'slg': 10, 'rck': 10, 'BFG': 10}, 0, 'pve')
     b.render()
@@ -138,14 +142,22 @@ def test_damage_on_flight():
     handle_shoot(w, eid)
     assert w.enemies[0]['hp'] == 4, "instant damage"
     ticks = 0
-    reached = False
+    killed = False
     while ticks < 30:
         w.update()
         ticks += 1
-        if not w.enemies or w.enemies[0]['hp'] <= 0:
-            reached = True
+        # A kill is observed as hp == 0 and stays that way: enemies no longer
+        # have a respawn timer of their own, a player's death restarts the
+        # wave (see smoke_respawn).  What must not happen is either silent
+        # revival or the record being dropped from the list.
+        if w.enemies and w.enemies[0]['hp'] == 0:
+            killed = True
             break
-    assert reached, "ball never hit the enemy"
+    assert killed, "ball never hit the enemy"
+    assert w.enemies[0]['a'] is False, w.enemies[0]
+    for _ in range(10):
+        w.update()
+    assert w.enemies[0]['hp'] == 0, "a dead enemy came back on its own"
     # snapshot carries from_player flag for client render
     states = w.get_bullet_states()
     assert all('from_player' in b for b in states)

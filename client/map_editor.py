@@ -78,7 +78,8 @@ ENEMY_NAMES = {
 }
 ITEM_NAMES = {'m': 'med', 'a': 'amm', 'k': 'berserk', 'h': 'haste', 'i': 'invuln',
               'w': 'wpn_0', 'u': 'wpn_2', 't': 'wpn_3', 'j': 'wpn_4', 'o': 'wpn_5',
-              'd': 'heart', 'e': 'armor_green', 'f': 'armor_blue'}
+              'd': 'heart', 'e': 'armor_green', 'f': 'armor_blue',
+              'r': 'key_red', 'y': 'key_yellow', 'b': 'key_blue'}
 
 
 class TileEditor:

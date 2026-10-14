@@ -10,6 +10,13 @@ TICK_RATE = 20
 TICK_INTERVAL = 1.0 / TICK_RATE
 FPS_60 = 60.0
 
+# How many ticks the game loop may run back-to-back inside one wake-up to catch
+# up on missed periods (see GameServer._game_loop). Bounded, because draining
+# an unbounded backlog in a single wake-up is what turns a stall into a freeze:
+# the loop spends all its time replaying the past instead of accepting packets
+# and answering the current one.
+TICK_DRAIN_MAX = 4
+
 
 def fps60_per_tick(px_per_frame: float) -> float:
     """ROUT_II_III speed (px/frame @60fps) -> px/tick."""
@@ -44,6 +51,70 @@ START_INITIAL_AMMO = {
 }
 
 AMMO_KEYS = ('pstl', 'shl', 'slg', 'rck', 'BFG')
+# Carrying reserve per ammo key.  This is the rule (a pickup that would push a
+# stack past it stops at it), not a wire detail: WORLD_STATE packs each ammo
+# slot as one byte, and an uncapped stack -- the old ``min(999, ...)`` -- grew
+# past 255 within a few pickups and took the whole game loop down with
+# ``struct.error: 'B' format requires 0 <= number <= 255`` in the broadcast.
+# 255 is therefore the largest reserve that reaches the client intact; the
+# encoder clamps as a guard, but the cap is enforced where ammo is granted so
+# the server and the HUD never disagree about a number.
+AMMO_MAX = 255
+
+# --- items -----------------------------------------------------------------
+# Pickup radius in px. Half a tile, not the engine's unused ITEM_PICKUP_DIST = 90:
+# 90 px is wider than a TILE, so an item would be taken from the far side of a
+# corridor the player is only looking down. Player radius is 16 and an item is
+# about as wide, so this is "walked over", not "in sight of".
+ITEM_PICKUP_DIST = 32.0
+# Taken items have no respawn timer any more: they come back only when the wave
+# restarts on a player's death (see `GameWorld._reset_items`).
+# engine/constants.py still declares an unused 60 fps ITEM_RESPAWN_TICKS from
+# the port; nothing reads it.
+# Armor soaks a hit completely before HP does. Not a third of the damage like
+# classic Doom: the HUD shows one integer, so a partial absorb would need a
+# second number nobody displays.
+ARMOR_MAX = 200
+# HASTE multiplies walking speed, BERSERK doubles damage and makes shots free,
+# INVULN refuses damage outright. Durations are in ticks.
+HASTE_SPEED_MULT = 1.5
+BERSERK_DMG_MULT = 2
+
+# Every placeable item type, keyed by the name the editor palette writes.
+# ``wpn_1`` is absent on purpose: the pistol is the starting weapon, so there is
+# nothing to pick up. A weapon entry names the WPN index and the ammo it grants;
+# a chainsaw (index 0) has no ammo key and grants none.
+ITEM_DB = {
+    'med':         {'kind': 'health',  'hp': 25},
+    'med_small':   {'kind': 'health',  'hp': 10},
+    'heart':       {'kind': 'health',  'hp': 100},
+    'amm':         {'kind': 'ammo',    'amount': 25},
+    'amm_small':   {'kind': 'ammo',    'amount': 10},
+    'armor_green': {'kind': 'armor',   'points': 100, 'armor_type': 'green'},
+    'armor_blue':  {'kind': 'armor',   'points': 200, 'armor_type': 'blue'},
+    'berserk':     {'kind': 'powerup', 'pu': 'BERSERK',
+                     'ticks': TICK_RATE * 60},
+    'haste':       {'kind': 'powerup', 'pu': 'HASTE', 'ticks': TICK_RATE * 20},
+    'invuln':      {'kind': 'powerup', 'pu': 'INVULN', 'ticks': TICK_RATE * 30},
+    'key_red':     {'kind': 'key', 'lock': 'red'},
+    'key_yellow':  {'kind': 'key', 'lock': 'yellow'},
+    'key_blue':    {'kind': 'key', 'lock': 'blue'},
+    'wpn_0':       {'kind': 'weapon',  'wpn': 0, 'ammo': 0},
+    'wpn_2':       {'kind': 'weapon',  'wpn': 2, 'ammo': 10},
+    'wpn_3':       {'kind': 'weapon',  'wpn': 3, 'ammo': 30},
+    'wpn_4':       {'kind': 'weapon',  'wpn': 4, 'ammo': 3},
+    'wpn_5':       {'kind': 'weapon',  'wpn': 5, 'ammo': 10},
+}
+
+# --- doors -----------------------------------------------------------------
+# A door is a two-sided linedef whose ``special`` marks it (SPECIAL_DOORS) and
+# whose middle texture names its lock.  The runtime state (phase / how far open /
+# hold timer) lives on GameWorld, never on the immutable map data (design D2).
+# A door blocks movement, sight, hitscans and projectiles until it is fully open.
+DOOR_OPEN_TICKS = 20     # 1.0 s at TICK_RATE = 20
+DOOR_HOLD_TICKS = 100    # 5.0 s fully open before it closes again
+DOOR_CLOSE_TICKS = 20    # 1.0 s to shut; reverses if the gap is occupied
+DOOR_USE_DIST = 64.0     # one tile: how far ahead "use" reaches for a door
 
 # --- combat ---------------------------------------------------------------
 MELEE_RANGE = 35
@@ -97,6 +168,12 @@ STRAFE_FACTOR = 0.6
 WANDER_SPEED_FACTOR = 0.4
 DIAGONAL_COST = 1.414
 CORPSE_LIFETIME = 600       # ticks (30 s at 20 tps)
+# Death -> back in the fight. One tick, not zero: the corpse and the death flash
+# are the only feedback that the player died at all, so the player is gone from
+# the snapshot for at least one tick before coming back.
+# Enemies have no timer of their own: a killed enemy stays down until a player
+# dies, and that death restarts the whole wave (see GameWorld._reset_enemies).
+PLAYER_RESPAWN_TICKS = 1
 
 CORPSE_COLORS = {
     'soldier': (160, 80, 80), 'shotgunguy': (180, 120, 50), 'chaingunner': (130, 130, 140),
