@@ -18,6 +18,8 @@ surfaces.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
+
 try:
     import numpy as np
 
@@ -80,15 +82,18 @@ def strip_height_for_bucket(edges, k: int, max_h: int) -> int:
 class WallStripCache:
     """Lazy, bounded cache of lit wall columns and distance-bucket strips."""
 
-    __slots__ = ("max_bytes", "_tex", "_lit", "_strips", "_lru", "_bytes",
+    __slots__ = ("max_bytes", "_tex", "_lit", "_strips", "_bytes",
                  "hits", "misses", "_bucket_edges", "_bucket_h", "_view")
 
     def __init__(self, max_bytes: int = 6 * 1024 * 1024) -> None:
         self.max_bytes = int(max_bytes)
         self._tex = {}      # id(surface) -> row-major RGB bytes
         self._lit = {}      # (id, level) -> column-major lit bytes
-        self._strips = {}   # (id, level, bucket) -> column-major strip bytes
-        self._lru = []      # LRU order of strip keys
+        # (id, level, bucket) -> column-major strip bytes, in LRU order: the
+        # leftmost entry is the least recently used. An OrderedDict keeps the
+        # recency bump O(1); the old list+``remove`` was O(n) per cache hit,
+        # i.e. O(columns) linear scans per frame on the wall path.
+        self._strips = OrderedDict()
         self._bytes = 0
         self.hits = 0
         self.misses = 0
@@ -125,13 +130,11 @@ class WallStripCache:
             self._lit.pop(k)
         for k in [kk for kk in self._strips if kk[0] == tid]:
             self._bytes -= len(self._strips.pop(k))
-        self._lru = [k for k in self._lru if k[0] != tid]
 
     def clear_tex(self) -> None:
         self._tex.clear()
         self._lit.clear()
         self._strips.clear()
-        self._lru.clear()
         self._bytes = 0
 
     # ── level 1: lit columns (task 2.1) ----------------------------
@@ -202,25 +205,19 @@ class WallStripCache:
         # Bucket heights changed: existing strips no longer match the bucket
         # geometry (view changes are rare — settings), so drop them.
         self._strips.clear()
-        self._lru.clear()
         self._bytes = 0
 
     def bucket_heights(self) -> list:
         return list(self._bucket_h)
 
     def _bump(self, key) -> None:
-        try:
-            self._lru.remove(key)
-        except ValueError:
-            pass
-        self._lru.append(key)
+        # O(1) recency bump; the entry is known to exist (called on a hit).
+        self._strips.move_to_end(key)
 
     def _evict(self) -> None:
-        while self._bytes > self.max_bytes and self._lru:
-            key = self._lru.pop(0)
-            data = self._strips.pop(key, None)
-            if data is not None:
-                self._bytes -= len(data)
+        while self._bytes > self.max_bytes and self._strips:
+            key, data = self._strips.popitem(last=False)
+            self._bytes -= len(data)
 
     def strip(self, tex, light: int, bucket: int) -> bytes | None:
         """Full 64-column strip for (surface, light, distance bucket) with all
@@ -256,7 +253,6 @@ class WallStripCache:
             data = bytes(out)
         self._bytes += len(data)
         self._strips[key] = data
-        self._lru.append(key)
         self._evict()
         return data
 

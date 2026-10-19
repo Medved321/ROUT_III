@@ -179,6 +179,11 @@ class SectorEditor:
         self.sm = sm if sm is not None else new_room(1600.0, 1600.0)
         self.snap_on = True
         self.snap_step = GRID_DEFAULT
+        # Create-time policy for `sector_from_contour`: when on, each contour
+        # edge gets the `solid` flag, so the new room is sealed by opaque walls
+        # instead of being an open portal to its neighbour. Off by default --
+        # the historic behaviour is a portal.
+        self.solid_on_create = False
         self.cur_sector = 0
         self.cur_line_mid = "wall"
         self._history: list[dict] = []
@@ -1001,6 +1006,7 @@ class SectorEditor:
             # survive the split instead of dropping back to "-"
             self.sides[ld.back].upper = outer.upper
             self.sides[ld.back].lower = outer.lower
+            ld.solid = self.solid_on_create
         self._after_mutate()
         return new_id, []
 

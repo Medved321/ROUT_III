@@ -94,6 +94,27 @@ def test_player_death_is_published_at_least_one_snapshot():
     print("player death visible in a snapshot OK")
 
 
+def test_player_respawn_refills_the_ammo_reserve():
+    """The reserve emptied by fighting comes back full; guns/selection do not."""
+    w = GameWorld(mode='pve')
+    eid = w.add_player(1, 'P')
+    wp = w.entities.get_component(eid, WeaponComponent)
+    spent = {'pstl': 0, 'shl': 3, 'slg': 100, 'rck': 0, 'BFG': 0}
+    lost_guns = {0, 1}
+    wp.ammo.update(spent)
+    wp.owned.clear()
+    wp.owned.update(lost_guns)
+    wp.current = 0
+
+    w.damage_player(eid, 1000)
+    w.update()
+
+    assert dict(wp.ammo) == dict(WeaponComponent().ammo), wp.ammo
+    assert wp.owned == lost_guns, wp.owned
+    assert wp.current == 0, wp.current
+    print("player respawn refills ammo, keeps guns OK")
+
+
 def test_player_respawn_clears_dash_and_cooldowns():
     """A player killed mid-dash must not keep dashing out of the respawn point."""
     w = GameWorld(mode='pve')
@@ -350,6 +371,7 @@ if __name__ == '__main__':
     test_player_respawn_is_immediate()
     test_player_death_is_published_at_least_one_snapshot()
     test_player_respawn_clears_dash_and_cooldowns()
+    test_player_respawn_refills_the_ammo_reserve()
     test_all_death_paths_schedule_a_respawn()
     test_input_does_not_clear_death_state()
     test_remove_player_forgets_start_point()

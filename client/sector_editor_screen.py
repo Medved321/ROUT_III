@@ -65,7 +65,7 @@ TEX_ROW_H = 15
 BASE_CHIPS_H = 48
 HINT_BLOCK_H = 34
 TEX_CHIP_NAMES = {"front": "ПЕРЕД", "back": "ЗАД",
-                   "lower": "НИЗ", "upper": "ВЕРХ"}
+                   "mid": "СТЕНА", "lower": "НИЗ", "upper": "ВЕРХ"}
 # map picker: row pitch of the dropdown, and the padding kept below the last
 # visible row so the box never reaches the window edge
 MAP_ROW_H = 22
@@ -151,6 +151,8 @@ class SectorEditorScreen:
 
     def _button_labels(self) -> dict[str, str]:
         return {"mode": "Тайлы ▶", "snap": "Сетка ✓" if self.editor.snap_on else "Сетка",
+                "walls": "Стены: сплошные ✓" if self.editor.solid_on_create
+                else "Стены: проём",
                 "undo": "Отмена", "redo": "Повтор", "save": "Сохранить",
                 "load": "Загрузить", "play": "▶ Играть", "back": "Назад",
                 "save_mts": "Сохранить .mts", "load_mts": "Открыть .mts"}
@@ -158,8 +160,9 @@ class SectorEditorScreen:
     def _build_toolbar(self) -> dict[str, pygame.Rect]:
         """Bottom toolbar: one button per action, sized to its own label.
 
-        ``snap`` toggles its label ("Сетка" / "Сетка ✓"), so the row is rebuilt
-        whenever that changes; the widths only ever grow by the tick glyph, and
+        ``snap`` and ``walls`` toggle their labels ("Сетка" / "Сетка ✓",
+        "Стены: проём" / "Стены: сплошные ✓"), so the row is rebuilt whenever
+        either changes; the widths only ever grow by the tick glyph, and
         ``_build_toolbar`` is cheap enough to call from the toggle.
         """
         labels = self._button_labels()
@@ -240,7 +243,13 @@ class SectorEditorScreen:
         self._tex_chips = {}
         self._tex_label_y = y
         y += 16
-        cw = (w - 12) // 4
+        # Every chip (front/back side + mid/lower/upper slot) has to sit on the
+        # same row inside the panel: the row height feeds the value line and the
+        # swatch grid below, so a fixed 4-wide pitch would push the fifth chip
+        # (the new STENA/mid slot) past the panel edge — the drawn box and the
+        # hit-box are the same rect, so it would simply stop being clickable.
+        n = len(TEX_CHIP_NAMES)
+        cw = max(28, (w - (n - 1) * 4) // n)
         for i, (key, name) in enumerate(TEX_CHIP_NAMES.items()):
             rect = pygame.Rect(x + i * (cw + 4), y, cw, 18)
             self._tex_chips[key] = rect
@@ -328,6 +337,14 @@ class SectorEditorScreen:
     def _set_sel(self, thing=None, line=None, vertex=None, sector=None) -> None:
         self.sel_thing, self.sel_line, self.sel_vertex, self.sel_sector = (
             thing, line, vertex, sector)
+        # Point the wall-texture palette at the slot that is actually DRAWN for
+        # this line, so a click on a swatch changes what is on screen. An opaque
+        # (solid) wall is painted from its MAIN texture (mid); a portal's visible
+        # faces are its step lips (lower/upper), and the renderer never draws a
+        # mid band for a two-sided opening. The chip still lets the author pick
+        # any slot by hand; this is only the default when the selection moves.
+        if line is not None and self.editor.line_two_sided(line):
+            self._tex_target = "mid" if self.editor.lines[line].solid else "lower"
 
     def _sync_sel(self) -> None:
         """Drop a selection that no longer points at a live entity.
@@ -511,7 +528,7 @@ class SectorEditorScreen:
         if k == pygame.K_g:
             self.editor.snap_on = not self.editor.snap_on
             self._dirty()
-            self._snap_label_changed()
+            self._toolbar_changed()
             return None
         if k == pygame.K_f:
             self.frame_around()
@@ -645,12 +662,14 @@ class SectorEditorScreen:
                 return None
         return None
 
-    def _snap_label_changed(self) -> None:
-        """Re-lay the toolbar when "Сетка" gains its tick.
+    def _toolbar_changed(self) -> None:
+        """Re-lay the toolbar when a ticked label grows.
 
-        The label is the button's width, so the row shifts by the width of the
-        tick glyph. Re-running the layout keeps the hitboxes equal to the drawn
-        boxes instead of letting the label poke out of its own button.
+        "Сетка" and "Стены: проём" gain a tick glyph when toggled, and the
+        label is the button's width, so the row shifts and may wrap to another
+        row. Re-running the layout keeps the hitboxes equal to the drawn boxes
+        instead of letting a label poke out of its own button or the canvas
+        start under the toolbar.
         """
         self.buttons = self._build_toolbar()
         self.canvas.height = self.height - 56 - self._toolbar_h - 8
@@ -663,7 +682,17 @@ class SectorEditorScreen:
         if key == "snap":
             self.editor.snap_on = not self.editor.snap_on
             self._dirty()
-            self._snap_label_changed()
+            self._toolbar_changed()
+            return None
+        if key == "walls":
+            # Creation-time policy only: flips what `sector_from_contour` will
+            # flag on the NEXT sector. Existing linedefs are untouched -- the
+            # per-wall "сплошная" chip is how an author edits those.
+            self.editor.solid_on_create = not self.editor.solid_on_create
+            self.status = ("Новые сектора: глухие стены"
+                           if self.editor.solid_on_create
+                           else "Новые сектора: проёмы")
+            self._toolbar_changed()
             return None
         if key == "undo":
             self.editor.undo()
@@ -703,7 +732,8 @@ class SectorEditorScreen:
             return None
         self.contour = []
         self._set_sel(sector=sec)
-        self.status = f"Сектор {sec} создан"
+        walls = "глухие стены" if self.editor.solid_on_create else "проёмы"
+        self.status = f"Сектор {sec} создан ({walls})"
         self._dirty()
         return None
 

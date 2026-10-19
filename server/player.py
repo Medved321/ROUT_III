@@ -30,7 +30,12 @@ class PlayerSession:
     # to the client in the WORLD_STATE player record so a refused shot is
     # visible instead of being dropped in silence.
     last_fire_result: FireResult | None = None
-    last_ping: float = 0.0
+    # Last time the session was heard from. It starts at creation, not at 0: a
+    # session that never sends a PING must still time out. With a 0 default the
+    # stale filter's `last_ping > 0` guard skipped such a session forever, so a
+    # client that completed the handshake and joined but never pinged lived on
+    # the server for the whole uptime.
+    last_ping: float = field(default_factory=time.monotonic)
     ping_rtt: float = 0.0
     sequence: int = 0
     last_received_seq: int = 0

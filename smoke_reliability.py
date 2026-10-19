@@ -15,7 +15,8 @@ from shared.releases import artifact_path, latest_version, write_latest_pointer
 from shared.version import CLIENT_VERSION, PROTOCOL_VERSION
 from server.server import GameServer
 from client.network_client import NetworkClient
-from client.updater import UpdateError, apply_update, restart, rollback
+from client.updater import (
+    UpdateError, apply_update, restart, rollback, validate_offer)
 
 
 class LossyChannel:
@@ -235,9 +236,140 @@ async def test_incompatible_protocol_rejected():
     print("incompatible protocol rejected OK")
 
 
+def test_reassembly_is_bounded():
+    from shared.protocol import encode_reliable
+    from shared import reliability as rel
+    channel = LossyChannel(0, loss=0.0, dup=0.0, jitter=0.0)
+    receiver = ReliableEndpoint(channel.wire('send'), clock=lambda: channel.now)
+    # Many never-completed fragmented messages, one per inner type: without the
+    # entry cap, `_reasm` would grow with the number of streams.
+    seq = 0
+    for inner in range(1, 200):
+        receiver.on_reliable(seq, encode_reliable(0, 0, inner, 0, 2, b'x' * 100))
+        seq = (seq + 2) & 0xFFFF
+    assert len(receiver._reasm) <= rel.MAX_REASSEMBLY_ENTRIES, len(receiver._reasm)
+
+    # An index at or past the declared count can never complete: rejected with
+    # no parts buffered.
+    fresh = ReliableEndpoint(channel.wire('send'), clock=lambda: channel.now)
+    fresh.on_reliable(0, encode_reliable(0, 0, 5, 7, 3, b'x' * 100))
+    assert 5 not in fresh._reasm, fresh._reasm
+    assert fresh.pop_failed() == [5], fresh.failed_transfers
+
+    # The byte budget is a hard ceiling: buffering past it drops the message
+    # rather than growing. Lower it so the test stays cheap.
+    original = rel.MAX_REASSEMBLY_BYTES
+    rel.MAX_REASSEMBLY_BYTES = 1000
+    try:
+        capped = ReliableEndpoint(channel.wire('send'), clock=lambda: channel.now)
+        capped.on_reliable(0, encode_reliable(0, 0, 6, 0, 4, b'a' * 600))
+        capped.on_reliable(1, encode_reliable(0, 0, 6, 1, 4, b'b' * 600))
+        assert capped._reasm_bytes <= rel.MAX_REASSEMBLY_BYTES, capped._reasm_bytes
+    finally:
+        rel.MAX_REASSEMBLY_BYTES = original
+
+    # A normal completion nets the byte counter back to zero.
+    done = ReliableEndpoint(channel.wire('send'), clock=lambda: channel.now)
+    done.on_reliable(0, encode_reliable(0, 0, 7, 0, 2, b'hello'))
+    done.on_reliable(1, encode_reliable(0, 0, 7, 1, 2, b' world'))
+    assert done._reasm_bytes == 0, done._reasm_bytes
+    assert done.pop_messages() == [(7, b'hello world')]
+    print("reassembly bounds OK")
+
+
+def test_file_request_is_gated():
+    """FILE_REQUEST is an inner reliable message any handshake-completed peer can
+    send. It must be served only to a client that was actually told an update is
+    pending, and only once per cooldown — otherwise the server is a free,
+    repeatable, multi-megabyte file host."""
+    with tempfile.TemporaryDirectory() as tmp:
+        artifact = b'X' * 1000
+        artifact_path(tmp, "9.9.9").write_bytes(artifact)
+        write_latest_pointer(tmp, "9.9.9")
+        server = GameServer(host="127.0.0.1", port=0, releases_dir=tmp)
+        sent = []
+        server.network.send_file = lambda addr, data: sent.append((addr, len(data)))
+        addr = ("10.0.0.1", 1234)
+
+        # 1. Never said HELLO: refused.
+        server._on_file_request(addr)
+        assert sent == [], sent
+        # 2. Handshake ok but already on the latest version: refused.
+        server.network.client_info[addr] = {"protocol_ok": True, "needs_update": False}
+        server._on_file_request(addr)
+        assert sent == [], sent
+        # 3. Update pending: served exactly once.
+        server.network.client_info[addr] = {"protocol_ok": True, "needs_update": True}
+        server._on_file_request(addr)
+        assert len(sent) == 1 and sent[0][1] == len(artifact), sent
+        # 4. Repeat inside the cooldown: throttled.
+        server._on_file_request(addr)
+        assert len(sent) == 1, sent
+    print("file request gated + throttled OK")
+
+
+def test_client_drops_foreign_datagrams():
+    """The client socket is unconnected, so anyone who guesses the ephemeral
+    port can send datagrams. Only the resolved server address may be processed."""
+    client = NetworkClient("127.0.0.1", 7777)
+    client.server_addr = ("127.0.0.1", 7777)
+    seen = []
+    client._dispatch_datagram = lambda data: seen.append(data)
+    client.datagram_received(b"\x00", ("9.9.9.9", 1))
+    assert seen == [], seen
+    client.datagram_received(b"\x00", ("127.0.0.1", 7777))
+    assert seen == [b"\x00"], seen
+    print("client drops foreign datagrams OK")
+
+
+def test_updater_trust_policy():
+    """The offer travels the same untrusted channel, so the client re-checks it:
+    a downgrade or malformed digest is refused before any bytes are fetched."""
+    # Downgrade to the running version is not newer.
+    for version, digest in [(CLIENT_VERSION, "a" * 64), ("99.0.0", "deadbeef"),
+                            ("99.0.0", ""), ("99.0.0", "z" * 64)]:
+        try:
+            validate_offer(version, 10, digest)
+            raise AssertionError(f"offer accepted: {version!r}/{digest!r}")
+        except UpdateError:
+            pass
+    validate_offer("99.0.0", 10, "a" * 64)
+    print("update offer policy OK")
+
+
+def test_updater_pin():
+    """ROUT_UPDATE_SHA256 is an operator trust anchor: even an artifact whose
+    advertised hash matches is refused when it does not match the pin."""
+    import os
+    with tempfile.TemporaryDirectory() as tmp:
+        data = b"artifact"
+        good = sha256_hex(data)
+        os.environ["ROUT_UPDATE_SHA256"] = good
+        try:
+            path = apply_update(tmp, "9.9.9", data, good)
+            assert path.read_bytes() == data
+        finally:
+            os.environ.pop("ROUT_UPDATE_SHA256", None)
+        os.environ["ROUT_UPDATE_SHA256"] = "0" * 64
+        try:
+            try:
+                apply_update(tmp, "9.9.10", data, good)
+                raise AssertionError("pin mismatch accepted")
+            except UpdateError:
+                pass
+        finally:
+            os.environ.pop("ROUT_UPDATE_SHA256", None)
+    print("update pin enforced OK")
+
+
 def main():
     test_exactly_once_over_loss()
     test_partial_and_corrupt_file()
+    test_reassembly_is_bounded()
+    test_file_request_is_gated()
+    test_client_drops_foreign_datagrams()
+    test_updater_trust_policy()
+    test_updater_pin()
     asyncio.run(test_server_serves_update())
     asyncio.run(test_idempotent_create())
     test_rollback()

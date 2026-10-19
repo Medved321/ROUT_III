@@ -28,6 +28,22 @@ def _newer(a: int, b: int) -> bool:
     return 0 < ((a - b) & 0xFFFF) < 0x8000
 
 
+# Reassembly buffers come from untrusted fragments, and a peer that never
+# completes a message grows `_reasm` without bound: a u16 `count` allows ~65k
+# parts per inner type, each up to a full chunk, so nothing caps memory today.
+# Two bounds fix that -- how many messages may be under reassembly at once, and
+# how many bytes may be buffered in total.  The byte budget is two orders of
+# magnitude above the largest legitimate transfer (the ~12 MB client artifact),
+# so it only ever trips on abuse.  What costs memory is the bytes actually
+# received, not the declared `count`.
+MAX_REASSEMBLY_ENTRIES = 16
+MAX_REASSEMBLY_BYTES = 64 * 1024 * 1024
+# Out-of-order messages waiting for a gap to fill. Delivery is strictly in
+# order and the sender window is 16, so a legitimate receiver holds a few dozen
+# at most; anything approaching this many means the peer is not delivering.
+MAX_READY_BUFFER = 1024
+
+
 @dataclass
 class _Pending:
     seq: int
@@ -70,6 +86,7 @@ class ReliableEndpoint:
         self._highest = -1
 
         self._reasm: dict[int, dict] = {}
+        self._reasm_bytes = 0
         self._expected_sha: dict[int, str] = {}
         self._ready: dict[int, tuple[int, bytes, int]] = {}
         self._next_deliver = 0
@@ -130,6 +147,9 @@ class ReliableEndpoint:
         self.alive = False
         self._pending.clear()
         self._out_queue.clear()
+        self._reasm.clear()
+        self._reasm_bytes = 0
+        self._ready.clear()
 
     # ------------------------------------------------------------ receiving
     def on_reliable(self, seq: int, payload: bytes) -> None:
@@ -147,6 +167,11 @@ class ReliableEndpoint:
         # Always acknowledge so the sender can clear its window (also for dupes).
         self._send_ack()
 
+    def _drop_reasm(self, inner_type: int) -> None:
+        entry = self._reasm.pop(inner_type, None)
+        if entry is not None:
+            self._reasm_bytes -= sum(len(c) for c in entry["parts"].values())
+
     def _store_fragment(self, seq: int, inner_type: int, index: int, count: int, chunk: bytes) -> None:
         base_seq = (seq - index) & 0xFFFF
         if count <= 1:
@@ -154,23 +179,56 @@ class ReliableEndpoint:
             if expected is not None and not verify_sha256(chunk, expected):
                 self._fail_message(inner_type, base_seq, 1)
                 return
+            if len(self._ready) >= MAX_READY_BUFFER:
+                self.mark_dead()
+                return
             self._ready[base_seq] = (inner_type, chunk, 1)
             self._flush_delivery()
             return
-        entry = self._reasm.setdefault(inner_type, {"count": count, "parts": {}})
-        entry["parts"][index] = chunk
+        # Validate the framing before buffering anything. An index at or past
+        # the declared count can never complete, and the same inner type
+        # re-declared with a different count would mix two messages.
+        entry = self._reasm.get(inner_type)
+        if entry is not None and entry["count"] != count:
+            self._drop_reasm(inner_type)
+            entry = None
+        if index >= count:
+            self._drop_reasm(inner_type)
+            self._fail_message(inner_type, base_seq, count)
+            return
+        if entry is None:
+            if len(self._reasm) >= MAX_REASSEMBLY_ENTRIES:
+                self._fail_message(inner_type, base_seq, count)
+                return
+            entry = self._reasm[inner_type] = {"count": count, "parts": {}}
+        if index not in entry["parts"]:
+            if self._reasm_bytes + len(chunk) > MAX_REASSEMBLY_BYTES:
+                # Buffering this fragment would exceed the budget: drop this
+                # message's parts instead of growing without bound.
+                self._drop_reasm(inner_type)
+                self._fail_message(inner_type, base_seq, count)
+                return
+            entry["parts"][index] = chunk
+            self._reasm_bytes += len(chunk)
         if len(entry["parts"]) == entry["count"]:
             parts = entry["parts"]
             data = b"".join(parts[i] for i in range(entry["count"]))
-            del self._reasm[inner_type]
+            self._drop_reasm(inner_type)
             expected = self._expected_sha.pop(inner_type, None)
             if expected is not None and not verify_sha256(data, expected):
                 self._fail_message(inner_type, base_seq, entry["count"])
+                return
+            if len(self._ready) >= MAX_READY_BUFFER:
+                self.mark_dead()
                 return
             self._ready[base_seq] = (inner_type, data, entry["count"])
             self._flush_delivery()
 
     def _fail_message(self, inner_type: int, base_seq: int, count: int) -> None:
+        # Drop any checksum registered for this message: it belonged to a
+        # transfer that will never complete, and keeping it would misjudge the
+        # next message of the same inner type.
+        self._expected_sha.pop(inner_type, None)
         # Keep the delivery order intact: reserve the slot but emit nothing.
         self.failed_transfers.append(inner_type)
         self._ready[base_seq] = (-1, b"", count)

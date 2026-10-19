@@ -29,6 +29,16 @@ from server.weapons import (
 
 logger = logging.getLogger(__name__)
 
+# Minimum seconds between two client artifacts served to the same address.
+# Retransmits of a lost FILE_REQUEST legitimately want a re-send, so the gate is
+# a cooldown rather than "once per session".
+ARTIFACT_RESEND_COOLDOWN = 30.0
+
+# Hard ceiling on concurrent parties. Each party runs its own world and tick, so
+# a flood of sessions (spoofed source ports, each completing HELLO+JOIN before
+# the ping timeout) must not turn into an unbounded number of worlds.
+MAX_PARTIES = 64
+
 
 class GameServer:
     def __init__(self, host: str = "0.0.0.0", port: int = 7777, releases_dir: str | None = None):
@@ -40,6 +50,11 @@ class GameServer:
             )
         self.releases = ReleaseStore(releases_dir)
         self.running = False
+        # Last time a client artifact was sent per address, for the update
+        # channel rate limit. A FILE_REQUEST is an inner reliable message, so
+        # any peer that completed the handshake can send it; without a gate it
+        # re-sends the whole (multi-megabyte) artifact on every datagram.
+        self._artifact_sent_at: dict[tuple[str, int], float] = {}
 
     async def start(self) -> None:
         self.running = True
@@ -96,9 +111,16 @@ class GameServer:
             ticks = 0
             while now - deadline >= TICK_INTERVAL:
                 deadline += TICK_INTERVAL
-                self.lobby.update_all()
-                self._broadcast_parties()
-                self._remove_stale_players()
+                # One bad tick must not end the server: an exception here used
+                # to escape `_game_loop`, stop `while self.running` and kill the
+                # process for every connected player.  Simulation and broadcast
+                # are isolated so the loop keeps a stable deadline.
+                try:
+                    self.lobby.update_all()
+                    self._broadcast_parties()
+                    self._remove_stale_players()
+                except Exception:
+                    logger.exception("Game tick failed; server continues")
                 ticks += 1
                 if ticks >= TICK_DRAIN_MAX:
                     # Fell too far behind (map load, GC pause). Replaying the
@@ -107,7 +129,10 @@ class GameServer:
                     deadline = now
                     break
                 now = time.monotonic()
-            self.network.tick()
+            try:
+                self.network.tick()
+            except Exception:
+                logger.exception("Network tick failed; server continues")
             left = deadline - time.monotonic()
             await asyncio.sleep(left if left > 0.0 else 0.0)
 
@@ -146,16 +171,21 @@ class GameServer:
         removed = False
         for addr in list(self.network.unreachable):
             session = self.network.remove_player(addr)
+            self._artifact_sent_at.pop(addr, None)
             if session:
                 self.lobby.remove_player(session)
                 logger.info(f"Player unreachable, removed: {session.name}")
                 removed = True
+        # `last_ping` starts at session creation, so a session that joined but
+        # never pinged is timed out like any other; there is no `> 0` guard
+        # because a positive timestamp is now guaranteed from the first moment.
         stale = [
             addr for addr, session in self.network.players.items()
-            if session.last_ping > 0 and now - session.last_ping > 10.0
+            if now - session.last_ping > 10.0
         ]
         for addr in stale:
             session = self.network.remove_player(addr)
+            self._artifact_sent_at.pop(addr, None)
             if session:
                 self.lobby.remove_player(session)
                 logger.info(f"Player timed out: {session.name}")
@@ -204,6 +234,18 @@ class GameServer:
             )
 
     def _on_file_request(self, addr) -> None:
+        info = self.network.client_info.get(addr, {})
+        # Only a client that completed the handshake AND was told it needs an
+        # update has any business asking for the artifact. Serving on any
+        # request turns the server into a free file host and lets one peer pull
+        # the whole multi-megabyte artifact over and over.
+        if not info.get("protocol_ok") or not info.get("needs_update"):
+            logger.debug(f"Ignoring FILE_REQUEST from {addr}: no update pending")
+            return
+        now = time.monotonic()
+        if now - self._artifact_sent_at.get(addr, 0.0) < ARTIFACT_RESEND_COOLDOWN:
+            logger.debug(f"Throttling FILE_REQUEST from {addr}")
+            return
         release = self.releases.latest()
         if release is None:
             logger.warning(f"Update requested by {addr} but no artifact is available")
@@ -212,6 +254,7 @@ class GameServer:
         if data is None:
             logger.warning(f"Release {release['version']} listed but unreadable")
             return
+        self._artifact_sent_at[addr] = now
         logger.info(f"Sending client {release['version']} ({len(data)} bytes) to {addr}")
         self.network.send_file(addr, data)
 
@@ -241,6 +284,10 @@ class GameServer:
             session.last_create_request = request_id
             self.network.send_party_created(session, current.id)
             self._broadcast_lobby()
+            return
+        if len(self.lobby.parties) >= MAX_PARTIES:
+            logger.warning(f"Refused party create from {session.name}: at cap")
+            self.network.send_join_fail(session, "Слишком много партий на сервере")
             return
         session.last_create_request = request_id
         game_map = None
@@ -314,45 +361,24 @@ class GameServer:
     ) -> None:
         # Exactly once per intent, always answered. Two facts are kept apart:
         # `last_fire_decided` is the watermark of everything already decided
-        # (accepted or refused) and answers "was this intent dealt with?", while
-        # `last_fire_seq` is the last ACCEPTED one and is what the snapshot
-        # publishes, because the client reads a jump of it as a shot.
-        #
-        # The guard therefore tests the decided watermark, not the accepted
-        # number: a refusal does not move the accepted number, so a redelivered
-        # REFUSED intent used to pass the guard and be decided a second time —
-        # the reliable channel retransmits with rto=0.2 and exponential
-        # backoff, so that is a real arrival, and by then the weapon may well
-        # have cooled down: the retry fired a shot nobody asked for and
-        # published it as a fresh acceptance over the decision that followed.
-        # Deciding it again would also overwrite that newer decision with a
-        # bogus refusal, which the client then charges against whatever it has
-        # in flight (the accepted shot loses its recoil mid-animation).
-        #
-        # The client numbers its intents strictly increasing (send_fire bumps
-        # the counter on every send), so "not newer" can never reject a fresh
-        # intent: everything that arrives here IS accepted and gets a decision.
+        # (accepted or refused); `last_fire_seq` is the last ACCEPTED one.
         if fire_seq <= session.last_fire_decided:
             return
-        # Stamped before anything can bail out, so no path leaves an intent
-        # unaccounted for and therefore re-decidable.
-        session.last_fire_decided = fire_seq
         party = self.lobby.find_party_of(session)
         if party is None:
-            # An intent the server cannot process still gets a decision: a
-            # silent drop is indistinguishable from a lost packet, and the
-            # client would keep the predicted recoil playing with no shot and no
-            # answer ever coming. The press is spent (retrying cannot help).
+            session.last_fire_decided = fire_seq
             session.last_fire_result = FireResult(False, 'noop', 0)
             return
         entity_id = party.world.get_player_entity(session.player_id)
         if entity_id is None:
+            session.last_fire_decided = fire_seq
             session.last_fire_result = FireResult(False, 'noop', 0)
             return
         apply_weapon_switch(party.world, entity_id, weapon_id)
         result = weapons_handle_shoot(party.world, entity_id)
         if result.fired:
             session.last_fire_seq = fire_seq
+        session.last_fire_decided = fire_seq
         session.last_fire_result = result
 
     def _apply_input(
@@ -365,7 +391,17 @@ class GameServer:
         pl = world.entities.get_component(entity_id, Player)
         dash = world.entities.get_component(entity_id, Dash)
 
-        if rot:
+        # The input channel is untrusted: move and angle are exactly what the
+        # client sent, and nothing downstream re-checks them.  A non-finite
+        # angle (NaN/Inf) survives `normalize_angle` (NaN % TAU is NaN), then
+        # poisons cos/sin, the velocity, the position and finally the collision
+        # helper -- `int(math.ceil(nan / MAX_MOVE_STEP_PX))` raises ValueError
+        # and takes the whole game loop down.  Motion is applied only when the
+        # angle is finite; an out-of-range move vector (the wire allows -128..127,
+        # which would be a 127x speed hack) is clamped to the unit square.
+        move_x = -1 if move_x < -1 else 1 if move_x > 1 else move_x
+        move_y = -1 if move_y < -1 else 1 if move_y > 1 else move_y
+        if rot and math.isfinite(angle):
             rot.angle = normalize_angle(angle)
 
         # Dash needs movement input to read a direction from, and must not be

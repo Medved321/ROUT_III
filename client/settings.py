@@ -258,6 +258,8 @@ class Settings:
     def set(self, key: str, value) -> None:
         self.values[key] = value
         self.dirty = True
+        if key in ("sfx_vol", "music_vol"):
+            self._apply_audio()
 
     def adjust(self, key: str, direction: int) -> None:
         spec = SPEC_BY_KEY.get(key)
@@ -288,6 +290,10 @@ class Settings:
             value = round(value, 6)
         self.values[key] = value
         self.dirty = True
+        if key in ("sfx_vol", "music_vol"):
+            # Apply the moment the player changes it: audio is audible from the
+            # settings screen, not only after leaving it.
+            self._apply_audio()
 
     def load(self) -> None:
         if not os.path.exists(CONFIG_PATH):
@@ -394,12 +400,22 @@ class Settings:
         self._apply_audio()
 
     def _apply_audio(self) -> None:
-        """Apply volumes if an audio mixer happens to be initialised."""
+        """Hand each volume to its owner module.
+
+        This used to write ``pygame.mixer.music`` directly, which made settings a
+        second owner of the mixer and silently did nothing whenever the mixer was
+        down. Each module applies the value the moment it changes; with no mixer
+        or no tracks it just stores it. The two are applied independently, so a
+        failure in one never mutes the other.
+        """
         try:
-            import pygame
-            if not pygame.mixer.get_init():
-                return
-            pygame.mixer.music.set_volume(float(self.get("music_vol")))
+            from client import music
+            music.set_volume(self.get("music_vol"))
+        except Exception:
+            pass
+        try:
+            from client import sfx
+            sfx.set_volume(self.get("sfx_vol"))
         except Exception:
             pass
 

@@ -310,6 +310,8 @@ def expected_action(name: str, key: str) -> object:
         "size_minus": None, "size_plus": None, "new": None, "clear": None,
         "save": None, "load": None, "snap": None, "undo": None,
         "redo": None, "save_mts": None, "load_mts": None,
+        # "walls" flips the create-time boundary policy and redraws itself.
+        "walls": None,
         "field_label": None, "field": None, "error": None,
         # "mode" switches the sector editor back to the tile editor.
         "mode": "tile",

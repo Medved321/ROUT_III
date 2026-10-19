@@ -96,7 +96,7 @@ class RenderBridge:
         # (``apply_runtime``); never reset them to import-time defaults here.
         if scale is not None:
             gs.render_scale = scale
-        gs.start_hp = 100
+        gs.start_hp = 200
         gs.fog_enabled = False
         gs.fog_density = const.FOG_DENSITY_DEFAULT
         texture_gen.gen_textures()

@@ -131,4 +131,51 @@ assert data['server_port'] == 4321, data['server_port']
 assert data['player_name'] == 'TypedName', data['player_name']
 print("_attempt_connect persists entered address/name + fps_cap applied OK")
 
+# ── entering a party clears the previous party's transient state ──
+from engine import game_state as gs
+
+class _FakeGameMap:
+    def __init__(self):
+        self.tiles = [[0]]
+        self.width = self.height = 1
+    @classmethod
+    def from_bytes(cls, data, w, h):
+        return cls()
+
+class _FakeBridge:
+    def __init__(self, surface):
+        pass
+    def set_map(self, *a, **k):
+        pass
+    def set_sector_map(self, *a, **k):
+        pass
+
+orig_gamemap = client_mod.GameMap
+orig_bridge = client_mod.RenderBridge
+client_mod.GameMap = _FakeGameMap
+client_mod.RenderBridge = _FakeBridge
+try:
+    gc.network.map_format = 0
+    gc.network.map_data = b""
+    gc.network.map_width = gc.network.map_height = 1
+    gc.network.player_id = 1
+    # Dirty every transient field with something from a "previous party".
+    gs.particles = [{'x': 1}]
+    gs.decals = [{'x': 1}]
+    gs.weather = [{'x': 1}]
+    gs.enemies = [{'id': 1}]
+    gs.corpses = [{'id': 1}]
+    gs.items = [{'id': 1}]
+    gs.dwall_hp = {(0, 0): 3}
+    gs.bridge_open = {(0, 0)}
+    gc._init_from_server()
+finally:
+    client_mod.GameMap = orig_gamemap
+    client_mod.RenderBridge = orig_bridge
+
+assert gs.particles == [] and gs.decals == [] and gs.weather == []
+assert gs.enemies == [] and gs.corpses == [] and gs.items == []
+assert gs.dwall_hp == {} and gs.bridge_open == set()
+print("starting a party resets transient state OK")
+
 print("ALL CONFIG SMOKE TESTS PASSED")

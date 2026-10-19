@@ -42,9 +42,21 @@ class Lobby:
         self.parties: dict[int, Party] = {}
         self._next_party_id: int = 1
 
+    def _allocate_party_id(self) -> int:
+        # A party id rides the wire as uint16 (PARTY_CREATED / JOIN_PARTY /
+        # LOBBY_STATE all pack it as "!H"), so the counter must stay in range
+        # instead of raising struct.error after 65535 creations.  Wrap within
+        # the u16 space and skip ids still in use, so an id never collides with
+        # a live party.
+        for _ in range(0x10000):
+            pid = self._next_party_id
+            self._next_party_id = (self._next_party_id % 0xFFFF) + 1
+            if pid not in self.parties:
+                return pid
+        raise RuntimeError("party id space exhausted")
+
     def create_party(self, name: str, mode: str = 'pve', game_map=None) -> Party:
-        party = Party(self._next_party_id, name, mode, game_map=game_map)
-        self._next_party_id += 1
+        party = Party(self._allocate_party_id(), name, mode, game_map=game_map)
         self.parties[party.id] = party
         logger.info(f"Party created: {name} (id={party.id}, mode={mode})")
         return party

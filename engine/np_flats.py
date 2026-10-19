@@ -31,7 +31,8 @@ import pygame
 
 import numpy as np
 
-from engine.constants import FOV, TILE, TEX_W
+from engine.constants import TILE, TEX_W
+from engine import constants as const
 
 
 FOCAL = 750.0
@@ -48,11 +49,16 @@ class FlatMaps:
                  "v_off_ceil", "_cols")
 
     def __init__(self, iw: int, ih: int, focal: float = FOCAL,
-                 fov: float = FOV) -> None:
+                 fov: float | None = None) -> None:
         self.iw = int(iw)
         self.ih = int(ih)
         self.hc = ih / 2.0
         self.focal = float(focal)
+        # FOV is read at build time, not bound at import: `const.FOV` is
+        # rewritten by the settings screen, and a copy captured here would keep
+        # rasterizing flats at the launch-time FOV forever (the walls would not).
+        if fov is None:
+            fov = const.FOV
         xs = np.arange(iw, dtype=np.float64)
         rel = (xs + 0.5) * (fov / iw) - fov / 2.0
         self.u_off = np.tan(rel)
@@ -126,16 +132,21 @@ class FlatMaps:
 _MAPS: dict[tuple, FlatMaps] = {}
 
 
-def get_maps(iw: int, ih: int, focal: float = FOCAL) -> FlatMaps:
+def get_maps(iw: int, ih: int, focal: float = FOCAL,
+             fov: float | None = None) -> FlatMaps:
     """Cached offset maps for an internal resolution (shared across frames).
 
     ``focal`` is the perspective factor in buffer rows (defaults to the module
     ``FOCAL``); sector rendering passes the viewport-scaled focal so flat depth
-    matches the wall projections in the same framebuffer."""
-    key = (int(iw), int(ih), float(focal))
+    matches the wall projections in the same framebuffer. ``fov`` defaults to
+    the live ``const.FOV`` and is part of the cache key, so changing FOV in the
+    settings rebuilds the column map instead of reusing a stale one."""
+    if fov is None:
+        fov = const.FOV
+    key = (int(iw), int(ih), float(focal), float(fov))
     m = _MAPS.get(key)
     if m is None:
-        m = FlatMaps(*key[:2], focal=focal)
+        m = FlatMaps(key[0], key[1], focal=key[2], fov=key[3])
         _MAPS[key] = m
     return m
 

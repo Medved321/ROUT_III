@@ -30,7 +30,9 @@ from client.pause_screen import PauseScreen
 from client.editor_screen import MapEditorScreen
 from engine.constants import WPN, INPUT_SEND_INTERVAL
 from client.performance import AdaptiveQuality, input_send_loop
-from client.updater import UpdateError, apply_update, default_releases_dir, restart
+from client.updater import (
+    UpdateError, apply_update, default_releases_dir, restart, validate_offer)
+from client import music, sfx
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,11 @@ UPDATE_TIMEOUT = 30.0
 FIRE_REASON_COOLDOWN = FIRE_REASON_CODES['cooldown']
 # How long the "нужен ключ" message stays on screen after the player presses E.
 USE_HINT_SECONDS = 1.5
+# An item that vanishes within this radius of the local player reads as "I picked
+# it up"; a farther disappearance (an ally's pickup) gets no sound. The server's
+# own pickup radius is half a tile, but the snapshot's item list is global, so the
+# client needs its own, slightly more forgiving, distance test.
+SFX_PICKUP_RADIUS_SQ = 72.0 * 72.0
 
 
 def _angle_diff(a: float, b: float) -> float:
@@ -108,7 +115,7 @@ class GameClient:
         self.local_x: float = 96.0
         self.local_y: float = 96.0
         self.local_angle: float = 0.0
-        self.local_health: int = 100
+        self.local_health: int = 200
         self.local_weapon: int = 1
         self.local_ammo: dict = {'pstl': 200, 'shl': 40, 'slg': 100, 'rck': 10, 'BFG': 5}
         # Authoritative world-state flag of the local player (3 = dashing),
@@ -133,6 +140,15 @@ class GameClient:
         self.enemies: list[dict] = []
         self.bullets: list[dict] = []
         self.corpses: list[dict] = []
+        # Sound-effect bookkeeping: what the previous snapshot already showed.
+        # Kept here, not in client/sfx.py, because it is state of THIS game, not
+        # of the mixer; the sfx module only knows how to make a noise.
+        self._sfx_seen_impacts: set = set()
+        self._sfx_seen_items: dict[int, tuple[float, float]] = {}
+        self._sfx_items_ready = False
+        self._sfx_seen_doors: set = set()
+        self._sfx_prev_health: int | None = None
+        self._sfx_prev_state = 0
         self.running = False
         # Weapon animation runs on a monotonic deadline, NOT on a frame counter:
         # its length in seconds is the server cooldown, at any frame rate. The
@@ -280,24 +296,39 @@ class GameClient:
         self.player_id = self.network.player_id
         asyncio.create_task(self.network.start_ping_loop())
         asyncio.create_task(self.network.start_reliable_loop())
+        music.start(lambda: self.running)
+        # Build the effect bank once, up front, so the first shot does not pay
+        # for synthesis mid-fire. Silent if the mixer never came up.
+        sfx.ensure()
         logger.info("Подключено. Выберите партию в меню.")
 
         if self.network.update_offer is not None and await self._maybe_update():
+            music.stop()
             self.network.disconnect()
             self.renderer.cleanup()
             return
 
+        # One dispatcher owns the screen, so it is also the only place that owns
+        # the music context: a new screen added here cannot be forgotten, whereas
+        # setting it inside each loop would be four places to keep in sync.
         while self.running:
             if self.network.state == "game":
+                music.set_context("game")
                 if self.bridge is None:
                     self._init_from_server()
                 await self._game_loop()
-            elif self._ui == "editor":
-                await self._editor_loop()
-            elif self._ui == "settings":
-                await self._settings_loop(from_pause=False)
             else:
-                await self._lobby_loop()
+                music.set_context("menu")
+                if self._ui == "editor":
+                    await self._editor_loop()
+                elif self._ui == "settings":
+                    await self._settings_loop(from_pause=False)
+                else:
+                    await self._lobby_loop()
+
+        music.stop()
+        self.network.disconnect()
+        self.renderer.cleanup()
 
         self.network.disconnect()
         self.renderer.cleanup()
@@ -374,6 +405,12 @@ class GameClient:
         )
         if not await self._confirm_update(offer):
             logger.info("Обновление отклонено; продолжаем на текущей версии")
+            return False
+
+        try:
+            validate_offer(offer.version, offer.size, offer.sha256)
+        except UpdateError as exc:
+            logger.error(str(exc))
             return False
 
         self.network.request_update()
@@ -603,6 +640,11 @@ class GameClient:
 
     def _init_from_server(self) -> None:
         self.player_id = self.network.player_id
+        # A new party starts from a blank slate: effects, corpses and the
+        # destructible/bridge sets are client-side only, so they would otherwise
+        # leak from the party we just left.
+        from engine import game_state as gs
+        gs.reset_transient_state()
         if self.network.map_format == MAP_FORMAT_SECTOR:
             self.game_map = None
             self.sector_map = SectorMap.from_bytes(self.network.map_data)
@@ -711,6 +753,11 @@ class GameClient:
                 self._input_snapshot,
                 INPUT_SEND_INTERVAL,
                 should_run=lambda: self.running and self.network.state == "game",
+                # While the pause menu is up the loop stays alive but sends
+                # nothing.  Forwarding the last held keys would keep the server
+                # moving and shooting the player behind the frozen frame, which
+                # is exactly "the pause does not stop the game".
+                enabled=lambda: not self._paused,
             )
         )
         try:
@@ -767,6 +814,14 @@ class GameClient:
         self.impacts = []
         self.local_state = 0
         self._paused = False
+        # Sound bookkeeping belongs to the party that just ended; the next party
+        # must not read its first snapshot as a burst of events.
+        self._sfx_seen_impacts.clear()
+        self._sfx_seen_items.clear()
+        self._sfx_items_ready = False
+        self._sfx_seen_doors.clear()
+        self._sfx_prev_health = None
+        self._sfx_prev_state = 0
         self._pause_bg = None
         # A remembered press died with the party: it was meant for a weapon in
         # a world that no longer exists.
@@ -990,6 +1045,11 @@ class GameClient:
                 # a held button does not need it, and it must not survive to give
                 # a second shot the player did not ask for.
                 self._fire_press_buffered = False
+                # Fire sound starts with the predicted recoil, on the gate
+                # opening, so it is heard the moment the shot is shown. It is not
+                # delayed to the snapshot's confirmed fire_seq: that would trail
+                # by a round-trip and read as lag.
+                sfx.play(sfx.shoot_name(info.get("snd", "pistol")))
                 # The reliable FIRE is the single path to a shot, so every gate
                 # opening sends an intent — held fire included. Ammo is not
                 # checked here on purpose: the server is the only authority and
@@ -1026,13 +1086,16 @@ class GameClient:
         self.bullets = bullets
         self.corpses = corpses
         self.impacts = impacts
+        self._sfx_impacts(impacts)
         # Pickups are taken straight from the snapshot: the server owns both
         # the position and the moment of disappearance, so there is nothing
         # here to predict and nothing to smooth.
         self.items = items
+        self._sfx_items(items)
         # Doors send only their non-closed state, keyed by linedef id (see
         # shared/protocol.py). The bridge joins them to the map's door lines.
         self.doors = doors
+        self._sfx_doors(doors)
         self.mode = mode
 
         latest = self.network.latest_state
@@ -1052,6 +1115,7 @@ class GameClient:
                 # (cooldown, no movement input) must not flash, and the effect
                 # then arrives exactly when the body starts moving.
                 self.local_state = p.get("state", 0)
+                self._sfx_local(self.local_health, self.local_state)
                 # Armor and the active buff are stored verbatim from the
                 # snapshot and handed to the bridge unchanged. They are not
                 # derived here: the server decides both, and a local guess
@@ -1084,6 +1148,58 @@ class GameClient:
                 elif abs(diff) > 1e-4:
                     self.local_angle = normalize_angle(self.local_angle + diff * 0.3)
             self._seen_first_state = True
+
+    # ── sound effects (state of THIS snapshot vs the last) ────────────────
+    def _sfx_impacts(self, impacts) -> None:
+        """One hit sound per new impact id; a live id is never replayed."""
+        active = {im.get("id") for im in impacts}
+        self._sfx_seen_impacts.intersection_update(active)
+        for im in impacts:
+            iid = im.get("id")
+            if iid in self._sfx_seen_impacts:
+                continue
+            self._sfx_seen_impacts.add(iid)
+            sfx.play("hit_enemy" if im.get("type") == "enemy" else "hit_wall")
+
+    def _sfx_items(self, items) -> None:
+        """A pickup sounds when an item near the player disappears.
+
+        The snapshot's item list is global, so distance decides whose pickup it
+        was: a vanished item within reach is ours, a distant one is an ally's.
+        """
+        now = {it["id"]: (it["x"], it["y"]) for it in items}
+        if self._sfx_items_ready:
+            for iid, (x, y) in self._sfx_seen_items.items():
+                if iid in now:
+                    continue
+                dx, dy = x - self.local_x, y - self.local_y
+                if dx * dx + dy * dy <= SFX_PICKUP_RADIUS_SQ:
+                    sfx.play("pickup")
+                    break
+        self._sfx_seen_items = now
+        self._sfx_items_ready = True
+
+    def _sfx_doors(self, doors) -> None:
+        """A door just started opening: an id that was not non-closed last frame."""
+        now = {d.get("li", d.get("id")) for d in doors}
+        if now - self._sfx_seen_doors:
+            sfx.play("door")
+        self._sfx_seen_doors = now
+
+    def _sfx_local(self, health: int, state: int) -> None:
+        """Own hurt/death/dash, read from the authoritative snapshot fields."""
+        dying = state == 1 and self._sfx_prev_state != 1
+        if dying:
+            # The fatal hit drops health to zero too; the death sound is the one
+            # that matters, so it replaces the hurt sound for this frame.
+            sfx.play("death")
+        else:
+            if self._sfx_prev_health is not None and health < self._sfx_prev_health:
+                sfx.play("hurt")
+            if state == 3 and self._sfx_prev_state != 3:
+                sfx.play("dash")
+        self._sfx_prev_health = health
+        self._sfx_prev_state = state
 
     def _render(self) -> None:
         if self.bridge is None:

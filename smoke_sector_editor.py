@@ -325,6 +325,72 @@ def test_solid_flag_and_step_textures():
     print("  solid + step tex OK")
 
 
+def _contour_box(ed, x0, y0, x1, y1):
+    """A 4-vertex box contour as a list of new linedef ids."""
+    v1 = ed.add_vertex(x0, y0)
+    v2 = ed.add_vertex(x1, y0)
+    v3 = ed.add_vertex(x1, y1)
+    v4 = ed.add_vertex(x0, y1)
+    return [ed.add_line(a, b) for a, b in
+            ((v1, v2), (v2, v3), (v3, v4), (v4, v1))]
+
+
+def test_solid_on_create_seals_the_contour():
+    """The create-time toggle changes flags only, never the geometry."""
+    def build(flag):
+        ed = SectorEditor(new_room(1600, 1600))
+        ed.solid_on_create = flag
+        box = _contour_box(ed, 400, 400, 800, 800)
+        sid, errs = ed.sector_from_contour(box, floor_h=0, ceil_h=128, light=120)
+        assert sid == 1 and not errs, errs
+        return ed, box
+
+    off, off_box = build(False)
+    assert not any(off.lines[li].solid for li in off_box), \
+        "default OFF must leave the contour as portals"
+    assert all(off.sm.line_blocks(li) is False for li in off_box), \
+        "equal floors with no flag is a walk-through portal"
+
+    on, on_box = build(True)
+    assert all(on.lines[li].solid for li in on_box), \
+        "toggle ON must flag every created edge"
+    assert all(on.sm.line_blocks(li) is True for li in on_box), \
+        "a flagged boundary must block"
+    assert not on.validate(), on.validate()
+    assert on.sm.has_polygon(1), "the new sector must keep its contour"
+    assert on.sm.has_polygon(0), "the neighbour's contour must survive"
+
+    # flags are the only difference: the geometry is identical
+    assert (len(on.verts), len(on.lines), len(on.sides)) == \
+        (len(off.verts), len(off.lines), len(off.sides))
+    assert _poly_points(on.sm, 1) == _poly_points(off.sm, 1)
+    assert _poly_points(on.sm, 0) == _poly_points(off.sm, 0)
+    print("  solid on create  OK")
+
+
+def test_solid_on_create_persists_and_undo_ignores_it():
+    """The flag is editor state, not map state: it outlives create and undo."""
+    ed = SectorEditor(new_room(1600, 1600))
+    ed.solid_on_create = True
+    box1 = _contour_box(ed, 300, 300, 600, 600)
+    sid1, errs1 = ed.sector_from_contour(box1, floor_h=0)
+    assert sid1 == 1 and not errs1, errs1
+    assert all(ed.lines[li].solid for li in box1)
+
+    box2 = _contour_box(ed, 900, 900, 1300, 1300)
+    sid2, errs2 = ed.sector_from_contour(box2, floor_h=0)
+    assert sid2 == 2 and not errs2, errs2
+    assert all(ed.lines[li].solid for li in box2), \
+        "the toggle must still be on for the second sector"
+
+    ed.undo()          # undo the second sector
+    assert ed.solid_on_create is True, "undo must not turn the toggle off"
+    assert len(ed.sectors) == 2
+    ed.redo()
+    assert len(ed.sectors) == 3 and ed.sm.find_sector_at(1100, 1100) == 2
+    print("  solid-on-create state OK")
+
+
 def test_solid_cleared_when_line_becomes_one_sided():
     """solid is only valid on two-sided lines, so it goes away with the back."""
     ed = SectorEditor()
@@ -869,6 +935,8 @@ def main():
     test_sector_from_contour()
     test_height_clamp()
     test_solid_flag_and_step_textures()
+    test_solid_on_create_seals_the_contour()
+    test_solid_on_create_persists_and_undo_ignores_it()
     test_solid_cleared_when_line_becomes_one_sided()
     test_things_roundtrip()
     test_undo_redo_roundtrip()

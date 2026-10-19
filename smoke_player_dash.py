@@ -22,7 +22,7 @@ from server.game_data import (
     DASH_COOLDOWN_TICKS, DASH_SPEED_MULT, DASH_TICKS,
     MAX_MOVE_STEP_PX, MOVE_SPEED_PX, TICK_INTERVAL,
 )
-from shared.components import Dash, Player, Position, Velocity, WeaponComponent
+from shared.components import Dash, Player, Position, Rotation, Velocity, WeaponComponent
 from shared.protocol import (
     INPUT_FLAG_DASH, INPUT_FLAG_USE, decode_player_input, encode_player_input,
 )
@@ -38,9 +38,10 @@ from smoke_sector_server import _strip_map
 
 def test_flags_roundtrip():
     # 8: the player record also carries the fire decision (fire_seq/fire_ready);
-    # 9: armor/powerup/items; 10: key mask + use_reason and the doors block.
+    # 9: armor/powerup/items; 10: key mask + use_reason and the doors block;
+    # 11: player_id is uint16 in JOIN_ACCEPT and LOBBY_STATE.
     # PLAYER_INPUT itself is unchanged, still flags.
-    assert PROTOCOL_VERSION == 10, PROTOCOL_VERSION
+    assert PROTOCOL_VERSION == 12, PROTOCOL_VERSION
     assert INPUT_FLAG_DASH == 0x01, INPUT_FLAG_DASH
     assert INPUT_FLAG_USE == 0x02, INPUT_FLAG_USE
 
@@ -454,6 +455,43 @@ def test_space_does_not_fire():
     print("9. Space does not fire, weapon timer and LMB still do OK")
 
 
+# ---------------------------------------------------------------------------
+# 10. Untrusted input is sanitized before it reaches the world
+# ---------------------------------------------------------------------------
+
+def test_untrusted_input_is_sanitized():
+    """The input channel is raw client bytes: a NaN angle or an oversized move
+    vector must not poison the world.  Before the guard, NaN survived
+    normalize_angle, reached the collision helper and crashed the game loop with
+    ``int(math.ceil(nan / MAX_MOVE_STEP_PX))`` (ValueError); a signed-byte move
+    vector of 127 was a 127x speed hack.
+    """
+    server = GameServer()
+    world, eid = _world()
+    rot = _comp(world, eid, Rotation)
+    vel = _comp(world, eid, Velocity)
+    pos = _comp(world, eid, Position)
+    rot.angle = 0.75
+    px, py = pos.x, pos.y
+
+    # NaN / Inf angle: rotation keeps its last finite value, world stays finite.
+    for bad in (math.nan, math.inf, -math.inf):
+        server._apply_input(world, eid, None, 0, 0, bad, False, 1, 0)
+        assert rot.angle == 0.75, (bad, rot.angle)
+        world.update()
+    assert math.isfinite(pos.x) and math.isfinite(pos.y), (pos.x, pos.y)
+
+    # Oversized move vector is clamped to the unit square, not applied as 127x.
+    server._apply_input(world, eid, None, 127, 127, 0.0, False, 1, 0)
+    assert abs(vel.dx) <= MOVE_SPEED_PX * TICK_INTERVAL + 1e-9, vel.dx
+    assert abs(vel.dy) <= MOVE_SPEED_PX * TICK_INTERVAL + 1e-9, vel.dy
+
+    # A full unit vector of bad input still leaves the player inside the world.
+    world.update()
+    assert math.isfinite(pos.x) and math.isfinite(pos.y), (pos.x, pos.y)
+    print("10. untrusted input sanitized (NaN angle, move clamp) OK")
+
+
 if __name__ == "__main__":
     test_flags_roundtrip()
     test_start_and_timers()
@@ -464,4 +502,5 @@ if __name__ == "__main__":
     test_state_reporting()
     test_client_pulse_is_one_shot()
     test_space_does_not_fire()
+    test_untrusted_input_is_sanitized()
     print("PLAYER DASH TEST PASSED")

@@ -124,8 +124,10 @@ def test_steps_solid_on_the_wire():
 
     # 8 = the fire decision (fire_seq/fire_ready) in the player record; 9 =
     # armor/powerup/items ride the snapshot; 10 = the key mask/use_reason and
-    # the sparse door block; heights still ride the map
-    assert PROTOCOL_VERSION == 10, PROTOCOL_VERSION
+    # the sparse door block; 11 = player_id is uint16 in JOIN_ACCEPT and
+    # LOBBY_STATE; heights still ride the map; 12 = tick is uint32 in
+    # WORLD_STATE (uint16 overflowed after ~54 min of party uptime)
+    assert PROTOCOL_VERSION == 12, PROTOCOL_VERSION
 
     sm = _steps_map()
     raw = sm.to_bytes()

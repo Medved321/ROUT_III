@@ -86,7 +86,55 @@ def test_protocol_roundtrip():
     assert pid == 5 and has_map and len(mdata) == 256, (pid, mw, mh, has_map, len(mdata))
     assert mfmt == 0, mfmt
 
+    # player_id is uint16 (PROTOCOL_VERSION 11): an id above the old byte
+    # ceiling must round-trip and must not crash the encoder.  As a `!B` field,
+    # join 256 raised struct.error in send_join_accept and killed the server.
+    big = 300
+    pid_big, *_ = decode_join_accept(encode_join_accept(big))
+    assert pid_big == big, pid_big
+    big_party = [{'id': 1, 'name': 'A', 'mode': 'pve',
+                  'players': [{'id': big, 'name': 'X'}]}]
+    assert decode_lobby_state(encode_lobby_state(big_party))[0]['players'][0]['id'] == big
+
     print("protocol roundtrip OK")
+
+
+def test_malformed_datagram_is_dropped():
+    """A datagram is untrusted: a valid header with a short payload used to
+    raise ``struct.error``/``IndexError`` out of the transport callback.  The
+    handler must drop it and stay silent.
+    """
+    from server.network import ServerNetwork
+    from shared.protocol import Packet, PacketType
+    net = ServerNetwork()
+    addr = ("127.0.0.1", 5555)
+    # HELLO with an empty payload: decode_hello(data[0]) would raise IndexError.
+    net.datagram_received(Packet(PacketType.HELLO, 0, b"").encode(), addr)
+    # Truncated / empty datagrams.
+    net.datagram_received(b"\x01", addr)
+    net.datagram_received(b"", addr)
+    # PLAYER_INPUT with a short payload and no session: dropped cleanly.
+    net.datagram_received(Packet(PacketType.PLAYER_INPUT, 0, b"\x00").encode(), addr)
+    assert net.players == {} and net.client_info == {}
+    print("malformed datagrams dropped OK")
+
+
+def test_party_cap_is_enforced():
+    """A flood of sessions (spoofed ports, each HELLO+JOIN before the timeout)
+    must not turn into an unbounded number of worlds."""
+    from server.server import GameServer, MAX_PARTIES
+    from server.player import PlayerSession
+    server = GameServer()
+    for i in range(MAX_PARTIES):
+        server.lobby.create_party(f"P{i}", "pve")
+    refused = []
+    server.network.send_join_fail = lambda session, reason: refused.append(reason)
+    server.network.send_party_created = lambda *a, **k: None
+    sess = PlayerSession(1000, "Flooder", ("10.0.0.2", 5))
+    server._on_create_party(sess, "OneMore", "pve")
+    assert refused, "create past the cap was not refused"
+    assert len(server.lobby.parties) == MAX_PARTIES, len(server.lobby.parties)
+    print("party cap enforced OK")
 
 
 def test_pvp_damage():
@@ -320,12 +368,55 @@ def test_impacts_wall():
     print("hit-scan wall impact + TTL OK")
 
 
+def test_enemy_turn_is_rate_limited():
+    """An enemy body pivots at ENEMY_TURN_RATE; it must not snap to the bearing."""
+    import math
+    from server.game_world import GameWorld, ENEMY_TURN_RATE, _turn_toward
+    from server.game_data import TICK_INTERVAL
+    from shared.components import Position
+    from shared.map_data import GameMap
+
+    m = GameMap(16, 16, [[1]*16] + [[1] + [0]*14 + [1] for _ in range(14)] + [[1]*16])
+    w = GameWorld(mode='pve', game_map=m)
+    eid = w.add_player(1, 'A')
+    p = w.entities.get_component(eid, Position); p.x, p.y = 160.0, 160.0
+    en = {
+        'id': 1, 'x': 320.0, 'y': 160.0, 't': 'imp',
+        'hp': 60, 'max_hp': 60, 'spd': 0.0, 'col': (1, 2, 3), 'a': True,
+        'dying': 0, 'anim_frame': 0, 'anim_state': 0, 'stun': 0, 'alert': False,
+        'pa': 0.0, 'ls': 0, 'd_flash': 0,
+        'spawn_x': 320.0, 'spawn_y': 160.0, 'spawn_pa': 0.0,
+        'attack_from': None, 'attack_ticks': 0,
+    }
+    w.enemies.append(en)
+    bearing = math.pi                    # player is straight to the enemy's left
+    step = ENEMY_TURN_RATE * TICK_INTERVAL
+
+    w.update()
+    moved = math.hypot(math.cos(en['pa']) - 1.0, math.sin(en['pa']))
+    assert abs(moved - 2 * math.sin(step / 2)) < 1e-9, (en['pa'], step)
+    assert abs((en['pa'] - bearing + math.pi) % (2 * math.pi) - math.pi) > 1.0, \
+        "must not snap to the bearing in one tick"
+    # Turn until the shortest arc (pi radians) is covered, with margin: the
+    # tick budget must follow ENEMY_TURN_RATE, not a hardcoded frame count.
+    for _ in range(int(math.ceil(math.pi / step)) + 5):
+        w.update()
+    err = (en['pa'] - bearing + math.pi) % (2 * math.pi) - math.pi
+    assert abs(err) < 1e-6, en['pa']
+    # takes the shortest way around the -pi/pi seam
+    assert _turn_toward(3.0, -3.0, 0.1) > 3.0
+    print("enemy turn is rate-limited OK")
+
+
 if __name__ == '__main__':
     test_protocol_roundtrip()
+    test_malformed_datagram_is_dropped()
+    test_party_cap_is_enforced()
     test_world_tick()
     test_pvp_damage()
     test_server_boot()
     test_rifle_ball_spawns()
     test_ball_flies_damages_wall()
     test_impacts_wall()
+    test_enemy_turn_is_rate_limited()
     print("ALL SMOKE TESTS PASSED")

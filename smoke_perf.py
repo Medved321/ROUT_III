@@ -377,6 +377,26 @@ def test_server_purges_unreachable():
     print("  ok: server removes unreachable sessions without ping timeout")
 
 
+def test_joined_session_times_out_without_ping():
+    from server.network import ServerNetwork
+    from server.player import PlayerSession
+    from server.server import GameServer
+
+    server = GameServer(host="127.0.0.1", port=0)
+    net = server.network
+    addr = ("10.0.0.10", 7777)
+    sess = PlayerSession(11, "Silent", addr)
+    net.players[addr] = sess
+    # A session that completed the handshake but never sent a PING must still be
+    # reclaimed: `last_ping` starts at creation, so the stale filter no longer
+    # needs (and no longer has) a `last_ping > 0` guard that skipped it forever.
+    assert sess.last_ping > 0, "session clock did not start at creation"
+    sess.last_ping -= 11.0  # simulate 11 s of silence
+    server._remove_stale_players()
+    assert addr not in net.players, "silent session was not timed out"
+    print("  ok: joined-but-silent session times out")
+
+
 def main():
     print("smoke_perf:")
     test_adaptive_quality()
@@ -389,6 +409,7 @@ def main():
     test_error_throttling()
     test_unreachable_broadcast()
     test_server_purges_unreachable()
+    test_joined_session_times_out_without_ping()
     print("ALL PASS")
 
 

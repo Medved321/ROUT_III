@@ -465,6 +465,43 @@ def _bbox_visible(box, px, py, fwx, fwy, rx, ry, tan_h) -> bool:
     return not behind and not all_right and not all_left
 
 
+def _seg_near_t(s, px, py, ca, sa) -> float:
+    """Forward distance of a seg's nearest endpoint (near-to-far sort key).
+
+    ``t = (v - eye) . forward`` is the same projection ``_seg_wall_bands``
+    uses; the smaller of the two endpoints is the seg's closest contact with
+    the camera.  Seg ordering within a subsector must be near-to-far because a
+    two-sided lip's clip movement is NOT order-independent (change
+    ``sector-doors-and-keys``, design D10): a far portal processed first
+    tightens the clip arrays to its own opening, and the nearer wall behind it
+    (e.g. a door on the camera's side of an island, sharing the far wall's
+    subsector) then draws only into that stale slice.  Solids already survive
+    arbitrary order via ``solid_depth``; this makes the whole subsector
+    order-independent.
+    """
+    t1 = (s.x1 - px) * ca + (s.y1 - py) * sa
+    t2 = (s.x2 - px) * ca + (s.y2 - py) * sa
+    return t1 if t1 < t2 else t2
+
+
+# Within-subsector near-to-far sort key.  The sides of one convex wall plane (a
+# platform box's near/left/right faces share a corner) differ in nearest depth
+# only by float noise; they must compare EQUAL and keep their BSP-built order.
+# A plain sort key cannot express that: it breaks ties by ``cos`` noise (>0.5 px
+# apart here because the corner is a shared endpoint), reordering the sides and
+# feeding the per-column frontier a different sequence, which dropped the
+# platform top (``smoke_sector_pits``).  The key is therefore the depth **rounded
+# to whole pixels** -- a cheap numeric key (``cmp_to_key`` with an epsilon
+# comparator is correct but far too slow for the per-frame budget,
+# ``smoke_sector_perf``).  Genuinely distinct walls are whole pixels apart, so
+# rounding merges only a shared wall plane's own segs.
+def _seg_order_key(segs, px, py, ca, sa):
+    """``sorted`` key: near-to-far, stable for depths within one pixel."""
+    def key(si):
+        return round(_seg_near_t(segs[si], px, py, ca, sa))
+    return key
+
+
 def _walk_subsectors(tree, px, py, pa) -> list:
     """Visible subsector indices, near-to-far (DOOM R_RenderBSPNode order).
 
@@ -901,8 +938,20 @@ def bsp_clipped_frame(vh=None, vy=None, view_buf=None) -> tuple:
     order = _walk_subsectors(bsp, px, py, pa)
     bands = []
     flat_spans = []
+    ca, sa = math.cos(pa), math.sin(pa)
+    segs = bsp.segs
+    sub_segs = bsp.sub_segs()
     for sub_i in order:
-        for si in bsp.sub_segs()[sub_i]:
+        seg_ids = sub_segs[sub_i]
+        # Near-to-far within the subsector: its segs arrive in an arbitrary
+        # order, and a farther two-sided lip drawn first would pinch a nearer
+        # wall's columns to its own opening (see ``_seg_near_t``).  Sorting the
+        # (few) seg references per subsector is O(k log k) and keeps the clip
+        # arrays fed in the order the per-column frontier expects.
+        if len(seg_ids) > 1:
+            seg_ids = sorted(seg_ids, key=_seg_order_key(
+                segs, px, py, ca, sa))
+        for si in seg_ids:
             _seg_wall_bands(bands, scene, bsp, si, px, py, pa,
                             F, hc, iw, ih, eye, view,
                             clip_top, clip_bot, flat_spans, view_buf,

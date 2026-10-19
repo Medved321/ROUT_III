@@ -198,6 +198,7 @@ def test_gameclient_connect_flow():
 
     async def lobby_flow():
         with tempfile.TemporaryDirectory() as tmp:
+            settings_mod.CONFIG_PATH = os.path.join(tmp, "config.json")
             server = GameServer(host="127.0.0.1", port=7801, releases_dir=tmp)
             task = asyncio.ensure_future(server.start())
             await asyncio.sleep(0.3)
@@ -226,6 +227,7 @@ def test_gameclient_connect_flow():
 
     async def unreachable_flow():
         with tempfile.TemporaryDirectory() as tmp:
+            settings_mod.CONFIG_PATH = os.path.join(tmp, "config.json")
             client = GameClient("127.0.0.1", 7802, "Smoker")
             runner = asyncio.ensure_future(client.run())
             await asyncio.sleep(0.3)

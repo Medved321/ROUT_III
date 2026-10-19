@@ -23,13 +23,21 @@ from server.game_data import (
     ENEMY_DETECT_RANGE, ENEMY_ALERT_AOE, ENEMY_MELEE_COOLDOWN,
     MELEE_RANGE, RANGED_DB, SPAWN_POOL, CORPSE_LIFETIME,
     PLAYER_RESPAWN_TICKS,
-    TICK_RATE, FPS_60, MAX_PLAYER_PROJ, IMPACT_TTL, MAX_IMPACTS,
+    TICK_RATE, TICK_INTERVAL, FPS_60, MAX_PLAYER_PROJ, MAX_ENEMY_PROJ,
+    IMPACT_TTL, MAX_IMPACTS,
     BALL_SUB_STEP, INFIGHT_TICKS, MAX_MOVE_STEP_PX,
     ITEM_DB, ITEM_PICKUP_DIST,
     ARMOR_MAX, AMMO_KEYS, AMMO_MAX, WPN,
     DOOR_OPEN_TICKS, DOOR_HOLD_TICKS, DOOR_CLOSE_TICKS, DOOR_USE_DIST,
 )
 from server.weapons import _damage_enemy
+
+# Enemy feel: how fast a body swings toward its target, in radians per second.
+# Snapping ``pa`` to the exact bearing every tick read as a turret pivoting
+# instantly, not a creature turning; this bounds the swing.  It lives here, not
+# in ``game_data``, because ``game_data`` is edited live for balance tuning.
+# Movement keeps its own unlimited heading, so only the visible facing is capped.
+ENEMY_TURN_RATE = 1.0
 
 # Reason codes for a refused "use" attempt (mirrors shared.combat).
 USE_REASON_LOCKED = USE_REASON_CODES['locked']
@@ -44,6 +52,22 @@ def _spawn_px(spawns: list[tuple[float, float]]) -> tuple[float, float]:
     if not spawns:
         return 96.0, 96.0
     return random.choice(spawns)
+
+
+def _turn_toward(current: float, target: float, max_step: float) -> float:
+    """Rotate ``current`` toward ``target`` by at most ``max_step`` radians.
+
+    Takes the shortest way around, so crossing the ``-pi``/``pi`` seam does not
+    send the enemy the long way.  ``max_step`` is the per-tick budget from
+    ``ENEMY_TURN_RATE``; the body pivots at that speed instead of snapping to
+    the bearing the instant a target appears.
+    """
+    diff = (target - current + math.pi) % (2 * math.pi) - math.pi
+    if diff > max_step:
+        diff = max_step
+    elif diff < -max_step:
+        diff = -max_step
+    return current + diff
 
 
 class GameWorld:
@@ -550,6 +574,34 @@ class GameWorld:
     # ------------------------------------------------------------------
     #  Enemy AI (simplified ROUT_II_III port, px space)
     # ------------------------------------------------------------------
+    @staticmethod
+    def _enemy_grid(enemies, cell: float) -> dict:
+        """Bucket live enemies into ``cell``-sized cells for neighbor queries.
+
+        A 3x3 block around a query point is guaranteed to hold every enemy
+        within ``cell`` of it, so this replaces the per-enemy scans over the
+        whole roster (alert AOE, separation) with a scan of a few buckets.
+        """
+        grid: dict = {}
+        for en in enemies:
+            if not en['a']:
+                continue
+            key = (int(en['x'] // cell), int(en['y'] // cell))
+            grid.setdefault(key, []).append(en)
+        return grid
+
+    @staticmethod
+    def _grid_block(grid: dict, cell: float, x: float, y: float) -> list:
+        """Every enemy in the 3x3 cell block around ``(x, y)``."""
+        cx, cy = int(x // cell), int(y // cell)
+        out: list = []
+        for gx in (cx - 1, cx, cx + 1):
+            for gy in (cy - 1, cy, cy + 1):
+                bucket = grid.get((gx, gy))
+                if bucket:
+                    out.extend(bucket)
+        return out
+
     def _update_enemies(self) -> None:
         player_positions = []
         for _pid, eid in self.players.items():
@@ -557,6 +609,15 @@ class GameWorld:
             hp = self.entities.get_component(eid, Health)
             if pos and hp and hp.value > 0:
                 player_positions.append((eid, pos.x, pos.y))
+
+        # O(1) attacker lookup and O(neighbors) alert/separation for the whole
+        # tick.  Rebuilt once here; per-tick movement is far smaller than a
+        # cell, so a neighbor can never leave its 3x3 block mid-tick.
+        by_id = {en['id']: en for en in self.enemies}
+        alert_cell = float(ENEMY_ALERT_AOE)
+        sep_cell = float(ENEMY_RADIUS * 2)
+        alert_grid = self._enemy_grid(self.enemies, alert_cell)
+        sep_grid = self._enemy_grid(self.enemies, sep_cell)
 
         for en in self.enemies:
             if not en['a'] or en['hp'] <= 0:
@@ -579,13 +640,11 @@ class GameWorld:
             target_enemy = None
             attacker_id = en.get('attack_from')
             if attacker_id is not None and en.get('attack_ticks', 0) > 0:
-                for other in self.enemies:
-                    if other['id'] == attacker_id:
-                        if (other['a'] and other['hp'] > 0
-                                and math.hypot(other['x'] - ex, other['y'] - ey) < ENEMY_DETECT_RANGE
-                                and self.has_los_px(ex, ey, other['x'], other['y'])):
-                            target_enemy = other
-                        break
+                other = by_id.get(attacker_id)
+                if (other is not None and other['a'] and other['hp'] > 0
+                        and math.hypot(other['x'] - ex, other['y'] - ey) < ENEMY_DETECT_RANGE
+                        and self.has_los_px(ex, ey, other['x'], other['y'])):
+                    target_enemy = other
                 if target_enemy is not None:
                     en['attack_ticks'] -= 1
             if attacker_id is not None and target_enemy is None:
@@ -607,8 +666,8 @@ class GameWorld:
             # --- alert nearby sleeping enemies ----------------------------
             if target_eid is not None or target_enemy is not None:
                 en['alert'] = True
-                for other in self.enemies:
-                    if other is en or not other['a'] or other.get('alert'):
+                for other in self._grid_block(alert_grid, alert_cell, ex, ey):
+                    if other is en or other.get('alert'):
                         continue
                     if math.hypot(other['x'] - ex, other['y'] - ey) < ENEMY_ALERT_AOE:
                         other['alert'] = True
@@ -618,8 +677,8 @@ class GameWorld:
 
             # --- separation from other enemies ----------------------------
             sx, sy = 0.0, 0.0
-            for other in self.enemies:
-                if other is en or not other['a']:
+            for other in self._grid_block(sep_grid, sep_cell, ex, ey):
+                if other is en:
                     continue
                 dx = ex - other['x']
                 dy = ey - other['y']
@@ -635,12 +694,15 @@ class GameWorld:
                     en['y'] = ny
 
             # --- movement toward target / wander --------------------------
-            new_pa = en['pa']
+            # Pathing keeps its own (unlimited) heading, so slowing the turn
+            # below does not cripple the chase.
             if tx is not None:
-                new_pa = math.atan2(ty - ey, tx - ex)
+                bearing = math.atan2(ty - ey, tx - ex)
+            else:
+                bearing = en['pa']
 
-            move_x = math.cos(new_pa) * espd
-            move_y = math.sin(new_pa) * espd
+            move_x = math.cos(bearing) * espd
+            move_y = math.sin(bearing) * espd
 
             new_x = en['x'] + move_x
             new_y = en['y'] + move_y
@@ -649,7 +711,15 @@ class GameWorld:
             if self.can_move_px(en['x'], new_y, ENEMY_RADIUS):
                 en['y'] = new_y
 
-            en['pa'] = new_pa
+            # --- visible facing turns at a bounded rate -------------------
+            # ``pa`` drives the rendered model, and snapping it to the exact
+            # bearing every tick read as a turret pivoting instantly instead of
+            # a creature turning.  Movement has its own heading above, so
+            # limiting the turn slows what the player sees without crippling
+            # the chase.
+            if tx is not None:
+                en['pa'] = _turn_toward(en['pa'], math.atan2(ty - ey, tx - ex),
+                                        ENEMY_TURN_RATE * TICK_INTERVAL)
 
             # --- melee attack (if close) -----------------------------------
             db = ENEMY_DB[etype]
@@ -677,6 +747,10 @@ class GameWorld:
         dy = ty - en['y']
         d = math.hypot(dx, dy)
         if d < 1:
+            return
+        # Same budget as player balls: enemy volleys must not grow the world
+        # without bound on an enemy-dense map.
+        if sum(1 for b in self.bullets if not b.get('from_player')) >= MAX_ENEMY_PROJ:
             return
         base_angle = math.atan2(dy, dx)
         cone = rdb.get('cone', 0.06)
@@ -773,8 +847,10 @@ class GameWorld:
         target['attack_from'] = attacker_id
         target['attack_ticks'] = INFIGHT_TICKS
         target['alert'] = True
-        for other in self.enemies:
-            if other is target or not other['a'] or other.get('alert'):
+        cell = float(ENEMY_ALERT_AOE)
+        grid = self._enemy_grid(self.enemies, cell)
+        for other in self._grid_block(grid, cell, target['x'], target['y']):
+            if other is target or other.get('alert'):
                 continue
             if math.hypot(other['x'] - target['x'], other['y'] - target['y']) < ENEMY_ALERT_AOE:
                 other['alert'] = True
@@ -1101,6 +1177,14 @@ class GameWorld:
         wp = self.entities.get_component(eid, WeaponComponent)
         if wp is not None:
             wp.fire_cooldown = 0
+            # The reserve is drained by fighting and refilled only by pickups,
+            # so it is "state of the old life" just like the dash and the
+            # cooldown: dying with an empty belt must not walk back into a
+            # restarted wave with the same empty belt.  Ownership and the
+            # selected weapon stay: the loadout is not what death erases, and
+            # the level's own loot returns through ``_reset_items``.
+            wp.ammo.clear()
+            wp.ammo.update(WeaponComponent().ammo)
         # Carried-over protection would be free: a player who died wearing armor
         # would come back still wearing it, and an unexpired invulnerability
         # would make the first tick after a respawn a guaranteed no-damage tick.

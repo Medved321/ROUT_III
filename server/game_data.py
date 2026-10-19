@@ -69,8 +69,6 @@ AMMO_MAX = 255
 ITEM_PICKUP_DIST = 32.0
 # Taken items have no respawn timer any more: they come back only when the wave
 # restarts on a player's death (see `GameWorld._reset_items`).
-# engine/constants.py still declares an unused 60 fps ITEM_RESPAWN_TICKS from
-# the port; nothing reads it.
 # Armor soaks a hit completely before HP does. Not a third of the damage like
 # classic Doom: the HUD shows one integer, so a partial absorb would need a
 # second number nobody displays.
@@ -78,7 +76,7 @@ ARMOR_MAX = 200
 # HASTE multiplies walking speed, BERSERK doubles damage and makes shots free,
 # INVULN refuses damage outright. Durations are in ticks.
 HASTE_SPEED_MULT = 1.5
-BERSERK_DMG_MULT = 2
+BERSERK_DMG_MULT = 20
 
 # Every placeable item type, keyed by the name the editor palette writes.
 # ``wpn_1`` is absent on purpose: the pistol is the starting weapon, so there is
@@ -131,6 +129,10 @@ BALL_SUB_STEP = 4.0
 PLAYER_PROJ_SPEED = fps60_per_tick(32.0)   # ~12 px/frame@60 -> px/tick
 PLAYER_PROJ_MAX_DIST = 900.0
 MAX_PLAYER_PROJ = 32
+# Enemy projectiles had no budget: on an enemy-dense map every shooter could add
+# its volley each cooldown, so the world grew with the wave instead of with the
+# live shots. Capped like player projectiles, with the oldest dropped first.
+MAX_ENEMY_PROJ = 48
 
 # Impact events (wall/enemy hit tracers) — short-lived, capped per world.
 IMPACT_TTL = 12          # ticks (0.6 s at 20 tps)
@@ -142,8 +144,8 @@ WPN = [
     {'n': 'PISTOL',   'd': 3,  'r': 900,   'f': 16, 'a': 'pstl', 'c': (50, 50, 55), 'snd': 'pistol'},
     {'n': 'SHOTGUN',  'd': 25, 'r': 720,   'f': 50, 'a': 'shl',  'c': (100, 70, 40), 'snd': 'shotgun', 'pellets': 7, 'cone': 0.15},
     {'n': 'RIFLE',    'd': 4,  'r': 850,   'f': 8,  'a': 'slg',  'c': (100, 0, 0),  'snd': 'rifle', 'proj': True, 'proj_spd': PLAYER_PROJ_SPEED, 'proj_max_dist': PLAYER_PROJ_MAX_DIST},
-    {'n': 'BFG',      'd': 50, 'r': 16500,  'f': 30, 'a': 'BFG',  'c': (0, 60, 0),    'snd': 'bfg', 'charge': True},
-    {'n': 'SSG',      'd': 5,  'r': 520,   'f': 75, 'a': 'shl',  'c': (80, 50, 25),  'snd': 'ssg', 'cost': 2, 'pellets': 20, 'cone': 0.25},
+    {'n': 'BFG',      'd': 5000, 'r': 16500,  'f': 30, 'a': 'BFG',  'c': (0, 60, 0),    'snd': 'bfg', 'charge': True},
+    {'n': 'SSG',      'd': 25,  'r': 720,   'f': 50, 'a': 'shl',  'c': (80, 50, 25),  'snd': 'ssg', 'cost': 2, 'pellets': 14, 'cone': 0.15},
 ]
 
 # --- enemies --------------------------------------------------------------
@@ -151,7 +153,7 @@ ENEMY_RADIUS = 8
 ENEMY_DETECT_RANGE = 500
 ENEMY_ALERT_AOE = 300
 # infighting: how many ticks a hurt enemy keeps the attacker as its target
-INFIGHT_TICKS = 100   # 5 s at 20 tps
+INFIGHT_TICKS = 99999   # ~83 min at 20 tps: effectively "until it dies"
 ENEMY_SEPARATION_RANGE = 40
 SEPARATION_FORCE = 0.8
 MELEE_PREFER_DIST = 45
@@ -167,7 +169,7 @@ ENEMY_RETREAT_HP = 0.3
 STRAFE_FACTOR = 0.6
 WANDER_SPEED_FACTOR = 0.4
 DIAGONAL_COST = 1.414
-CORPSE_LIFETIME = 600       # ticks (30 s at 20 tps)
+CORPSE_LIFETIME = 6000       # ticks (5 min at 20 tps)
 # Death -> back in the fight. One tick, not zero: the corpse and the death flash
 # are the only feedback that the player died at all, so the player is gone from
 # the snapshot for at least one tick before coming back.

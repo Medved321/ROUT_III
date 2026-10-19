@@ -194,6 +194,35 @@ def test_back_wall_occlusion():
     print("  z-buffer occlusion intact     OK")
 
 
+def _crack_columns():
+    cols = set()
+    for x in range(W):
+        for y in range(H):
+            if gs.screen.get_at((x, y))[:3] == (20, 15, 10):
+                cols.add(x // SCALE)
+                break
+    return cols
+
+
+def test_cracks_span_wall_columns():
+    # A damaged destructible wall must crack across every column it covers, not
+    # just one. The overlay used to run once after the ray loop on the loop's
+    # leftover variables, so cracks only ever landed on the last column's wall.
+    room = ["HHHHHHHH", "H......H", "H......H", "H......H", "HHHHHHHH"]
+    _set_map(room)
+    gs.dwall_hp = {}
+    _render_at(1.5 * TILE, 2.5 * TILE, 0.0)
+    base = _crack_columns()
+    gs.dwall_hp = {(x, y): 2 for y, row in enumerate(room)
+                   for x, ch in enumerate(row) if ch == 'H'}
+    _render_at(1.5 * TILE, 2.5 * TILE, 0.0)
+    cracked = _crack_columns()
+    gs.dwall_hp = {}
+    new_cols = cracked - base
+    assert len(new_cols) > 5, f"cracks landed on {len(new_cols)} column(s)"
+    print(f"  cracks span wall columns ({len(new_cols)})   OK")
+
+
 def main():
     _init()
     test_frame_created()
@@ -202,6 +231,7 @@ def main():
     test_floor_ceiling_band()
     test_tiers()
     test_back_wall_occlusion()
+    test_cracks_span_wall_columns()
     print("smoke_framebuffer_tile: ALL OK")
 
 

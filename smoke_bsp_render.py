@@ -13,7 +13,9 @@ discarded entirely, R_RenderSegLoop semantics).
 Window/step frames, seg discard (4.2) and visplane flats (4.3) are asserted
 as they land: near walls clip far walls and discard fully-closed segs; flat
 spans are bounded by the per-column clips, textured via numpy or solid by
-budget, and never leak into closed columns.
+budget, and never leak into closed columns.  A door on an island's edge
+(``maps/sector2.mt1``) renders whole from both sides — the within-subsector
+near-to-far order (change ``sector-doors-and-keys``, D10).
 """
 from __future__ import annotations
 
@@ -429,6 +431,79 @@ def test_flats_textured_frame():
     print("  flats textured   OK")
 
 
+def test_door_island_both_sides():
+    """A door on an island's edge must render whole from BOTH sides.
+
+    ``maps/sector2.mt1`` is an island/hole: one subsector holds both the
+    door's seg and a far island wall, so the far two-sided lip used to be
+    processed first and pinch the door's columns to its own opening — half the
+    door vanished from the sector-0 side (change ``sector-doors-and-keys``,
+    design D10).  The near-to-far within-subsector order fixes it; this guards
+    the frame on the real map.
+    """
+    from engine import constants as const
+    from engine import sector_render
+    from shared.sector_map import SectorMap
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "maps", "sector2.mt1")
+    if not os.path.exists(path):
+        print("  door island (map missing, skipped)")
+        return
+
+    gs.textures = {}
+    for n in ("wall", "stone", "wood", "exit", "elevator", "spikes",
+              "door_R", "door_Y", "door_B"):
+        s = pygame.Surface((const.TEX_W, const.TEX_W))
+        s.fill((0, 255, 0))
+        gs.textures[n] = s
+    door_tex = pygame.Surface((const.TEX_W, const.TEX_W))
+    door_tex.fill((255, 0, 255))
+    gs.textures["door_D"] = door_tex
+    gs.flats = {}
+    for n in ("floor", "ceiling"):
+        s = pygame.Surface((const.TEX_W, const.TEX_W))
+        s.fill((10, 10, 10))
+        gs.flats[n] = s
+
+    sm = SectorMap.from_mt1(open(path, "rb").read())
+    dl = sm.door_linedefs()[0]
+
+    def _door_pixels(cam):
+        gs.sec_scene = sector_render.SectorScene(sm)
+        gs.sec_scene.door_progress = {dl: 0.0}
+        gs.sector_mode = True
+        gs.render_scale = 1
+        gs.vs_scale = 1
+        gs.view_dist = 1500
+        gs.flat_textured = False
+        gs.px, gs.py = cam
+        gs.pa = math.atan2(328 - cam[1], 240 - cam[0])
+        gs.pz = 0.0
+        gs.vh720 = False
+        sector_render.render_scene(700, 0)
+        w, h = gs.screen.get_size()
+        tot = mid = 0
+        for y in range(h):
+            r, g, b = gs.screen.get_at((w // 2, y))[:3]
+            if r > 150 and b > 150 and g < 100:
+                mid += 1
+        for y in range(0, h, 3):
+            for x in range(0, w, 3):
+                r, g, b = gs.screen.get_at((x, y))[:3]
+                if r > 150 and b > 150 and g < 100:
+                    tot += 1
+        return tot, mid
+
+    tot_b, mid_b = _door_pixels((265.0, 476.0))   # sector 0, outside the island
+    tot_a, mid_a = _door_pixels((215.0, 180.0))   # sector 2, inside the island
+    # Both faces see the full door plate (the bug left sector 0 with mid=210,
+    # tot=16569 while sector 2 stayed whole at mid=555, tot=34687).
+    assert mid_b >= 500 and mid_a >= 500, (mid_b, mid_a)
+    assert tot_b >= 30000 and tot_a >= 30000, (tot_b, tot_a)
+    print("  door island both sides OK")
+
+
 def main():
     _init_display()
     test_walk_order()
@@ -440,6 +515,7 @@ def main():
     test_flats_span_clips()
     test_flats_solid_frame()
     test_flats_textured_frame()
+    test_door_island_both_sides()
     print("smoke_bsp_render: ALL OK")
 
 

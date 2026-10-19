@@ -119,7 +119,6 @@ ITEM_ATT_MIN_SZ = 6
 BOT_COUNT_DEFAULT = 4
 
 # Deathmatch
-ITEM_RESPAWN_TICKS = 1800  # 30 seconds at 60 fps
 KILL_LOG_MAX = 5
 
 # Sector mode

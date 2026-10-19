@@ -265,6 +265,20 @@ class NetworkClient:
         logger.warning(f"Network error: {exc}")
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        # The socket is unconnected (bound to 0.0.0.0:0), so anyone who guesses
+        # the ephemeral port can inject datagrams. Everything of consequence
+        # arrives here -- world state, lobby, and the update offer -- so only the
+        # server we resolved is trusted; anything else is dropped.
+        if addr != self.server_addr:
+            logger.debug(f"Dropping datagram from unexpected {addr}")
+            return
+        try:
+            self._dispatch_datagram(data)
+        except Exception:
+            logger.debug(f"Malformed datagram from {addr} ({len(data)} bytes)",
+                         exc_info=True)
+
+    def _dispatch_datagram(self, data: bytes) -> None:
         packet = Packet.decode(data)
         if packet is None:
             return

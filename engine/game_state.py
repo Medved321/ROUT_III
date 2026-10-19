@@ -178,3 +178,33 @@ fog_density = 60
 # Cache used by map_utils._player_in_any_sector
 player_sector_cache = -1
 player_sector_timer = 0
+
+
+def reset_transient_state() -> None:
+    """Clear per-party world/effect state so a new party starts blank.
+
+    The bridge refills the entity lists from the first snapshot and rebuilds
+    ``explored`` when it installs the map, but effects, corpses and the
+    destructible/bridge sets are client-side only: without this a party would
+    inherit the previous one's dust, decals and damaged-wall state.  Per-session
+    values (providers, textures, fog, settings) are deliberately left alone.
+    """
+    global particles, decals, weather, weather_type
+    global enemies, bots, items, barrels, portals, bul, proj, corpses, players
+    global dwall_hp, bridge_open, explored
+    particles = []
+    decals = []
+    weather = []
+    weather_type = 'none'
+    enemies = []
+    bots = []
+    items = []
+    barrels = []
+    portals = []
+    bul = []
+    proj = []
+    corpses = []
+    players = []
+    dwall_hp = {}
+    bridge_open = set()
+    explored = []

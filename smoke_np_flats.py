@@ -22,6 +22,7 @@ import numpy as np  # noqa: E402
 import pygame  # noqa: E402
 
 from engine.constants import FOV, TILE, TEX_W  # noqa: E402
+from engine import constants as const  # noqa: E402
 from engine import np_flats  # noqa: E402
 
 
@@ -126,12 +127,32 @@ def test_sample_pixels_matches():
     print("  sample_pixels     OK")
 
 
+def test_fov_change_rebuilds_maps():
+    # FOV is a settings knob. The maps are keyed by it, so changing FOV must
+    # rebuild them -- and the module must read ``const.FOV`` live, not a copy
+    # frozen at import (which kept flats rasterized at the launch-time FOV).
+    saved = const.FOV
+    try:
+        const.FOV = math.radians(60.0)
+        m1 = np_flats.get_maps(320, 240)
+        const.FOV = math.radians(120.0)
+        m2 = np_flats.get_maps(320, 240)
+        assert m1 is not m2, "maps not rebuilt on FOV change"
+        assert not np.allclose(m1.u_off, m2.u_off), "u_off unchanged with FOV"
+        # 120 deg spans wider tangents than 60 deg at the edges.
+        assert abs(m2.u_off[0]) > abs(m1.u_off[0])
+    finally:
+        const.FOV = saved
+    print("  fov change rebuilds maps  OK")
+
+
 def main():
     test_maps()
     test_tex_array()
     test_floor_row()
     test_ceiling_row()
     test_sample_pixels_matches()
+    test_fov_change_rebuilds_maps()
     print("smoke_np_flats: ALL OK")
 
 

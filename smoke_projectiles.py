@@ -164,8 +164,24 @@ def test_damage_on_flight():
     print("damage on flight + from_player snapshot OK")
 
 
+def test_enemy_projectile_cap():
+    """Enemy volleys share a budget: without MAX_ENEMY_PROJ the world grew with
+    the enemy count instead of with the live shots."""
+    from server.game_data import MAX_ENEMY_PROJ
+    from server.game_world import GameWorld
+    w = GameWorld(mode='pve')
+    en = {'id': 1, 'x': 100.0, 'y': 100.0, 'col': (1, 2, 3)}
+    rdb = {'spd': 5.0, 'dmg': 5, 'n': 1, 'cone': 0.0}
+    for _ in range(MAX_ENEMY_PROJ * 3):
+        w._fire_enemy_proj(en, rdb, 200.0, 100.0)
+    enemy_balls = [b for b in w.bullets if not b.get('from_player')]
+    assert len(enemy_balls) <= MAX_ENEMY_PROJ, len(enemy_balls)
+    print(f"enemy projectile cap enforced ({len(enemy_balls)} <= {MAX_ENEMY_PROJ}) OK")
+
+
 if __name__ == '__main__':
     asyncio.run(run_live())
     test_bridge_particles_and_render()
     test_damage_on_flight()
+    test_enemy_projectile_cap()
     print("PROJECTILES SMOKE PASSED")

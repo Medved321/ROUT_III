@@ -138,6 +138,37 @@ def test_neighbor_alert():
     print("neighbor alert AOE OK")
 
 
+def test_grid_block_is_a_superset():
+    """The 3x3 block must hold every enemy within one cell on both axes, which
+    is what lets the alert/separation scans drop the O(n) roster walk."""
+    import random as _r
+    w = GameWorld(mode='pve')
+    _park_player(w, 900.0, 900.0)
+    rng = _r.Random(1234)
+    enemies = [_mk_enemy(w, i, rng.uniform(0, 4000), rng.uniform(0, 4000))
+               for i in range(1, 401)]
+    w.enemies.extend(enemies)
+    for cell in (float(ENEMY_ALERT_AOE), float(ENEMY_RADIUS * 2)):
+        grid = w._enemy_grid(enemies, cell)
+        for en in enemies:
+            got = {id(o) for o in w._grid_block(grid, cell, en['x'], en['y'])}
+            want = {id(o) for o in enemies
+                    if abs(o['x'] - en['x']) <= cell and abs(o['y'] - en['y']) <= cell}
+            assert want <= got, (cell, en['x'], en['y'])
+    print("grid block is a superset of the cell-neighborhood OK")
+
+
+def test_grid_skips_dead():
+    w = GameWorld(mode='pve')
+    a = _mk_enemy(w, 1, 100.0, 100.0)
+    b = _mk_enemy(w, 2, 110.0, 100.0)
+    b['a'] = False
+    w.enemies.extend([a, b])
+    grid = w._enemy_grid(w.enemies, 300.0)
+    assert w._grid_block(grid, 300.0, 100.0, 100.0) == [a]
+    print("grid excludes dead enemies OK")
+
+
 if __name__ == '__main__':
     test_spawn_fields()
     test_projectile_hurts_other_enemy()
@@ -146,4 +177,6 @@ if __name__ == '__main__':
     test_retaliation_then_return_to_player()
     test_melee_hits_enemy_target()
     test_neighbor_alert()
+    test_grid_block_is_a_superset()
+    test_grid_skips_dead()
     print("INFIGHTING SMOKE PASSED")

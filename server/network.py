@@ -153,24 +153,33 @@ class ServerNetwork:
             endpoint.tick(now)
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        packet = Packet.decode(data)
-        if packet is None:
-            return
+        # A datagram is untrusted bytes: a valid 3-byte header with a short or
+        # garbage payload makes every `decode_*` raise `struct.error`, which
+        # would otherwise surface as an unhandled callback exception and flood
+        # the log.  A malformed datagram is dropped; one bad packet must never
+        # affect the rest of the server.
+        try:
+            packet = Packet.decode(data)
+            if packet is None:
+                return
 
-        if packet.ptype == PacketType.HELLO:
-            self._handle_hello(addr, packet.payload)
-        elif packet.ptype == PacketType.RELIABLE_DATA:
-            self._endpoint(addr).on_reliable(packet.sequence, packet.payload)
-            self._drain_reliable(addr)
-        elif packet.ptype == PacketType.ACK:
-            self._endpoint(addr).on_ack(packet.payload)
-        elif packet.ptype == PacketType.JOIN_REQUEST:
-            # Accepted only through the reliable channel.
-            return
-        elif packet.ptype == PacketType.PLAYER_INPUT:
-            self._handle_input(addr, packet)
-        elif packet.ptype == PacketType.PING:
-            self._handle_ping(addr, packet)
+            if packet.ptype == PacketType.HELLO:
+                self._handle_hello(addr, packet.payload)
+            elif packet.ptype == PacketType.RELIABLE_DATA:
+                self._endpoint(addr).on_reliable(packet.sequence, packet.payload)
+                self._drain_reliable(addr)
+            elif packet.ptype == PacketType.ACK:
+                self._endpoint(addr).on_ack(packet.payload)
+            elif packet.ptype == PacketType.JOIN_REQUEST:
+                # Accepted only through the reliable channel.
+                return
+            elif packet.ptype == PacketType.PLAYER_INPUT:
+                self._handle_input(addr, packet)
+            elif packet.ptype == PacketType.PING:
+                self._handle_ping(addr, packet)
+        except Exception:
+            logger.debug(f"Malformed datagram from {addr} ({len(data)} bytes)",
+                         exc_info=True)
 
     def _drain_reliable(self, addr: tuple[str, int]) -> None:
         endpoint = self._endpoint(addr)

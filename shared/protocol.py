@@ -259,7 +259,8 @@ def encode_world_state(
     doors: list[dict] | None = None,
 ) -> bytes:
     mode_byte = MODES.get(mode, 0)
-    header = struct.pack("!HBB", tick, mode_byte, len(players))
+    # tick grows beyond uint16 after ~54 min; use uint32 to avoid struct.error
+    header = struct.pack("!IBB", tick & 0xFFFFFFFF, mode_byte, len(players))
     body = b""
     for p in players:
         ammo = p.get("ammo", {})
@@ -376,9 +377,9 @@ def encode_world_state(
 
 
 def decode_world_state(data: bytes) -> tuple[int, list[dict], list[dict], list[dict], list[dict], str, list[dict], list[dict], list[dict]]:
-    tick, mode_byte, count = struct.unpack("!HBB", data[:4])
+    tick, mode_byte, count = struct.unpack("!IBB", data[:6])
     players = []
-    offset = 4
+    offset = 6
     for _ in range(count):
         pid, x, y, angle, hp, state, wpn, ap, ash, asg, ark, abfg, fire_seq, fire_ready, fire_reason, armor_value, armor_idx, pu_idx, keys, use_reason = struct.unpack(
             "!HfffBBBBBBBBIBBBBBBB", data[offset:offset + 33]
@@ -482,15 +483,20 @@ def encode_join_accept(
     map_format: int = 0,
 ) -> bytes:
     has_map = 1 if map_data else 0
+    # player_id is uint16, matching the world-state record: it comes from the
+    # same monotonic join counter, and as a byte it overflowed into a
+    # ``struct.error`` in ``send_join_accept`` after 255 joins in one server
+    # lifetime.  An id is an identity, so it is widened rather than clamped.
     header = struct.pack(
-        "!BHHBB", player_id, map_width, map_height, has_map, map_format & 0xFF
+        "!HHHBB", player_id & 0xFFFF, map_width, map_height, has_map,
+        map_format & 0xFF,
     )
     return header + map_data
 
 
 def decode_join_accept(data: bytes) -> tuple[int, int, int, bool, bytes, int]:
-    pid, mw, mh, has_map, map_format = struct.unpack("!BHHBB", data[:7])
-    map_data = data[7:] if has_map else b""
+    pid, mw, mh, has_map, map_format = struct.unpack("!HHHBB", data[:8])
+    map_data = data[8:] if has_map else b""
     return pid, mw, mh, bool(has_map), map_data, map_format
 
 
@@ -556,7 +562,7 @@ def encode_lobby_state(parties: list[dict]) -> bytes:
         out += struct.pack("!B", len(party["players"]))
         for player in party["players"]:
             player_bytes = player["name"].encode("utf-8")[:32]
-            out += struct.pack("!BB", player["id"], len(player_bytes)) + player_bytes
+            out += struct.pack("!HB", player["id"] & 0xFFFF, len(player_bytes)) + player_bytes
     return bytes(out)
 
 
@@ -574,8 +580,8 @@ def decode_lobby_state(data: bytes) -> list[dict]:
         offset += 1
         players = []
         for _ in range(player_count):
-            pid = data[offset]
-            offset += 1
+            pid = struct.unpack("!H", data[offset:offset + 2])[0]
+            offset += 2
             pname, offset = _decode_string(data, offset)
             players.append({"id": pid, "name": pname})
         parties.append({"id": party_id, "name": name, "mode": mode, "players": players})
@@ -641,7 +647,7 @@ def decode_join_party(data: bytes) -> int:
 
 
 def encode_party_created(party_id: int) -> bytes:
-    return struct.pack("!H", party_id)
+    return struct.pack("!H", party_id & 0xFFFF)
 
 
 def decode_party_created(data: bytes) -> int:

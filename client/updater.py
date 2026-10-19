@@ -8,18 +8,36 @@ from pathlib import Path
 
 from shared.releases import (
     artifact_path,
+    is_newer,
     latest_version,
     list_versions,
     read_latest_pointer,
     write_latest_pointer,
 )
 from shared.reliability import sha256_hex, verify_sha256
+from shared.version import CLIENT_VERSION
 
 logger = logging.getLogger(__name__)
 
 
 class UpdateError(Exception):
     pass
+
+
+def validate_offer(version: str, size: int, sha256: str) -> None:
+    """Reject a malformed or downgrade update offer before fetching any bytes.
+
+    The server already only advertises versions newer than the client's, but the
+    offer arrives over the same untrusted channel, so the client re-checks it
+    rather than trusting the server to be well-behaved.
+    """
+    if not is_newer(version, CLIENT_VERSION):
+        raise UpdateError(
+            f"Предложенная версия {version!r} не новее текущей {CLIENT_VERSION}"
+        )
+    digest = (sha256 or "").lower()
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise UpdateError(f"Некорректная контрольная сумма обновления: {sha256!r}")
 
 
 def default_releases_dir() -> Path:
@@ -41,6 +59,17 @@ def apply_update(
         raise UpdateError(
             f"Контрольная сумма не совпала для версии {version} "
             f"(получено {sha256_hex(data)[:12]}...)"
+        )
+    # Trust anchor for operators who want one. The advertised hash travels over
+    # the same channel as the artifact, so on its own it only catches transit
+    # corruption, not a malicious server. If ROUT_UPDATE_SHA256 is set, the
+    # artifact must also match that pinned value; without a pin the client trusts
+    # the server it connected to (the address guard in NetworkClient ensures the
+    # offer came from that server), which is the same trust model as the game.
+    pin = (os.environ.get("ROUT_UPDATE_SHA256") or "").strip().lower()
+    if pin and sha256_hex(data) != pin:
+        raise UpdateError(
+            "Контрольная сумма не совпала с закреплённой (ROUT_UPDATE_SHA256)"
         )
     directory = Path(releases_dir)
     directory.mkdir(parents=True, exist_ok=True)

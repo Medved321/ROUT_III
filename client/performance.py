@@ -128,18 +128,29 @@ class AdaptiveQuality:
         return 0.7 + 0.3 * self.quality_factor()
 
 
-async def input_send_loop(network, snapshot, interval: float, should_run=None) -> None:
+async def input_send_loop(
+    network, snapshot, interval: float, should_run=None, enabled=None
+) -> None:
     """Send the freshest input snapshot at a fixed rate, independent of FPS.
 
     ``snapshot`` is a zero-arg callable returning ``(move_x, move_y, angle,
     shoot, weapon_id, flags)``; it is read right before every send so the latest
     local prediction (including mouse rotation) always goes out.  ``flags``
     carries one-shot action intents (dash).
+
+    ``enabled`` is an optional zero-arg predicate.  When it returns False the
+    loop keeps ticking but sends nothing, and ``snapshot`` is not even sampled
+    (so a latched dash edge cannot be spent while muted).  Pausing uses it: a
+    paused client must not keep forwarding the last held keys, or the server
+    (which trusts the freshest input) would walk the player around while the
+    menu is up.  A separate predicate from ``should_run`` on purpose -- False
+    here does not tear the timer down, so playing resumes at the same rate.
     """
     try:
         while should_run is None or should_run():
-            move_x, move_y, angle, shoot, weapon_id, flags = snapshot()
-            network.send_input(move_x, move_y, angle, shoot, weapon_id, flags)
+            if enabled is None or enabled():
+                move_x, move_y, angle, shoot, weapon_id, flags = snapshot()
+                network.send_input(move_x, move_y, angle, shoot, weapon_id, flags)
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
         pass

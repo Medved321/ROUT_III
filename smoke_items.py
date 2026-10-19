@@ -40,7 +40,8 @@ def check(label, cond, detail=""):
 
 print("1. map -> server")
 from server.game_data import (ITEM_DB, ITEM_PICKUP_DIST,
-                              ARMOR_MAX, TICK_RATE, AMMO_KEYS, AMMO_MAX)
+                              ARMOR_MAX, TICK_RATE, AMMO_KEYS, AMMO_MAX,
+                              BERSERK_DMG_MULT)
 from server.game_world import GameWorld
 from shared.components import (Position, Health, WeaponComponent, Armor,
                                Powerup, Rotation)
@@ -272,7 +273,9 @@ check("dash still outruns walking",
       walk_speed('', dash=True) > base * DASH_SPEED_MULT * 0.9,
       (walk_speed('', dash=True), base))
 
-# BERSERK: double damage, free shots, and an empty magazine still refuses.
+# BERSERK: multiplied damage, free shots, and an empty magazine still refuses.
+# The multiplier is read from game_data so balance tuning does not silently
+# invalidate the check; the point is that the buff is applied at all.
 ws = GameWorld(mode='pvp')
 s1 = ws.add_player(1, 'A')
 s2 = ws.add_player(2, 'B')
@@ -299,7 +302,7 @@ def hit_for(powerup):
 
 plain_dmg = hit_for('')
 berserk_dmg = hit_for('BERSERK')
-check("berserk doubles damage", berserk_dmg == plain_dmg * 2,
+check("berserk multiplies damage", berserk_dmg == plain_dmg * BERSERK_DMG_MULT,
       (plain_dmg, berserk_dmg))
 
 spu.kind = 'BERSERK'
@@ -546,14 +549,15 @@ check("no powerup decodes as an empty string", ps2[0]['powerup'] == '',
 
 # An unknown index must not raise: a newer server must not crash an older client
 # with an IndexError inside the render loop. Byte 29/30 of the player record are
-# armor_idx / pu_idx (header is 4 bytes, the record is 31: id is uint16).
+# armor_idx / pu_idx (header is 6 bytes after the uint32 tick, the record is 33:
+# id is uint16).
 out = bytearray(encode_world_state(1, [player], [], [], [], 'pve', [], []))
-out[4 + 29] = 250
-out[4 + 30] = 250
+out[6 + 29] = 250
+out[6 + 30] = 250
 try:
     (_t, ps3, *_rest) = decode_world_state(bytes(out))
     check("unknown armor index degrades instead of raising",
-          ps3[0]['armor'] is None, ps3[0]['armor'])
+          ps3[0]['armor'] is None, repr(ps3[0]['armor']))
     check("unknown powerup index degrades instead of raising",
           ps3[0]['powerup'] == '', repr(ps3[0]['powerup']))
 except Exception as exc:  # noqa: BLE001 - the point is that this must not raise

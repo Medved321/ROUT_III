@@ -1150,6 +1150,7 @@ def render(vh=None, vy=None):
 
         # Wall raycasting with textures
         z_b = [999.0] * NC
+        crack_segments = []
         for i in range(NC):
             ra = ra_start + (i / NC) * FOV
             c, s = cos_ra[i], sin_ra[i]
@@ -1297,24 +1298,32 @@ def render(vh=None, vy=None):
                 if ft_ < fb_:
                     frame.fill_rect(bx_, ft_, bw_, fb_ - ft_, (br, br, br))
 
-        # One upscale of the internal buffer onto the screen per frame.
-        gs.frame.draw_to(gs.screen, (const.W, _RH))
-
-        # Crack overlay on damaged destructible walls
-        if tile in ('H', 'T', 'W', 'M', 'I', 'P'):
-            dwall_key = (cur_tx, cur_ty)
-            if dwall_key in gs.dwall_hp:
-                dhp = gs.dwall_hp[dwall_key]
-                if dhp < 60 and wh > 10:
+            # Damaged destructible walls crack as HP drops. Segments are
+            # collected per column here and drawn on the upscaled screen below:
+            # the overlay must run for every column that hit such a wall, not
+            # once after the ray loop with whatever the last column happened to
+            # hit (which is why cracks only ever appeared on one column).
+            if tile in ('H', 'T', 'W', 'M', 'I', 'P') and wh > 10:
+                dhp = gs.dwall_hp.get((cur_tx, cur_ty))
+                if dhp is not None and dhp < 60:
                     crack_density = 1.0 - (dhp / 60.0)
-                    crack_col = (20, 15, 10)
                     wh_i = int(wh)
                     for _ in range(max(1, int(3 * crack_density))):
                         cy2 = draw_y + random.randint(0, max(1, wh_i - 1))
                         cx2 = i * SCALE + random.randint(0, SCALE - 1)
                         cl = max(1, int(3 * crack_density))
-                        pygame.draw.line(gs.screen, crack_col, (cx2 - cl, cy2), (cx2 + cl, cy2 - cl // 2), 1)
-                        pygame.draw.line(gs.screen, crack_col, (cx2 - cl // 2, cy2 + 1), (cx2 + cl, cy2 + 1), 1)
+                        crack_segments.append((cx2, cy2, cl))
+
+        # One upscale of the internal buffer onto the screen per frame.
+        gs.frame.draw_to(gs.screen, (const.W, _RH))
+
+        # Crack overlay on damaged destructible walls, after the upscale so the
+        # 1px cracks stay crisp.
+        for cx2, cy2, cl in crack_segments:
+            pygame.draw.line(gs.screen, (20, 15, 10),
+                             (cx2 - cl, cy2), (cx2 + cl, cy2 - cl // 2), 1)
+            pygame.draw.line(gs.screen, (20, 15, 10),
+                             (cx2 - cl // 2, cy2 + 1), (cx2 + cl, cy2 + 1), 1)
 
     # Sprites (shared between tile and sector modes)
     objs = sorted([e for e in gs.enemies if e['a'] or e.get('dying', 0) > 0] + [i for i in gs.items if i['a']] + gs.bul + gs.proj + gs.corpses + gs.portals + [b for b in gs.barrels if b.get('a', True)],

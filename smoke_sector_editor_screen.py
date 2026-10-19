@@ -114,6 +114,8 @@ def main():
     _check_load_reports_a_repair(scr, surface)
     _check_selection_survives_nothing(scr, surface)
     _check_map_list(scr, surface)
+    _check_walls_toggle(surface)
+    _check_walls_create_status(scr, surface)
     print("smoke_sector_editor_screen: ALL OK")
 
 
@@ -538,6 +540,26 @@ def _check_tex_palette(scr, surface) -> None:
     assert ed.sides[back].lower == "wood", "the back lip was not reset"
     assert ed.sides[back].upper == "stone"
     assert ed.sides[front].lower == "wall"
+    # The MAIN wall texture (mid) is now a first-class slot.  A solid wall is
+    # painted from its mid texture — the renderer draws no lower/upper lip for an
+    # opaque wall — so selecting it must default the palette to STENA (mid), and
+    # a click must land in sd.mid.  Before this the UI only ever wrote the
+    # lower/upper step lips, so "setting a wall texture" changed nothing visible.
+    ed.lines[li].solid = True
+    scr._set_sel(line=li)
+    scr.draw(surface)
+    assert scr._tex_target == "mid", scr._tex_target
+    assert "mid" in scr._tex_chips, sorted(scr._tex_chips)
+    assert scr.panel.contains(scr._tex_chips["mid"]), scr._tex_chips["mid"]
+    scr.handle([_evt(pygame.MOUSEBUTTONDOWN,
+                     pos=scr._tex_rects["martyr"].center, button=1)])
+    assert ed.sides[ed.lines[li].front].mid == "martyr", \
+        ed.sides[ed.lines[li].front].mid
+    assert "martyr" in scr.status, scr.status
+    # a non-solid portal goes back to defaulting on the step lip (lower)
+    ed.lines[li].solid = False
+    scr._set_sel(line=li)
+    assert scr._tex_target == "lower", scr._tex_target
     # the palette survives deselect/reselect with the assigned values in place
     scr._set_sel()
     scr.draw(surface)
@@ -795,6 +817,96 @@ def _check_load_reports_a_repair(scr, surface) -> None:
         scr.status
     assert scr.editor.repair_notes == [], scr.editor.repair_notes
     print("  load status names the repair, and stays quiet on a healthy map")
+
+
+def _check_walls_toggle(surface) -> None:
+    """The create-time walls toggle flips flag, tick and layout together.
+
+    The label IS the button's width, so gaining a tick can push a button into
+    a new row. The canvas sits above the toolbar at a height derived from it,
+    so both have to follow, or the drawn boxes and the hitboxes drift apart
+    and the canvas starts under the toolbar it is supposed to end above.
+    """
+    for w, h in ((1000, 700), (1152, 648), (1600, 900)):
+        scr = SectorEditorScreen(w, h)
+        surf = pygame.Surface((w, h))
+        scr.draw(surf)
+        ed = scr.editor
+        assert not ed.solid_on_create, "OFF (portals) is the default"
+        assert scr._button_labels()["walls"] == "Стены: проём"
+
+        rebuilt: list[bool] = []
+        real_panel = scr._build_panel
+        scr._build_panel = lambda: rebuilt.append(True) or real_panel()
+        before = scr.buttons["walls"]
+        scr.handle([_evt(pygame.MOUSEBUTTONDOWN, pos=before.center, button=1)])
+        scr._build_panel = real_panel
+
+        assert ed.solid_on_create is True, "the click must flip the model flag"
+        assert "глухие стены" in scr.status, scr.status
+        assert rebuilt == [True], "a changed toolbar must re-build the panel"
+        scr.draw(surf)
+        label = scr._button_labels()["walls"]
+        assert label.endswith("✓"), label
+        assert scr.buttons["walls"].size != before.size, \
+            "the grown label must re-lay the row, not poke out of its button"
+
+        # geometry is consistent after the rebuild
+        assert scr.canvas.height == h - 56 - scr._toolbar_h - 8, \
+            f"{w}x{h}: canvas {scr.canvas.height} follows neither the toolbar"
+        rects = list(scr.buttons.values())
+        for r in rects:
+            assert r.y >= scr.canvas.bottom, \
+                f"{w}x{h}: a button at {r} sits over the canvas {scr.canvas}"
+        for i, a in enumerate(rects):
+            for b in rects[i + 1:]:
+                assert not a.colliderect(b), f"{w}x{h}: {a} overlaps {b}"
+        assert all(0 <= r.x and r.right <= w and 0 <= r.y and r.bottom <= h
+                   for r in rects), f"{w}x{h}: a button left the window"
+        # clicking the redrawn button still lands on it, and switches back
+        scr.handle([_evt(pygame.MOUSEBUTTONDOWN,
+                         pos=scr.buttons["walls"].center, button=1)])
+        assert ed.solid_on_create is False, "the second click must switch off"
+        assert "проёмы" in scr.status, scr.status
+        scr.draw(surf)
+        assert not scr._button_labels()["walls"].endswith("✓")
+        assert scr.canvas.height == h - 56 - scr._toolbar_h - 8
+    print("  walls toggle     OK")
+
+
+def _check_walls_create_status(scr, surface) -> None:
+    """Creating through the screen seals only with the toggle on, and says so."""
+    ed = SectorEditor(new_room(1600, 1600))
+    scr.editor = ed
+    scr.frame_around()
+
+    def box(x0, y0, x1, y1):
+        v1 = ed.add_vertex(x0, y0)
+        v2 = ed.add_vertex(x1, y0)
+        v3 = ed.add_vertex(x1, y1)
+        v4 = ed.add_vertex(x0, y1)
+        return [ed.add_line(a, b) for a, b in
+                ((v1, v2), (v2, v3), (v3, v4), (v4, v1))]
+
+    scr.contour = box(300, 300, 700, 700)
+    scr._create_sector()
+    assert scr.status.endswith("(проёмы)"), scr.status
+    assert not any(l.solid for l in ed.lines), \
+        "the default must leave the new boundary as portals"
+    assert not ed.validate(), ed.validate()
+
+    scr.contour = box(1000, 1000, 1400, 1400)
+    ed.solid_on_create = True
+    scr._create_sector()
+    assert scr.status.endswith("(глухие стены)"), scr.status
+    sealed = [l for l in ed.lines if l.solid]
+    assert len(sealed) == 4, f"exactly the second box: {sealed}"
+    assert all(ed.sm.line_blocks(i) for i, l in enumerate(ed.lines) if l.solid)
+    assert not ed.validate(), ed.validate()
+    assert ed.sm.has_polygon(1) and ed.sm.has_polygon(2), "both contours alive"
+    assert ed.sm.find_sector_at(500, 500) == 1, "the portal box stays open"
+    scr.draw(surface)
+    print("  create status    OK")
 
 
 if __name__ == "__main__":
