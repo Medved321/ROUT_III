@@ -1,9 +1,59 @@
 from __future__ import annotations
 
+import math
 import struct
 from enum import IntEnum
 from dataclasses import dataclass
 from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Text sanitation.
+#
+# Strings that arrive from the network end up in logs (join name) and are
+# re-broadcast to other clients (party/player names).  A raw C0/C1 control
+# character -- most importantly '\n' -- turns one log line into many and can
+# forge entries, so control characters are stripped on decode.  Decoding is
+# also the boundary here: the encoder truncates to a byte budget, which can
+# split a multi-byte UTF-8 sequence and make the OTHER side raise
+# UnicodeDecodeError.  Both halves live next to each other so a change to the
+# budget cannot silently desynchronise them.
+# ---------------------------------------------------------------------------
+
+MAX_STRING_BYTES = 32
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    """Cut ``text`` to at most ``max_bytes`` bytes WITHOUT splitting a character.
+
+    Slicing the encoded bytes at an arbitrary offset can land inside a UTF-8
+    continuation byte (0b10xxxxxx); the decoder on the far side then sees an
+    invalid sequence and raises.  Walking back to the start of the character
+    keeps the wire payload valid UTF-8 by construction.
+    """
+    data = text.encode("utf-8")
+    if len(data) <= max_bytes:
+        return text
+    cut = max_bytes
+    while cut > 0 and (data[cut] & 0xC0) == 0x80:
+        cut -= 1
+    return data[:cut].decode("utf-8")
+
+
+def sanitize_text(text: str, max_bytes: int = MAX_STRING_BYTES) -> str:
+    """Make an untrusted name log-safe and wire-safe.
+
+    Strips C0/C1 control characters (including the newlines that would let a
+    peer inject fake log lines) and truncates on a character boundary.  The
+    result is always valid UTF-8 of at most ``max_bytes`` bytes, so it survives
+    both a log write and a round trip through ``_encode_string``.
+    """
+    if not isinstance(text, str):
+        return ""
+    cleaned = "".join(
+        ch for ch in text
+        if not (ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F)
+    )
+    return _truncate_utf8(cleaned, max_bytes)
 
 
 class PacketType(IntEnum):
@@ -36,6 +86,10 @@ class PacketType(IntEnum):
     # Reliable per-click fire intent (fire_seq monotonic). Gameplay fire via
     # the unreliable PLAYER_INPUT channel stays as hold-fire auto-fire.
     FIRE = 0x27
+    # Reliable "respawn me" request (C -> S, empty body). Death no longer
+    # auto-respawns, so the client asks for it explicitly; a reliable channel
+    # means the click survives a lost datagram (match-end design D4).
+    PLAYER_RESPAWN = 0x28
 
 
 # Action intent bits carried by the PLAYER_INPUT `flags` byte. A bitfield
@@ -102,6 +156,12 @@ POWERUP_TYPES = ("", "BERSERK", "HASTE", "INVULN")
 
 MODES = {"pve": 0, "pvp": 1}
 MODE_NAMES = {v: k for k, v in MODES.items()}
+
+# Match lifecycle phase, sent as the trailing block of WORLD_STATE so it is
+# read from the same frame as the entities it describes (no side packet to
+# race). Index is the wire value; names travel verbatim to the client.
+MATCH_PHASES = ("playing", "over")
+MATCH_PHASE_INDEX = {name: i for i, name in enumerate(MATCH_PHASES)}
 
 # Impact event types (tracer markers for wall/enemy hits). Wire order fixed.
 IMPACT_TYPES = ("wall", "enemy")
@@ -257,6 +317,7 @@ def encode_world_state(
     impacts: list[dict] | None = None,
     items: list[dict] | None = None,
     doors: list[dict] | None = None,
+    match: dict | None = None,
 ) -> bytes:
     mode_byte = MODES.get(mode, 0)
     # tick grows beyond uint16 after ~54 min; use uint32 to avoid struct.error
@@ -278,6 +339,11 @@ def encode_world_state(
         armor_type = armor.get("type", "green")
         armor_idx = ARMOR_TYPES.index(armor_type) if armor_type in ARMOR_TYPES else 0
         pu_idx = POWERUP_TYPES.index(powerup) if powerup in POWERUP_TYPES else 0
+        # Per-player stats live in the record, not in a side packet: they are
+        # read from the same frame as the player they describe, so the results
+        # screen can never show counters from a different snapshot.  A missing
+        # "stats" dict encodes as all zeros, so an old caller still round-trips.
+        stats = p.get("stats") or {}
         body += struct.pack(
             # player_id is uint16 on purpose: it comes from a monotonic join
             # counter with no 255 ceiling, and as a byte it was the second way
@@ -288,7 +354,7 @@ def encode_world_state(
             # keys: the player's key bitmask (R/Y/B), use_reason: advisory code
             # for the last "use" attempt (0 = none/ok).  Both are per-player
             # state with no other source in the snapshot.
-            "!HfffBBBBBBBBIBBBBBBB",
+            "!HfffBBBBBBBBIBBBBBBBHHIIHHHH",
             p["id"] & 0xFFFF,
             p["x"], p["y"], p["angle"],
             _u8(p["health"]),
@@ -305,6 +371,14 @@ def encode_world_state(
             pu_idx,
             int(p.get("keys", 0)) & 0xFF,
             int(p.get("use_reason", 0)) & 0xFF,
+            int(stats.get("kills", 0)) & 0xFFFF,
+            int(stats.get("deaths", 0)) & 0xFFFF,
+            int(stats.get("damage_dealt", 0)) & 0xFFFFFFFF,
+            int(stats.get("damage_taken", 0)) & 0xFFFFFFFF,
+            int(stats.get("shots_fired", 0)) & 0xFFFF,
+            int(stats.get("shots_hit", 0)) & 0xFFFF,
+            int(stats.get("items", 0)) & 0xFFFF,
+            int(stats.get("secrets", 0)) & 0xFFFF,
         )
         body += _encode_string(p.get("name", ""))
     # Enemies
@@ -373,6 +447,19 @@ def encode_world_state(
         body += struct.pack("!HB",
                             d.get("li", d.get("id", 0)) & 0xFFFF,
                             _u8(d.get("progress", 0)))
+    # Match block: phase (playing/over), winner id (0 = none/draw) and the
+    # PvP clock in seconds, plus the party's total secret count for the HUD.
+    # Read separately from the entity tuple so the 9-element shape every caller
+    # unpacks does not grow (decode_match_block reads the trailing bytes).
+    match = match or {}
+    phase_byte = MATCH_PHASE_INDEX.get(match.get("phase", "playing"), 0)
+    body += struct.pack(
+        "!BHHH",
+        phase_byte,
+        int(match.get("winner_id", 0)) & 0xFFFF,
+        int(match.get("time_left", 0)) & 0xFFFF,
+        int(match.get("secrets_total", 0)) & 0xFFFF,
+    )
     return header + body
 
 
@@ -381,10 +468,13 @@ def decode_world_state(data: bytes) -> tuple[int, list[dict], list[dict], list[d
     players = []
     offset = 6
     for _ in range(count):
-        pid, x, y, angle, hp, state, wpn, ap, ash, asg, ark, abfg, fire_seq, fire_ready, fire_reason, armor_value, armor_idx, pu_idx, keys, use_reason = struct.unpack(
-            "!HfffBBBBBBBBIBBBBBBB", data[offset:offset + 33]
+        (pid, x, y, angle, hp, state, wpn, ap, ash, asg, ark, abfg,
+         fire_seq, fire_ready, fire_reason, armor_value, armor_idx, pu_idx,
+         keys, use_reason, s_kills, s_deaths, s_dealt, s_taken,
+         s_fired, s_hit, s_items, s_secrets) = struct.unpack(
+            "!HfffBBBBBBBBIBBBBBBBHHIIHHHH", data[offset:offset + 53]
         )
-        offset += 33
+        offset += 53
         name, offset = _decode_string(data, offset)
         players.append({
             "id": pid, "x": x, "y": y, "angle": angle,
@@ -402,6 +492,12 @@ def decode_world_state(data: bytes) -> tuple[int, list[dict], list[dict], list[d
                         if 0 <= pu_idx < len(POWERUP_TYPES) else ""),
             "keys": keys,
             "use_reason": use_reason,
+            "stats": {
+                "kills": s_kills, "deaths": s_deaths,
+                "damage_dealt": s_dealt, "damage_taken": s_taken,
+                "shots_fired": s_fired, "shots_hit": s_hit,
+                "items": s_items, "secrets": s_secrets,
+            },
         })
     # Enemies
     e_count = struct.unpack("!H", data[offset:offset + 2])[0]
@@ -465,14 +561,49 @@ def decode_world_state(data: bytes) -> tuple[int, list[dict], list[dict], list[d
             MODE_NAMES.get(mode_byte, 'pve'), impacts, items, doors)
 
 
+def decode_match_block(data: bytes) -> dict:
+    """Read the trailing match block of a WORLD_STATE payload.
+
+    Kept apart from ``decode_world_state`` on purpose: the entity tuple keeps
+    its 9-element shape for every existing caller, while the phase/winner/clock
+    block is appended last and read here.  A payload without the block (a
+    caller that never passed ``match``) degrades to a playing, no-winner,
+    zero-clock match instead of raising.
+    """
+    if len(data) < 7:
+        return {"phase": "playing", "winner_id": 0, "time_left": 0,
+                "secrets_total": 0}
+    phase_byte, winner_id, time_left, secrets_total = struct.unpack(
+        "!BHHH", data[-7:]
+    )
+    return {
+        "phase": MATCH_PHASES[phase_byte] if 0 <= phase_byte < len(MATCH_PHASES)
+                 else "playing",
+        "winner_id": winner_id,
+        "time_left": time_left,
+        "secrets_total": secrets_total,
+    }
+
+
+def encode_player_respawn() -> bytes:
+    return b""
+
+
+def decode_player_respawn(data: bytes) -> None:
+    return None
+
+
 def encode_join_request(name: str) -> bytes:
-    name_bytes = name.encode("utf-8")[:32]
+    name_bytes = sanitize_text(name).encode("utf-8")
     return struct.pack("!B", len(name_bytes)) + name_bytes
 
 
 def decode_join_request(data: bytes) -> str:
     length = data[0]
-    return data[1:1 + length].decode("utf-8")
+    # errors="replace" instead of a raising decode: the payload is untrusted and
+    # an invalid sequence must not abort the datagram handler.  sanitize_text
+    # then strips control characters before the name reaches a log line.
+    return sanitize_text(data[1:1 + length].decode("utf-8", errors="replace"))
 
 
 def encode_join_accept(
@@ -501,11 +632,18 @@ def decode_join_accept(data: bytes) -> tuple[int, int, int, bool, bytes, int]:
 
 
 def encode_ping(timestamp: float) -> bytes:
+    # A non-finite timestamp must not go on the wire: it would be echoed back
+    # and turn the client's RTT into NaN, which then propagates into the HUD.
+    if not math.isfinite(timestamp):
+        timestamp = 0.0
     return struct.pack("!d", timestamp)
 
 
 def decode_ping(data: bytes) -> float:
-    return struct.unpack("!d", data)[0]
+    value = struct.unpack("!d", data)[0]
+    # None of the server's clocks produce inf/nan; a peer sending one is either
+    # broken or probing, and either way the sane response is "no timestamp".
+    return value if math.isfinite(value) else 0.0
 
 
 def encode_bullet_spawn(bullet_id: int, x: float, y: float, angle: float, owner: int) -> bytes:
@@ -541,27 +679,32 @@ def decode_respawn_event(data: bytes) -> tuple[int, float, float, float]:
     return struct.unpack("!Bfff", data)
 
 
-def _encode_string(message: str, max_len: int = 32) -> bytes:
-    data = message.encode("utf-8")[:max_len]
+def _encode_string(message: str, max_len: int = MAX_STRING_BYTES) -> bytes:
+    data = sanitize_text(message, max_len).encode("utf-8")
     return struct.pack("!B", len(data)) + data
 
 
 def _decode_string(data: bytes, offset: int = 0) -> tuple[str, int]:
     length = data[offset]
-    return data[offset + 1:offset + 1 + length].decode("utf-8"), offset + 1 + length
+    text = data[offset + 1:offset + 1 + length].decode("utf-8", errors="replace")
+    # Strip control characters only: the length prefix already bounded the
+    # field, and re-applying the 32-byte default here would silently truncate
+    # fields the encoder deliberately allowed to be longer (a 64-char sha256,
+    # a 64-byte version tag) -- which corrupts them.
+    return sanitize_text(text, 256), offset + 1 + length
 
 
 def encode_lobby_state(parties: list[dict]) -> bytes:
     out = bytearray(struct.pack("!B", len(parties)))
     for party in parties:
         out += struct.pack("!H", party["id"])
-        name_bytes = party["name"].encode("utf-8")[:32]
+        name_bytes = sanitize_text(party["name"]).encode("utf-8")
         out += struct.pack("!B", len(name_bytes)) + name_bytes
         mode_byte = MODES.get(party.get("mode", "pve"), 0)
         out += struct.pack("!B", mode_byte)
         out += struct.pack("!B", len(party["players"]))
         for player in party["players"]:
-            player_bytes = player["name"].encode("utf-8")[:32]
+            player_bytes = sanitize_text(player["name"]).encode("utf-8")
             out += struct.pack("!HB", player["id"] & 0xFFFF, len(player_bytes)) + player_bytes
     return bytes(out)
 

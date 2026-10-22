@@ -52,21 +52,65 @@ def _enemies_in_range(world, x: float, y: float, rng: float):
             yield e
 
 
+# Spatial grid cell for shot resolution: 4 tiles.  The grid is built ONCE per
+# handle_shoot() (not per pellet), so SHOTGUN x7 / SSG x14 resolve every pellet
+# from the same buckets instead of walking the whole roster 7/14 times.
+_SHOT_GRID_CELL = 256.0
+
+
+def _ray_candidates(grid: dict, cell: float, live: int, x: float, y: float,
+                    ca: float, sa: float, t_end: float) -> list:
+    """Superset of live enemies whose circle can meet the ray ``[0, t_end]``.
+
+    The bounding box of the segment expanded by ``ENEMY_RADIUS`` contains the
+    centre of every circle that intersects the segment, so enumerating all
+    overlapping cells is exact for ANY cell size: this is a range query over
+    the whole box, not a 3x3 block around a point, so the AI rule
+    "cell >= query radius" does not apply here.  The caller re-checks every
+    candidate (``a``/``hp`` and the ray-circle test), so any superset yields
+    the same hit as the old full scan.
+
+    When the box spans more cells than there are live enemies (a 16500 px BFG
+    ray across an open map), a flat pass over the roster is cheaper than the
+    cell walk, so it falls back to one -- both paths stay supersets.
+    """
+    ex = x + ca * t_end
+    ey = y + sa * t_end
+    m = ENEMY_RADIUS
+    x0, x1 = (x, ex) if x <= ex else (ex, x)
+    y0, y1 = (y, ey) if y <= ey else (ey, y)
+    cx0, cx1 = int((x0 - m) // cell), int((x1 + m) // cell)
+    cy0, cy1 = int((y0 - m) // cell), int((y1 + m) // cell)
+    if (cx1 - cx0 + 1) * (cy1 - cy0 + 1) <= live:
+        out: list = []
+        for cx in range(cx0, cx1 + 1):
+            for cy in range(cy0, cy1 + 1):
+                bucket = grid.get((cx, cy))
+                if bucket:
+                    out.extend(bucket)
+        return out
+    return [en for bucket in grid.values() for en in bucket]
+
+
 def _ray_wall_dist(world, x: float, y: float, angle: float, dist: float) -> float:
     """Distance along a ray until it hits a wall, capped by ``dist`` (px).
 
     Steps from the muzzle with a step much smaller than the entity radius
     (4 px) and includes points closer than 8 px from the muzzle, so a wall
-    right in front of the barrel blocks the shot.
+    right in front of the barrel blocks the shot.  ``cos``/``sin`` of the
+    ray angle are hoisted out of the step loop: they are loop-invariant, and
+    a 900 px ray took 225 x 2 trig calls per pellet for the same values.
     """
     step = 4.0
     nx = x
     ny = y
     travelled = 0.0
+    ca = math.cos(angle)
+    sa = math.sin(angle)
     while travelled < dist:
         travelled += step
-        nx = x + math.cos(angle) * travelled
-        ny = y + math.sin(angle) * travelled
+        nx = x + ca * travelled
+        ny = y + sa * travelled
         if world.is_wall_px(nx, ny):
             return travelled
     return dist
@@ -108,17 +152,29 @@ def _angle_diff(a: float, b: float) -> float:
     return abs(d)
 
 
-def _damage_enemy(world, en, dmg: int, shooter_name: str = '') -> None:
+def _damage_enemy(world, en, dmg: int,
+                  shooter_eid: int | None = None) -> None:
+    """Damage an enemy and credit the shooter's stats.
+
+    ``shooter_eid`` is the player entity that fired, or None for infighting
+    (an enemy projectile hitting another enemy) -- only player damage is
+    attributed, so an infighting kill is nobody's frag.
+    """
     if not en['a'] or en['hp'] <= 0:
         return
     en['hp'] = max(0, en['hp'] - dmg)
     en['d_flash'] = 5
+    if shooter_eid is not None:
+        world.note_damage_dealt(shooter_eid, dmg)
     if en['hp'] <= 0:
-        world.kill_enemy(en, shooter_name)
+        world.kill_enemy(en)
+        if shooter_eid is not None:
+            world.note_kill(shooter_eid)
 
 
-def _damage_player(world, target_eid: int, dmg: int) -> None:
-    world.damage_player(target_eid, dmg)
+def _damage_player(world, target_eid: int, dmg: int,
+                   source_eid: int | None = None) -> None:
+    world.damage_player(target_eid, dmg, source_eid)
 
 
 def _hitscan_players(world, shooter_eid: int, x: float, y: float,
@@ -141,7 +197,7 @@ def _hitscan_players(world, shooter_eid: int, x: float, y: float,
             best_eid = eid
     if best_eid is None:
         return False
-    _damage_player(world, best_eid, dmg)
+    _damage_player(world, best_eid, dmg, source_eid=shooter_eid)
     pos = world.entities.get_component(best_eid, Position)
     world.impact(pos.x, pos.y, 'enemy')
     return True
@@ -178,7 +234,9 @@ def handle_shoot(world, entity_id: int) -> FireResult:
     if wdef.get('melee'):
         wp.fire_cooldown = wpn_cooldown_ticks(wdef['f'])
         pl.state = 2
-        _fire_melee(world, entity_id, pos, rot, dmg_mult)
+        world.note_shot_fired(entity_id)
+        if _fire_melee(world, entity_id, pos, rot, dmg_mult):
+            world.note_shot_hit(entity_id)
         return FireResult(True, '', wp.fire_cooldown)
 
     # ammo
@@ -228,10 +286,28 @@ def handle_shoot(world, entity_id: int) -> FireResult:
             'src': entity_id,
             'from_player': True,
         })
+        # Counted at spawn: the shot happened even if the ball never lands.
+        # The hit is recorded later, in GameWorld._resolve_player_ball.
+        world.note_shot_fired(entity_id)
         return FireResult(True, '', wp.fire_cooldown)
 
+    # One spatial grid for the WHOLE shot, built after the melee/projectile
+    # early exits so those shots never pay for it.  FIRE is handled outside the
+    # AI tick (GameServer._on_player_fire), so the AI grids inside
+    # GameWorld._update_enemies are locals of a different phase and cannot be
+    # reused here; this one is short-lived and covers every pellet below.
+    # Same builder as the AI (GameWorld._enemy_grid -> live enemies only), and
+    # the per-candidate `a`/`hp` re-check also drops anything killed by an
+    # earlier pellet of this same volley.
+    grid = world._enemy_grid(world.enemies, _SHOT_GRID_CELL)
+    live = sum(len(b) for b in grid.values())
+
+    world.note_shot_fired(entity_id)
+    any_hit = False
     for _ in range(pellets):
         angle = base_angle + (random.uniform(-cone, cone) if cone else 0.0)
+        ca = math.cos(angle)
+        sa = math.sin(angle)
         # Wall distance along the same ray (4 px steps from the muzzle, incl.
         # points closer than 8 px). The nearest of "wall" and "entity" wins.
         end_dist = _ray_wall_dist(world, x, y, angle, rng)
@@ -239,13 +315,15 @@ def handle_shoot(world, entity_id: int) -> FireResult:
         # PvP players first
         if world.mode == 'pvp':
             if _hitscan_players(world, entity_id, x, y, angle, dmg, end_dist):
+                any_hit = True
                 continue
 
         # Enemies: nearest positive ray-circle intersection, with the wall as
         # an occluder (entity behind the wall is not hit; wall wins ties).
         best = None
         best_t = end_dist
-        for e in world.enemies:
+        for e in _ray_candidates(grid, _SHOT_GRID_CELL, live, x, y, ca, sa,
+                                 end_dist):
             if not e['a'] or e['hp'] <= 0:
                 continue
             t = _ray_circle_hit(x, y, angle, e['x'], e['y'], ENEMY_RADIUS, rng)
@@ -254,19 +332,25 @@ def handle_shoot(world, entity_id: int) -> FireResult:
             best = e
             best_t = t
         if best is not None:
-            _damage_enemy(world, best, dmg, pl.name)
+            _damage_enemy(world, best, dmg, entity_id)
             world.impact(best['x'], best['y'], 'enemy')
+            any_hit = True
         elif end_dist < rng:
             # ray terminated at a wall before max range -> wall tracer
-            wx = x + math.cos(angle) * end_dist
-            wy = y + math.sin(angle) * end_dist
+            wx = x + ca * end_dist
+            wy = y + sa * end_dist
             world.impact(wx, wy, 'wall')
 
+    # Accuracy is hits/shots at the volley level: a shotgun blast that lands any
+    # pellet counts as one hit shot, not seven (the shot is the click).
+    if any_hit:
+        world.note_shot_hit(entity_id)
     return FireResult(True, '', wp.fire_cooldown)
 
 
 def _fire_melee(world, entity_id: int, pos: Position, rot: Rotation,
-                dmg_mult: int = 1) -> None:
+                dmg_mult: int = 1) -> bool:
+    """Resolve a melee swing; returns True when it connected (for accuracy)."""
     x, y = pos.x, pos.y
     best = None
     best_d = MELEE_RANGE
@@ -280,4 +364,6 @@ def _fire_melee(world, entity_id: int, pos: Position, rot: Rotation,
                 best = e
                 best_d = d
     if best is not None:
-        _damage_enemy(world, best, PLAYER_MELEE_DMG * dmg_mult)
+        _damage_enemy(world, best, PLAYER_MELEE_DMG * dmg_mult, entity_id)
+        return True
+    return False

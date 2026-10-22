@@ -329,7 +329,7 @@ def test_step_window():
     assert not np.array_equal(base, step_hi), (
         "B floor height must affect the step framebuffer")
 
-    iw_f, ih_f = 320, 240
+    iw_f, ih_f = gs.frame.iw, gs.frame.ih
     maps = np_flats.get_maps(iw_f, ih_f, _view_focal(700, ih_f))
     flat_floor = np_flats.FlatMaps.tex_array(gs.flats["floor"])
     flat_ceil = np_flats.FlatMaps.tex_array(gs.flats["ceiling"])

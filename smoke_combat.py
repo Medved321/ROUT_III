@@ -310,8 +310,9 @@ def test_ball_flies_damages_wall():
     assert down['hp'] == 0 and down['a'] is False, "a dead enemy revived itself"
     assert (down['x'], down['y']) == (400.0, 300.0), down
 
-    # ...and a player's death is the one thing that does bring it back.
+    # ...and a player's respawn is the one thing that does bring it back.
     wk.damage_player(ek, 1000)
+    wk.respawn_player(1)
     wk.update()
     back = wk.enemies[0]
     assert back['hp'] == 60 and back['a'] is True, back

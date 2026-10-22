@@ -829,6 +829,16 @@ def _sector_loops(sm: SectorMap, sector: int) -> list[list[int]]:
             adj.setdefault(ld.v1, []).append(ld.v2)
         if 0 <= ld.back < n_sides and sm.sidedefs[ld.back].sector == sector:
             adj.setdefault(ld.v2, []).append(ld.v1)
+    # Отсечь нетривиальные SCC: односторонние декоративные линии внутри
+    # сектора (рамки, уступы) дают истоки без входа, которые иначе
+    # «съедают» рёбра настоящей петли при жадном обходе.
+    comp = _scc_components(adj)
+    size: dict[int, int] = {}
+    for v, c in comp.items():
+        size[c] = size.get(c, 0) + 1
+    adj = {u: [v for v in vs if comp[v] == comp[u] and size[comp[u]] > 1]
+           for u, vs in adj.items()}
+    adj = {u: vs for u, vs in adj.items() if vs}
     open_v = {k for k, v in adj.items() if v}
     loops: list[list[int]] = []
     while open_v:
@@ -852,6 +862,48 @@ def _sector_loops(sm: SectorMap, sector: int) -> list[list[int]]:
             if not adj.get(v):
                 open_v.discard(v)
     return loops
+
+
+def _scc_components(adj: dict[int, list[int]]) -> dict[int, int]:
+    """Kosaraju: компоненты сильной связности графа, итеративно."""
+    seen: set[int] = set()
+    order: list[int] = []
+    for root in list(adj):
+        if root in seen:
+            continue
+        seen.add(root)
+        stack: list[tuple[int, int]] = [(root, 0)]
+        while stack:
+            node, idx = stack[-1]
+            vs = adj.get(node, [])
+            if idx < len(vs):
+                stack[-1] = (node, idx + 1)
+                v = vs[idx]
+                if v not in seen:
+                    seen.add(v)
+                    stack.append((v, 0))
+            else:
+                stack.pop()
+                order.append(node)
+    rev: dict[int, list[int]] = {}
+    for u, vs in adj.items():
+        for v in vs:
+            rev.setdefault(v, []).append(u)
+    comp: dict[int, int] = {}
+    cid = 0
+    for root in reversed(order):
+        if root in comp:
+            continue
+        stack = [root]
+        comp[root] = cid
+        while stack:
+            node = stack.pop()
+            for v in rev.get(node, []):
+                if v not in comp:
+                    comp[v] = cid
+                    stack.append(v)
+        cid += 1
+    return comp
 
 
 def _side_defaults(sm: SectorMap, sector: int) -> tuple[str, str, str]:

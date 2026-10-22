@@ -11,13 +11,13 @@ from __future__ import annotations
 # "Ширина внутреннего буфера SHALL определяться уровнем качества").
 TIER_DEFS = {
     # textured walls + per-perspective (numpy) flats
-    "high": {"iw": 320, "ih": 240, "flats": "textured",
+    "high": {"iw": 500, "ih": 400, "flats": "textured",
              "effect_ratio": 1.0, "detail_ratio": 1.0, "view_dist": 1.0},
     # textured walls, solid flats
-    "medium": {"iw": 240, "ih": 150, "flats": "solid",
+    "medium": {"iw": 320, "ih": 240, "flats": "solid",
                "effect_ratio": 0.7, "detail_ratio": 0.6, "view_dist": 0.8},
     # minimum effects
-    "fast": {"iw": 160, "ih": 100, "flats": "solid",
+    "fast": {"iw": 100, "ih": 40, "flats": "solid",
              "effect_ratio": 0.35, "detail_ratio": 0.35, "view_dist": 0.6},
 }
 

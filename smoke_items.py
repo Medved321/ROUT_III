@@ -111,15 +111,14 @@ check("a hurt player takes the medkit that was refused",
 check("the taken medkit did not overheal", hp.value <= 200, hp.value)
 
 # A dead player must not loot: the body would eat the item before the wave
-# restarts. The respawn is pushed far out so the dead tick is observable on its
-# own -- a death brings the item back immediately, which would otherwise mask a
-# body that looted on the way down.
+# restarts. Death no longer starts a respawn timer, so the body simply stays
+# dead and the item on the floor is observed on its own -- were the wave to
+# restart it would put the item back and mask a body that looted on the way down.
 w2 = GameWorld('pve', make_map(('med', 200.0, 200.0)))
 e2 = w2.add_player(1, 'Ann')
 p2 = w2.entities.get_component(e2, Position)
 p2.x, p2.y = 200.0, 200.0
 w2.damage_player(e2, 500)
-w2._respawn[e2] = 1000
 w2.update()
 check("dead player does not loot",
       len(w2.get_item_states()) == 1, w2.get_item_states())
@@ -219,7 +218,7 @@ w.damage_player(eid, 1000)
 check("a hit past the armor kills", hp.value == 0, hp.value)
 
 # Respawn clears carried-over protection.
-w._respawn[eid] = 1
+w.respawn_player(1)
 w.update()
 check("respawn restores HP", hp.value == 200, hp.value)
 check("respawn clears armor", arm.value == 0, arm.value)
@@ -457,7 +456,7 @@ check("a full player does not wall off the loot",
       and hp_full.value == hp_full.max_value,
       (gw.items[0]['a'], hp_full.value, hp_hurt.value))
 
-print("\n6. items return on a player's death, not on a timer")
+print("\n6. items return on a player's respawn, not on a timer")
 w = GameWorld('pve', make_map(('heart', 500.0, 500.0)))
 eid = w.add_player(1, 'Ann')
 pos = w.entities.get_component(eid, Position)
@@ -490,11 +489,12 @@ for _ in range(20):
     w.update()
 check("killing an enemy does not return items", item['a'] is False, item)
 
-# A player's death restarts the wave and puts every taken item back.
+# A player's respawn restarts the wave and puts every taken item back.  Death
+# itself no longer does: the player stays dead until the client asks for it.
 w.damage_player(eid, 500)
-w.update()            # death is published for one tick
-w.update()            # next tick: respawn + wave restart
-check("a player's death returns the taken item", item['a'] is True, item)
+w.respawn_player(1)
+w.update()            # respawn + wave restart
+check("a player's respawn returns the taken item", item['a'] is True, item)
 check("the item is back on its own spot",
       (item['x'], item['y']) == (500.0, 500.0), (item['x'], item['y']))
 check("id is stable across the wave restart", item['id'] == item_id, item['id'])

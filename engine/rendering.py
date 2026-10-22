@@ -1,11 +1,11 @@
-import math, os, random, pygame
+import logging, math, os, random, time, pygame
 try:
     import numpy as np
     _HAVE_NP = True
 except Exception:
     np = None
     _HAVE_NP = False
-from engine.constants import (SCALE, TILE, FOV, TEX_W, WPN, ENEMY_DB, EYE_H,
+from engine.constants import (SCALE, TILE, FOV, TEX_W, WPN, ENEMY_DB,
                                CAM_Z, ENEMY_GAME_HEIGHTS, FALLBACK_SPRITE_MAX,
                                ITEM_GAME_HEIGHTS, ITEM_FLOAT_HEIGHT)
 from engine import constants as const
@@ -14,9 +14,33 @@ from engine.framebuffer import depth_col
 from engine.viewport import ensure_hud_fonts, ui_px, ui_scale, project_point
 from engine.particles import draw_particles, draw_decals, draw_weather
 from engine.particles import update_particles, update_decals, update_weather
-from engine.map_utils import get_t, _player_in_any_sector
+from engine.map_utils import get_t
 from engine.quality import enemy_detail
 from engine.sprite_cache import view_index
+from engine.wallcache import DEFAULT_CACHE, bucket_for_dist, light_level
+
+_log = logging.getLogger(__name__)
+
+# Hot-path failures (an untextured column, a sprite SDL refuses to blend)
+# repeat every frame while they last, so logging them directly would mirror
+# the frame rate into the log.  The first occurrence is logged immediately,
+# later ones are counted and summarised once per ``interval_s`` per key: the
+# failure stays visible, the log stays readable.
+_warn_state = {}
+
+
+def _warn_throttled(key, msg, interval_s=5.0):
+    now = time.monotonic()
+    st = _warn_state.get(key)
+    if st is None:
+        _log.warning(msg)
+        _warn_state[key] = [0, now]
+        return
+    st[0] += 1
+    if now - st[1] >= interval_s:
+        _log.warning("%s (+%d suppressed)", msg, st[0])
+        st[0] = 0
+        st[1] = now
 
 # ---------------------------------------------------------------------------
 # Framebuffer backend (total-performance, D1/D4): the tile 3D scene is
@@ -47,6 +71,56 @@ def _blank_sprite(size):
     return surf
 
 
+# One shared neutral texture for walls that have no texture at all.  The old
+# per-column Surface was a fresh object every column, and every object was
+# registered in the wall cache under its own id -- ``_tex``/``_lit`` never
+# evict, so a frame with a few hundred untextured columns registered a few
+# hundred orphaned textures, plus one allocation each.
+_FALLBACK_TEX = None
+
+
+def _fallback_tex():
+    global _FALLBACK_TEX
+    if _FALLBACK_TEX is None:
+        _FALLBACK_TEX = pygame.Surface((TEX_W, TEX_W))
+        _FALLBACK_TEX.fill((40, 40, 40))
+    return _FALLBACK_TEX
+
+
+# Reusable full-window overlay surfaces (fog, damage flash, powerup glow, ...).
+# A fresh SDL surface per frame for a rect that is filled and blitted right
+# away is an allocation per effect per frame; keyed by a name, so a window
+# resize simply misses the stored size and rebuilds that one entry.
+_OVERLAYS = {}
+
+
+def _overlay(name, size, srcalpha=False):
+    entry = _OVERLAYS.get(name)
+    if entry is not None and entry[0] == size and entry[2] == srcalpha:
+        return entry[1]
+    surf = pygame.Surface(size, pygame.SRCALPHA if srcalpha else 0)
+    _OVERLAYS[name] = (size, surf, srcalpha)
+    return surf
+
+
+# font.render() results for strings that repeat every frame (name tags, the
+# elevator prompt): each render is a C call plus a surface allocation whose
+# product is blitted and dropped.  Keyed by the font object itself (not its
+# id) so a font rebuild after a resize misses instead of showing stale text.
+_TEXT_CACHE = {}
+
+
+def _cached_text(font, text, color):
+    key = (font, text, color)
+    surf = _TEXT_CACHE.get(key)
+    if surf is None:
+        surf = font.render(text, True, color)
+        if len(_TEXT_CACHE) >= 256:
+            _TEXT_CACHE.clear()
+        _TEXT_CACHE[key] = surf
+    return surf
+
+
 def _ensure_frame():
     """Lazily (re)create the internal framebuffer for the current tier."""
     from engine.framebuffer import Frame
@@ -64,7 +138,6 @@ def _wall_strip(tex, tex_x, h, br):
     shaded by ``br`` (0..255).  The source column comes from the pre-lit
     column cache (task 2.1: 16 light levels, selection by brightness) and is
     vertical-sampled to ``h`` in one bulk copy."""
-    from engine.wallcache import light_level, DEFAULT_CACHE
     level = light_level(br)
     if level == 0:
         return bytes(h * 3)
@@ -117,8 +190,6 @@ def _frame_blit_wall(frame, tex, tex_x, bx, bw, top, bot, br, rd=None):
     h = bot - top
     if h <= 0 or bx >= frame.iw:
         return
-    from engine.wallcache import (DEFAULT_CACHE, bucket_for_dist,
-                                         light_level)
     strip = None
     if rd is not None:
         try:
@@ -142,7 +213,10 @@ def _frame_blit_wall(frame, tex, tex_x, bx, bw, top, bot, br, rd=None):
                         sr = (r * (hb - 1)) // max(1, h - 1)
                         out[r * 3:r * 3 + 3] = col[sr * 3:sr * 3 + 3]
                     strip = bytes(out)
-        except Exception:
+        except Exception as exc:
+            _warn_throttled('wall-strip',
+                            f"wall strip cache failed ({exc!r}); "
+                            "column falls back to the lit column cache")
             strip = None
     if strip is None:
         strip = _wall_strip(tex, tex_x, h, br)
@@ -232,7 +306,9 @@ def _get_ssg(i):
             # had no meaning at any other window size.  _fit_wpn() now normalises
             # every frame of a weapon to one target height.
             _ssg_frames[i] = pygame.image.load(_skin_path(_SSG_FILES[i])).convert_alpha()
-        except:
+        except Exception as exc:
+            _log.warning("cannot load SSG frame %r (%s); slot %d stays blank",
+                         _SSG_FILES[i], exc, i)
             _ssg_frames[i] = pygame.Surface((1, 1))
     return _ssg_frames[i]
 
@@ -255,7 +331,8 @@ def _load_pistol():
     try:
         _PISTOL_IDLE = pygame.image.load(_skin_path('skins/pistol_1.png')).convert_alpha()
         _PISTOL_FIRE = pygame.image.load(_skin_path('skins/pistol_2.png')).convert_alpha()
-    except:
+    except Exception as exc:
+        _log.warning("cannot load pistol skins (%s); placeholder frames used", exc)
         _PISTOL_IDLE = pygame.Surface((1, 1))
         _PISTOL_FIRE = pygame.Surface((1, 1))
 
@@ -264,7 +341,8 @@ def _load_rifle():
     try:
         _RIFLE_IDLE = pygame.image.load(_skin_path('skins/riffle_1.png')).convert_alpha()
         _RIFLE_FIRE = pygame.image.load(_skin_path('skins/riffle_2.png')).convert_alpha()
-    except:
+    except Exception as exc:
+        _log.warning("cannot load rifle skins (%s); placeholder frames used", exc)
         _RIFLE_IDLE = pygame.Surface((1, 1))
         _RIFLE_FIRE = pygame.Surface((1, 1))
 
@@ -274,7 +352,8 @@ def _load_shotgun():
         _SHOTGUN_IDLE = pygame.image.load(_skin_path('skins/shootgun_1.png')).convert_alpha()
         _SHOTGUN_FIRE = pygame.image.load(_skin_path('skins/shootgun_2.png')).convert_alpha()
         _SHOTGUN_RECOIL = pygame.image.load(_skin_path('skins/shootgun_3.png')).convert_alpha()
-    except:
+    except Exception as exc:
+        _log.warning("cannot load shotgun skins (%s); placeholder frames used", exc)
         _SHOTGUN_IDLE = _SHOTGUN_FIRE = _SHOTGUN_RECOIL = pygame.Surface((1, 1))
 
 
@@ -283,56 +362,20 @@ def _load_chainsaw():
     try:
         _CHAINSAW_IDLE = pygame.image.load(_skin_path('skins/chainsaw_1.png')).convert_alpha()
         _CHAINSAW_FIRE = pygame.image.load(_skin_path('skins/chainsaw_2.png')).convert_alpha()
-    except:
+    except Exception as exc:
+        _log.warning("cannot load chainsaw skins (%s); placeholder frames used", exc)
         _CHAINSAW_IDLE = _CHAINSAW_FIRE = pygame.Surface((1, 1))
 
 
 def draw_wpn(idx, tmr, fire, bob):
     if idx >= 100:
-        cw_idx = idx - 100
-        cg = gs.p.get('custom_guns', [])
-        if 0 <= cw_idx < len(cg):
-            from custom_content import get_custom_weapons
-            cw = get_custom_weapons()
-            wdef = cw.get(cg[cw_idx], {})
-            hand_sprite_path = wdef.get('hand_sprite')
-            if hand_sprite_path and not (wdef.get('proj_sprite') and len(gs.proj) > 0):
-                if hand_sprite_path not in _wpn_sprites:
-                    try:
-                        _wpn_sprites[hand_sprite_path] = pygame.image.load(hand_sprite_path).convert_alpha()
-                    except Exception:
-                        _wpn_sprites[hand_sprite_path] = None
-                spr = _wpn_sprites.get(hand_sprite_path)
-                if spr:
-                    scale = min(const.W * 0.5 / spr.get_width(), const.H * 0.4 / spr.get_height(), 4)
-                    sw = int(spr.get_width() * scale)
-                    sh_s = int(spr.get_height() * scale)
-                    bx = const.W // 2 - sw // 2
-                    by = const.H - sh_s - ui_px(20) + bob
-                    gs.screen.blit(pygame.transform.scale(spr, (sw, sh_s)), (bx, by))
-            else:
-                model_name = wdef.get('model')
-                if model_name:
-                    from voxel import load_voxel, render_voxel_facing
-                    voxels, palette = load_voxel(model_name)
-                    if voxels:
-                        spr, _ = render_voxel_facing(voxels, palette, 30, 64)
-                        if spr:
-                            # Fraction of the window, like the hand sprite above,
-                            # so a voxel model is not a fixed pixel block either.
-                            scale_f = min(const.W * 0.3 / spr.get_width(), const.H * 0.4 / spr.get_height())
-                            sw = max(1, int(spr.get_width() * scale_f))
-                            sh = max(1, int(spr.get_height() * scale_f))
-                            bx = const.W // 2 - sw // 2
-                            by = const.H - sh - ui_px(30) + bob
-                            gs.screen.blit(pygame.transform.scale(spr, (sw, sh)), (bx, by))
-                else:
-                    col = wdef.get('color', (200, 200, 100))
-                    sz = ui_px(80)
-                    bx = const.W // 2 - sz // 2
-                    by = const.H - sz - ui_px(30) + bob
-                    pygame.draw.rect(gs.screen, col, (bx, by, sz, sz))
-                    pygame.draw.rect(gs.screen, (255, 255, 255), (bx, by, sz, sz), 2)
+        # Custom weapon slots are filled by a content package the engine does
+        # not carry: without one there is no viewmodel to draw, and the
+        # renderer must not import content packages it knows nothing about.
+        # The HUD keeps naming the slot "Custom" with an ammo placeholder.
+        _warn_throttled('wpn-viewmodel',
+                        f"weapon index {idx} has no registered content "
+                        "package: no viewmodel drawn")
         return
     info = WPN[idx]
     # Animation phase as a fraction of the weapon's own cooldown (1.0 at the
@@ -637,167 +680,6 @@ def draw_corpse(c, sx, sh, ground_y=None):
     w, h = surf.get_size()
     _enemy_blit(surf, int(sx - w // 2), int(floor_y - h + 1))
 
-
-
-def _render_sector_scene_legacy():
-    """[removed in advanced-sector-editor] superseded by sector_render."""
-    NC = const.W // SCALE
-    pz = gs.pz + EYE_H
-    px = gs.px; py = gs.py; pa = gs.pa
-    verts = gs.sec_verts; lines = gs.sec_lines; sectors = gs.sec_sectors
-
-    tex = gs.textures
-    def_wall = tex.get('wall')
-    if def_wall is None:
-        def_wall = pygame.Surface((TEX_W, TEX_W))
-        def_wall.fill((140, 120, 100))
-
-    # Pre-compute line endpoints (skip open doors)
-    line_data = []
-    sec_line_door = getattr(gs, 'sec_line_door', {})
-    open_doors = getattr(gs, 'open_doors', {})
-    for li, ld in enumerate(lines):
-        if li in sec_line_door:
-            gx, gy = sec_line_door[li]
-            if (gx, gy) in open_doors:
-                continue
-        v1i, v2i = ld[0], ld[1]
-        if v1i < len(verts) and v2i < len(verts):
-            line_data.append((verts[v1i][0], verts[v1i][1], verts[v2i][0], verts[v2i][1], ld))
-
-    # Ceiling base
-    pygame.draw.rect(gs.screen, (20, 20, 25), (0, 0, const.W, const.H // 2))
-    # Floor base
-    pygame.draw.rect(gs.screen, (30, 30, 35), (0, const.H // 2, const.W, const.H // 2))
-
-    player_si = _player_in_any_sector(px, py)
-
-    z_b = [999.0] * NC
-    for i in range(NC):
-        ra = pa - FOV / 2 + (i / NC) * FOV
-        cs, sn = math.cos(ra), math.sin(ra)
-
-        closest_d = gs.view_dist
-        hit_ld = None
-        hit_ix = hit_iy = 0
-        hit_si = -1
-        tex_u = i / NC
-
-        end_x = px + cs * gs.view_dist
-        end_y = py + sn * gs.view_dist
-
-        for v1x, v1y, v2x, v2y, ld in line_data:
-            dx1, dy1 = end_x - px, end_y - py
-            dx2, dy2 = v2x - v1x, v2y - v1y
-            denom = dx1 * dy2 - dy1 * dx2
-            if abs(denom) < 0.0001:
-                continue
-            t = ((v1x - px) * dy2 - (v1y - py) * dx2) / denom
-            u = ((v1x - px) * dy1 - (v1y - py) * dx1) / denom
-            if 0 <= t <= 1 and 0 <= u <= 1:
-                ix = px + t * dx1
-                iy = py + t * dy1
-                d2 = math.hypot(ix - px, iy - py)
-                if d2 > 0.5 and d2 < closest_d:
-                    closest_d = d2
-                    hit_ld = ld
-                    hit_ix, hit_iy = ix, iy
-                    hit_si = ld[2] if ld[2] is not None and ld[2] >= 0 else (ld[3] if ld[3] is not None and ld[3] >= 0 else -1)
-
-        rd = closest_d * math.cos(ra - pa)
-        if rd < 1: rd = 1
-        z_b[i] = rd
-
-        wall_si = hit_si
-        if hit_ld is not None:
-            for ldi in line_data:
-                if ldi[4] is hit_ld:
-                    v1x, v1y, v2x, v2y = ldi[:4]
-                    line_len = math.hypot(v2x - v1x, v2y - v1y) or 1
-                    tex_u = math.hypot(hit_ix - v1x, hit_iy - v1y) / line_len
-                    if hit_ld[2] is not None and hit_ld[2] >= 0 and hit_ld[3] is not None and hit_ld[3] >= 0:
-                        mx = (v1x + v2x) / 2
-                        my = (v1y + v2y) / 2
-                        nx = -(v2y - v1y)
-                        ny = v2x - v1x
-                        nl = math.hypot(nx, ny) or 1
-                        nx /= nl; ny /= nl
-                        dot = (px - mx) * nx + (py - my) * ny
-                        wall_si = hit_ld[2] if dot > 0 else hit_ld[3]
-                    break
-
-        if wall_si >= 0 and wall_si < len(sectors):
-            sec = sectors[wall_si]
-            fh = sec.get('fh', 0)
-            ch = sec.get('ch', 128)
-            fc = sec.get('fc', (80, 60, 40))
-            cc = sec.get('cc', (60, 60, 120))
-            wc = sec.get('wc', (140, 120, 100))
-            if not isinstance(fc, (list, tuple)): fc = (fc, fc, fc)
-            if not isinstance(cc, (list, tuple)): cc = (cc, cc, cc)
-            if not isinstance(wc, (list, tuple)): wc = (wc, wc, wc)
-
-            half_h = const.H / 2
-            wt = int(half_h - (pz - ch) * 750 / rd)
-            wb = int(half_h - (pz - fh) * 750 / rd)
-            if wt > wb: wt, wb = wb, wt
-            if wt > const.H: wt = const.H
-            if wb < 0: wb = 0
-
-            shade = max(0.15, 1.0 - closest_d / (gs.view_dist * 1.2))
-
-            # Ceiling
-            if wt > 0:
-                ccol = tuple(min(255, int(v * shade)) for v in cc)
-                pygame.draw.line(gs.screen, ccol, (i * SCALE, 0), (i * SCALE, wt))
-
-            # Wall (textured column)
-            if wb - wt > 0:
-                tex_x = int(tex_u * TEX_W) % TEX_W
-                try:
-                    col_strip = def_wall.subsurface((tex_x, 0, 1, TEX_W))
-                except:
-                    col_strip = None
-                if col_strip:
-                    scaled = pygame.transform.scale(col_strip, (SCALE, wb - wt))
-                    tint = pygame.Surface(scaled.get_size())
-                    tint.fill(tuple(min(255, int(v * shade)) for v in wc))
-                    scaled.blit(tint, (0, 0), special_flags=pygame.BLEND_RGB_MULT)
-                    gs.screen.blit(scaled, (i * SCALE, wt))
-                else:
-                    wcol = tuple(min(255, int(v * shade)) for v in wc)
-                    pygame.draw.line(gs.screen, wcol, (i * SCALE, wt), (i * SCALE, wb))
-
-            # Floor
-            if wb < const.H:
-                fcol = tuple(min(255, int(v * shade)) for v in fc)
-                pygame.draw.line(gs.screen, fcol, (i * SCALE, wb), (i * SCALE, const.H))
-        else:
-            if player_si >= 0:
-                sec = sectors[player_si]
-                fh = sec.get('fh', 0)
-                ch = sec.get('ch', 128)
-                fc = sec.get('fc', (80, 60, 40))
-                cc = sec.get('cc', (60, 60, 120))
-                if not isinstance(fc, (list, tuple)): fc = (fc, fc, fc)
-                if not isinstance(cc, (list, tuple)): cc = (cc, cc, cc)
-                half_h = const.H / 2
-                wt = int(half_h - (pz - ch) * 750 / rd)
-                wb = int(half_h - (pz - fh) * 750 / rd)
-                if wt > wb: wt, wb = wb, wt
-                if wt > const.H: wt = const.H
-                if wb < 0: wb = 0
-                shade = max(0.15, 1.0 - closest_d / (gs.view_dist * 1.2))
-                if wt > 0:
-                    ccol = tuple(min(255, int(v * shade)) for v in cc)
-                    pygame.draw.line(gs.screen, ccol, (i * SCALE, 0), (i * SCALE, wt))
-                if wb < const.H:
-                    fcol = tuple(min(255, int(v * shade)) for v in fc)
-                    pygame.draw.line(gs.screen, fcol, (i * SCALE, wb), (i * SCALE, const.H))
-            else:
-                pygame.draw.line(gs.screen, (30, 35, 45), (i * SCALE, 0), (i * SCALE, const.H))
-
-    return z_b
 
 
 # --- Own-dash radial rays (dash-fx) ---------------------------------------
@@ -1261,27 +1143,20 @@ def render(vh=None, vy=None):
                 tex_name = tile_provider(tile) if tile_provider else 'wall'
             tex = tx.get(tex_name) or tx.get('wall')
             if tex is None:
-                tex = pygame.Surface((TEX_W, TEX_W))
-                tex.fill((40, 40, 40))
+                tex = _fallback_tex()
             br = 255
-            try:
-                tex_h = TEX_W
-                if tile == 'C':
-                    tex = tx.get('bridge_wall') or tx.get('wall')
-                if tile == 'C' and (cur_tx, cur_ty) in gs.bridge_open:
-                    tex_name = 'bridge' if (cur_tx, cur_ty) not in gs.bridge_open else 'floor'
-                    tex = gs.flats.get(tex_name) or tx.get('wall')
-                if tile == 'C' and (cur_tx, cur_ty) in gs.bridge_open:
-                    wh = max(1, int(wh))
-                    bx_, bw_ = _frame_column_span(i, NC, iw_f)
-                    ft_, fb_ = _frame_ys(draw_y, draw_y + wh, _RH, ih_f)
-                    if ft_ < fb_:
-                        frame.fill_rect(bx_, ft_, bw_, fb_ - ft_, (100, 100, 100))
-                    continue
-                col_strip = tex.subsurface((tex_x % TEX_W, 0, 1, min(tex_h, tex.get_height())))
-            except:
-                col_strip = pygame.Surface((1, 1))
-                col_strip.fill((br, br, br))
+            if tile == 'C':
+                tex = tx.get('bridge_wall') or tx.get('wall')
+            if tile == 'C' and (cur_tx, cur_ty) in gs.bridge_open:
+                tex_name = 'bridge' if (cur_tx, cur_ty) not in gs.bridge_open else 'floor'
+                tex = gs.flats.get(tex_name) or tx.get('wall')
+            if tile == 'C' and (cur_tx, cur_ty) in gs.bridge_open:
+                wh = max(1, int(wh))
+                bx_, bw_ = _frame_column_span(i, NC, iw_f)
+                ft_, fb_ = _frame_ys(draw_y, draw_y + wh, _RH, ih_f)
+                if ft_ < fb_:
+                    frame.fill_rect(bx_, ft_, bw_, fb_ - ft_, (100, 100, 100))
+                continue
             try:
                 br = max(0, 255 - int(rd * 0.25))
                 # Animated textures (blinking lights)
@@ -1291,7 +1166,10 @@ def render(vh=None, vy=None):
                 bx_, bw_ = _frame_column_span(i, NC, iw_f)
                 ft_, fb_ = _frame_ys(draw_y, draw_y + wh, _RH, ih_f)
                 _frame_blit_wall(frame, tex, tex_x, bx_, bw_, ft_, fb_, br, rd)
-            except:
+            except Exception as exc:
+                _warn_throttled('wall-column',
+                                f"wall column blit failed for tile {tile!r} "
+                                f"({exc!r}); column filled grey")
                 br = max(0, 255 - int(rd * 0.25))
                 bx_, bw_ = _frame_column_span(i, NC, iw_f)
                 ft_, fb_ = _frame_ys(draw_y, draw_y + wh, _RH, ih_f)
@@ -1491,7 +1369,10 @@ def render(vh=None, vy=None):
                     if proj_path not in _wpn_sprites:
                         try:
                             _wpn_sprites[proj_path] = pygame.image.load(proj_path).convert_alpha()
-                        except Exception:
+                        except Exception as exc:
+                            _log.warning("cannot load projectile sprite %r "
+                                         "(%s); drawn with the simple dot",
+                                         proj_path, exc)
                             _wpn_sprites[proj_path] = None
                     spr = _wpn_sprites.get(proj_path)
                     if spr:
@@ -1693,7 +1574,7 @@ def render(vh=None, vy=None):
                 # Name tag
                 oname = pl.get('name', '')
                 if oname:
-                    nm_surf = gs.sm_font.render(oname, True, (255, 255, 255))
+                    nm_surf = _cached_text(gs.sm_font, oname, (255, 255, 255))
                     nm_x = sx2 - nm_surf.get_width() // 2
                     nm_y = head_y - nm_surf.get_height() - 2
                     if nm_y > _RY - 10:
@@ -1708,13 +1589,13 @@ def render(vh=None, vy=None):
         glow_h = ui_px(40)
         if ft in ('F', 'E', 'L'):
             col, alpha = {'F': ((200, 150, 20), 80), 'E': ((60, 180, 220), 60), 'L': ((200, 50, 5), 60)}[ft]
-            ov = pygame.Surface((const.W, glow_h))
+            ov = _overlay(f'glow{ft}', (const.W, glow_h))
             ov.set_alpha(alpha)
             ov.fill(col)
             gs.screen.blit(ov, (0, _RY + _RH - glow_h))
         if ft == 'L':
             glow_h2 = ui_px(80)
-            ov2 = pygame.Surface((const.W, glow_h2))
+            ov2 = _overlay('glowL2', (const.W, glow_h2))
             ov2.set_alpha(30)
             ov2.fill((200, 80, 10))
             gs.screen.blit(ov2, (0, _RY + _RH - glow_h2))
@@ -1736,7 +1617,10 @@ def render(vh=None, vy=None):
 
     # Distance fog
     if gs.fog_enabled and z_b:
-        fog_surf = pygame.Surface((const.W, _RH), pygame.SRCALPHA)
+        fog_surf = _overlay('fog', (const.W, _RH), True)
+        # A fresh SRCALPHA surface starts fully transparent; a cached one
+        # still holds last frame's columns, so reset it before refilling.
+        fog_surf.fill((0, 0, 0, 0))
         nc = len(z_b)
         for i in range(nc):
             d = z_b[i]
@@ -1771,7 +1655,7 @@ def render(vh=None, vy=None):
     draw_wpn(gs.p['wpn'], gs.w_tmr, fire, bob)
 
     if gs.d_flash > 0:
-        ov = pygame.Surface((const.W, _RH), pygame.SRCALPHA)
+        ov = _overlay('dmg', (const.W, _RH), True)
         ov.set_alpha(120)
         ov.fill((255, 0, 0))
         gs.screen.blit(ov, (0, _RY))
@@ -1782,17 +1666,23 @@ def render(vh=None, vy=None):
             br = random.randint(4, 20)
             ba = random.randint(30, 100)
             bcol = (140, 10, 10, ba)
-            s = pygame.Surface((br * 2, br * 2), pygame.SRCALPHA)
+            s = _overlay(f'drop{br * 2}', (br * 2, br * 2), True)
+            # A cached droplet keeps its previous circle in the corners:
+            # clear it before drawing the new one.
+            s.fill((0, 0, 0, 0))
             pygame.draw.circle(s, bcol, (br, br), br)
             try:
                 gs.screen.blit(s, (bx - br, by - br), special_flags=pygame.BLEND_ALPHA_SDL2)
-            except:
+            except Exception as exc:
+                _warn_throttled('blood-drop',
+                                f"droplet blend blit failed ({exc!r}); "
+                                "plain blit used")
                 gs.screen.blit(s, (bx - br, by - br))
         gs.d_flash -= 1
 
     if gs.p['powerup']:
         pu_glow = int(155 + 100 * math.sin(curr_t * 0.008))
-        ov = pygame.Surface((const.W, _RH))
+        ov = _overlay('pu', (const.W, _RH))
         ov.set_alpha(pu_glow // 4)
         if gs.p['powerup'] == 'BERSERK':
             ov.fill((200, 0, 0))
@@ -1804,19 +1694,19 @@ def render(vh=None, vy=None):
 
     if gs.p['hp'] <= 50 and gs.p['hp'] > 0:
         intensity = int(80 * (1 - gs.p['hp'] / 50))
-        ov = pygame.Surface((const.W, _RH))
+        ov = _overlay('hpo', (const.W, _RH))
         ov.set_alpha(intensity)
         ov.fill((180, 0, 0))
         gs.screen.blit(ov, (0, _RY))
         if gs.p['hp'] <= 20 and int(curr_t * 0.005) % 2 == 0:
-            ov2 = pygame.Surface((const.W, _RH))
+            ov2 = _overlay('hppulse', (const.W, _RH))
             ov2.set_alpha(60)
             ov2.fill((200, 0, 0))
             gs.screen.blit(ov2, (0, _RY))
 
     # Elevator prompt
     if gs.elevator_prompt:
-        msg = gs.sm_font.render("ELEVATOR: PRESS ENTER", True, (0, 255, 255))
+        msg = _cached_text(gs.sm_font, "ELEVATOR: PRESS ENTER", (0, 255, 255))
         gs.screen.blit(msg, (const.W // 2 - msg.get_width() // 2, _RY + _RH // 2 - ui_px(80)))
 
     # Update explored tiles (fog of war) — always track
@@ -2126,17 +2016,13 @@ def render(vh=None, vy=None):
         gs.screen.blit(gs.font.render(arm_label, True, arm_col2), (rx, hud_by + ui_px(4)))
 
     if gs.p['wpn'] >= 100:
-        cw_idx = gs.p['wpn'] - 100
-        cg = gs.p.get('custom_guns', [])
-        if 0 <= cw_idx < len(cg):
-            from custom_content import get_custom_weapons
-            cw = get_custom_weapons()
-            wdef = cw.get(cg[cw_idx], {})
-            wpn_name = wdef.get('name', 'Custom')
-            ammo_type = wdef.get('ammo', 'pstl')
-            amm = gs.p.get(ammo_type, 0) if ammo_type else "INF"
-        else:
-            wpn_name, amm = "Custom", "?"
+        # Same story as draw_wpn: no content package in the engine, so the
+        # slot is named generically and ammo shows a placeholder instead of
+        # the renderer importing what it does not carry.
+        _warn_throttled('wpn-hud',
+                        f"weapon index {gs.p['wpn']} has no registered "
+                        "content package: HUD shows a placeholder")
+        wpn_name, amm = "Custom", "?"
     else:
         wpn = WPN[gs.p['wpn']]
         wpn_name = wpn['n']

@@ -13,7 +13,8 @@ import random
 
 from shared.components import (
     EntityManager, Position, Velocity, Rotation,
-    Health, Player, Collider, WeaponComponent, Dash, Armor, Powerup, Keys
+    Health, Player, Collider, WeaponComponent, Dash, Armor, Powerup, Keys,
+    Stats,
 )
 from shared.map_data import GameMap, TILE
 from shared.sector_map import SectorMap, KEY_BITS
@@ -22,7 +23,7 @@ from server.game_data import (
     PLAYER_RADIUS, PLAYER_MAX_HP, ENEMY_DB, ENEMY_RADIUS,
     ENEMY_DETECT_RANGE, ENEMY_ALERT_AOE, ENEMY_MELEE_COOLDOWN,
     MELEE_RANGE, RANGED_DB, SPAWN_POOL, CORPSE_LIFETIME,
-    PLAYER_RESPAWN_TICKS,
+    EXIT_RADIUS, PVP_MATCH_TICKS,
     TICK_RATE, TICK_INTERVAL, FPS_60, MAX_PLAYER_PROJ, MAX_ENEMY_PROJ,
     IMPACT_TTL, MAX_IMPACTS,
     BALL_SUB_STEP, INFIGHT_TICKS, MAX_MOVE_STEP_PX,
@@ -45,6 +46,12 @@ USE_REASON_LOCKED = USE_REASON_CODES['locked']
 # sub-step, so a projectile stepping at BALL_SUB_STEP px cannot tunnel through a
 # door's zero-thickness linedef.
 DOOR_POINT_RADIUS = BALL_SUB_STEP * 0.5
+
+# Sector special that marks a secret room (mirrors
+# ``shared.text_map.SPECIAL_NAMES["секрет"]``).  The number only travels through
+# the .mt1 geometry; the client already draws the map, so the server reads it
+# to count and award a secret the first time a player steps inside one.
+SECRET_SPECIAL = 9
 
 
 def _spawn_px(spawns: list[tuple[float, float]]) -> tuple[float, float]:
@@ -88,10 +95,21 @@ class GameWorld:
         self.corpses: list[dict] = []
         self.impacts: list[dict] = []   # wall/enemy hit markers: {x, y, type, ttl}
 
-        # respawn tracking  entity_id -> ticks remaining.  Players only: a
-        # killed enemy has no timer of its own, it waits for a player's death
-        # (see _reset_enemies).
-        self._respawn: dict[int, int] = {}
+        # Match lifecycle.  `playing` -> `over` happens once and is never
+        # reversed within a world; while `over` the world is frozen (update()
+        # returns early) but snapshots keep flowing so every client shows the
+        # same final frame (match-end design D9).
+        self.match_phase: str = 'playing'
+        self.winner_id: int = 0
+        # PvP clock in ticks; 0 (and unused) in PvE.
+        self.pvp_match_ticks: int = PVP_MATCH_TICKS if mode == 'pvp' else 0
+        # Exit thing position (px) or None for a map without one -- such a map
+        # stays endless (spec: map without exit never finishes by exit).
+        self.exit_pos: tuple[float, float] | None = self._read_exit_pos()
+        # Secret bookkeeping: total secret sectors on the map, and per-player
+        # set of sector ids already counted so re-entry never double-counts.
+        self.secrets_total: int = self._count_secrets()
+        self._secrets_found: dict[int, set[int]] = {}
         # Where a player joined the map.  This is the point they come back to:
         # respawning on a random `spawn_points` entry would put a respawned
         # player somewhere the camera never looked, which reads as a teleport into
@@ -141,22 +159,183 @@ class GameWorld:
         self.entities.add_component(eid, Powerup())
         # No keys at spawn: a locked door has to be found, not started behind.
         self.entities.add_component(eid, Keys())
+        # Zeroed match stats: they accumulate on the server for the whole match
+        # and are reset only by starting a party, never by a respawn.
+        self.entities.add_component(eid, Stats())
 
         self.players[player_id] = eid
         self._player_start[player_id] = (sx, sy)
+        self._secrets_found[player_id] = set()
         return eid
 
     def remove_player(self, player_id: int) -> None:
         eid = self.players.pop(player_id, None)
         self._player_start.pop(player_id, None)
         self._use_reason.pop(player_id, None)
+        self._secrets_found.pop(player_id, None)
         if eid is not None:
             self.entities.destroy(eid)
-            self._respawn.pop(eid, None)
             self._use_held.pop(eid, None)
 
     def get_player_entity(self, player_id: int) -> int | None:
         return self.players.get(player_id)
+
+    # ------------------------------------------------------------------
+    #  Match lifecycle (exit / PvP clock / freeze) and stats bookkeeping
+    # ------------------------------------------------------------------
+    def _read_exit_pos(self) -> tuple[float, float] | None:
+        """Position of the map's `exit` thing, or None when there is none."""
+        things = getattr(self.game_map, 'things', None)
+        if not things:
+            return None
+        for t in things:
+            if getattr(t, 'type', None) in ('exit', 'E'):
+                return (float(t.x), float(t.y))
+        return None
+
+    def _count_secrets(self) -> int:
+        """Number of sectors flagged as a secret on the map."""
+        sectors = getattr(self.game_map, 'sectors', None)
+        if not sectors:
+            return 0
+        return sum(1 for s in sectors if getattr(s, 'special', 0) == SECRET_SPECIAL)
+
+    def _sector_special_at(self, x: float, y: float) -> int:
+        finder = getattr(self.game_map, 'find_sector_at', None)
+        sectors = getattr(self.game_map, 'sectors', None)
+        if finder is None or not sectors:
+            return 0
+        sid = finder(x, y)
+        if sid is None or sid < 0 or sid >= len(sectors):
+            return 0
+        return getattr(sectors[sid], 'special', 0)
+
+    def _sector_id_at(self, x: float, y: float) -> int:
+        finder = getattr(self.game_map, 'find_sector_at', None)
+        if finder is None:
+            return -1
+        sid = finder(x, y)
+        return -1 if sid is None else sid
+
+    def get_match_state(self) -> dict:
+        """Trailing match block for WORLD_STATE (phase/winner/clock/secrets)."""
+        if self.mode == 'pvp':
+            time_left = max(0, self.pvp_match_ticks) // TICK_RATE
+        else:
+            time_left = 0
+        return {
+            'phase': self.match_phase,
+            'winner_id': self.winner_id & 0xFFFF,
+            'time_left': min(0xFFFF, time_left),
+            'secrets_total': self.secrets_total & 0xFFFF,
+        }
+
+    def _update_match(self) -> None:
+        """Advance the match clock / exit check while the match is playing."""
+        if self.match_phase != 'playing':
+            return
+        if self.mode == 'pvp':
+            if self.pvp_match_ticks > 0:
+                self.pvp_match_ticks -= 1
+            if self.pvp_match_ticks <= 0:
+                self._end_match()
+            return
+        # PvE: a LIVING player inside the exit radius finishes the level.  A
+        # dead body on the exit does not (spec scenario "мёртвый на выходе").
+        if self.exit_pos is None:
+            return
+        ex, ey = self.exit_pos
+        for _pid, eid in self.players.items():
+            pos = self.entities.get_component(eid, Position)
+            hp = self.entities.get_component(eid, Health)
+            if pos is None or hp is None or hp.value <= 0:
+                continue
+            if math.hypot(pos.x - ex, pos.y - ey) <= EXIT_RADIUS:
+                self._end_match()
+                return
+
+    def _end_match(self) -> None:
+        self.match_phase = 'over'
+        if self.mode != 'pvp':
+            self.winner_id = 0
+            return
+        # Most frags wins; an equal top count is a draw (winner_id 0).  In PvP
+        # worlds no enemies are spawned, so every kill here is player-vs-player.
+        best = -1
+        winner = 0
+        tie = False
+        for pid, eid in self.players.items():
+            st = self.entities.get_component(eid, Stats)
+            kills = st.kills if st is not None else 0
+            if kills > best:
+                best = kills
+                winner = pid
+                tie = False
+            elif kills == best:
+                tie = True
+        self.winner_id = 0 if tie else winner
+
+    def _update_secrets(self) -> None:
+        """Award a secret the first time a live player stands in a secret sector."""
+        if self.mode != 'pve' or self.secrets_total <= 0:
+            return
+        for pid, eid in self.players.items():
+            pos = self.entities.get_component(eid, Position)
+            hp = self.entities.get_component(eid, Health)
+            if pos is None or hp is None or hp.value <= 0:
+                continue
+            sid = self._sector_id_at(pos.x, pos.y)
+            if sid < 0 or self._sector_special_at(pos.x, pos.y) != SECRET_SPECIAL:
+                continue
+            found = self._secrets_found.setdefault(pid, set())
+            if sid in found:
+                continue
+            found.add(sid)
+            self.note_secret(eid)
+
+    # --- stat bookkeeping (entity-id based except where noted) ----------
+    def _stats(self, eid: int) -> Stats | None:
+        return self.entities.get_component(eid, Stats)
+
+    def note_shot_fired(self, eid: int) -> None:
+        st = self._stats(eid)
+        if st is not None:
+            st.shots_fired += 1
+
+    def note_shot_hit(self, eid: int) -> None:
+        st = self._stats(eid)
+        if st is not None:
+            st.shots_hit += 1
+
+    def note_kill(self, eid: int) -> None:
+        st = self._stats(eid)
+        if st is not None:
+            st.kills += 1
+
+    def note_death(self, eid: int) -> None:
+        st = self._stats(eid)
+        if st is not None:
+            st.deaths += 1
+
+    def note_damage_dealt(self, eid: int, dmg: int) -> None:
+        st = self._stats(eid)
+        if st is not None and dmg > 0:
+            st.damage_dealt += int(dmg)
+
+    def note_damage_taken(self, eid: int, dmg: int) -> None:
+        st = self._stats(eid)
+        if st is not None and dmg > 0:
+            st.damage_taken += int(dmg)
+
+    def note_item(self, eid: int) -> None:
+        st = self._stats(eid)
+        if st is not None:
+            st.items += 1
+
+    def note_secret(self, eid: int) -> None:
+        st = self._stats(eid)
+        if st is not None:
+            st.secrets += 1
 
     # ------------------------------------------------------------------
     #  PvE enemy spawning (called once per wave or on game start)
@@ -462,6 +641,12 @@ class GameWorld:
     # ------------------------------------------------------------------
     def update(self) -> None:
         self.tick += 1
+        # Frozen match: the world stops changing the tick after it ends (no AI,
+        # no bullets, no doors, no movement), but the tick still advances so the
+        # server keeps broadcasting the same final frame to everyone.  A dead
+        # player has no respawn timer, so nothing here revives anyone.
+        if self.match_phase == 'over':
+            return
         # Doors first: their open/shut state decides what movement, sight,
         # hitscans and projectiles may pass this tick.
         self._update_doors()
@@ -477,7 +662,8 @@ class GameWorld:
         self._update_corpses()
         self._update_powerups()
         self._update_items()
-        self._update_respawns()
+        self._update_secrets()
+        self._update_match()
         # A killed enemy is NOT dropped from the list: its record carries
         # spawn_x/spawn_y -- the home the wave reset needs -- and it is part of
         # the wave until a player's death brings the whole level back.  The
@@ -857,13 +1043,14 @@ class GameWorld:
 
     def _resolve_player_ball(self, b: dict) -> bool:
         """Player projectile -> enemy or (PvP) other player hit."""
+        src = b.get('src')
         for e in self.enemies:
             if not e['a'] or e['hp'] <= 0:
                 continue
             if math.hypot(e['x'] - b['x'], e['y'] - b['y']) < ENEMY_RADIUS + 4:
-                _damage_enemy(self, e, b['dmg'])
+                _damage_enemy(self, e, b['dmg'], src)
+                self.note_shot_hit(src)
                 return True
-        src = b.get('src')
         for _pid, eid in self.players.items():
             if eid == src:
                 continue
@@ -871,7 +1058,8 @@ class GameWorld:
             hp = self.entities.get_component(eid, Health)
             if pos and hp and hp.value > 0:
                 if math.hypot(pos.x - b['x'], pos.y - b['y']) < PLAYER_RADIUS:
-                    self.damage_player(eid, b['dmg'])
+                    self.damage_player(eid, b['dmg'], source_eid=src)
+                    self.note_shot_hit(src)
                     return True
         return False
 
@@ -1048,6 +1236,7 @@ class GameWorld:
             # error, not full pockets, so it keeps leaving the floor as it
             # always did.
             it['a'] = False
+            self.note_item(eid)
             return True
         before = self._item_state(eid)
         kind = spec['kind']
@@ -1098,6 +1287,7 @@ class GameWorld:
         # life (design D5): there is no per-item respawn timer, so a key and a
         # medkit are returned by exactly the same rule in `_reset_items`.
         it['a'] = False
+        self.note_item(eid)
         return True
 
     def get_item_states(self) -> list[dict]:
@@ -1109,7 +1299,7 @@ class GameWorld:
     # ------------------------------------------------------------------
     #  Respawn
     # ------------------------------------------------------------------
-    def damage_player(self, eid: int, dmg: int) -> bool:
+    def damage_player(self, eid: int, dmg: int, source_eid: int | None = None) -> bool:
         """Damage a player and handle death.  Returns True if this killed.
 
         Single entry point for player damage: melee, enemy fireballs, friendly
@@ -1119,35 +1309,60 @@ class GameWorld:
         forgot the timer left a 0 HP player wedged in the world forever.
 
         Armor soaks the hit first and INVULN refuses it outright, so both belong
-        here rather than in each of the four callers.
+        here rather than in each of the four callers.  ``source_eid`` is the
+        shooter's entity when a player fired it (None for enemies) and drives
+        the damage-dealt / kill attribution.
+
+        Death no longer starts a respawn timer: the player stays dead until the
+        client asks to respawn (match-end design D4).  ``note_death`` records it.
         """
         pu = self.entities.get_component(eid, Powerup)
         if pu is not None and pu.kind == 'INVULN':
             return False
+        hp = self.entities.get_component(eid, Health)
+        # A hit on an already-dead body changes nothing and must not inflate the
+        # stats, so the guard sits before the bookkeeping (and before armor).
+        if hp is None or hp.value <= 0:
+            return False
+        # "Received" is the incoming hit, before armor eats it: a hit stopped by
+        # a full plate was still a hit the player took.
+        self.note_damage_taken(eid, dmg)
+        if source_eid is not None and source_eid != eid:
+            self.note_damage_dealt(source_eid, dmg)
         arm = self.entities.get_component(eid, Armor)
         if arm is not None and arm.value > 0 and dmg > 0:
             absorbed = min(arm.value, dmg)
             arm.value -= absorbed
             dmg -= absorbed
-        hp = self.entities.get_component(eid, Health)
-        if hp is None or hp.value <= 0:
-            return False
         hp.value = max(0, hp.value - dmg)
         if hp.value > 0:
             return False
         pl = self.entities.get_component(eid, Player)
         if pl is not None:
             pl.state = 1
-            self._respawn[eid] = PLAYER_RESPAWN_TICKS
+        self.note_death(eid)
+        # A kill by another player counts toward the shooter's kills (which are
+        # the frags in PvP): a self-inflicted or environmental death does not.
+        if source_eid is not None and source_eid != eid:
+            src_pl = self.entities.get_component(source_eid, Player)
+            if src_pl is not None:
+                self.note_kill(source_eid)
         return True
 
-    def _update_respawns(self) -> None:
-        for eid in list(self._respawn):
-            self._respawn[eid] -= 1
-            if self._respawn[eid] > 0:
-                continue
-            self._respawn.pop(eid)
-            self._respawn_player(eid)
+    def respawn_player(self, player_id: int) -> None:
+        """Public respawn entry: a client's reliable PLAYER_RESPAWN lands here.
+
+        A living player is left untouched (spec: respawn of a living player does
+        nothing), so the request is idempotent and cannot be used to teleport.
+        """
+        eid = self.players.get(player_id)
+        if eid is None:
+            return
+        hp = self.entities.get_component(eid, Health)
+        pl = self.entities.get_component(eid, Player)
+        if hp is not None and pl is not None and pl.state != 1 and hp.value > 0:
+            return
+        self._respawn_player(eid)
 
     def _respawn_player(self, eid: int) -> None:
         pos = self.entities.get_component(eid, Position)
@@ -1195,18 +1410,18 @@ class GameWorld:
         if pu is not None:
             pu.kind = ""
             pu.ticks = 0
-        # The level starts over with the life that just came back: enemies do
-        # not respawn on their own timer, so this death is the only thing that
-        # brings the wave back (killed ones revive, living ones are teleported
-        # home).  Hooked here rather than in damage_player() so the snapshot in
-        # which the player is still dead still shows the level as it was left.
-        self._reset_enemies()
-        # ...and the level includes its doors and all its pickups (design D6):
-        # shut every door, clear every key mask and put every taken item back.
-        # A lost key would otherwise soft-lock the level forever, and a spent
-        # medkit would leave the restarted wave without its loot.
-        self._reset_doors()
-        self._reset_items()
+        # PvE only: the level starts over with the life that just came back.
+        # Enemies do not respawn on their own timer, so this respawn is the only
+        # thing that brings the wave back (killed ones revive, living ones are
+        # teleported home); the level also includes its doors and all its
+        # pickups, so every door shuts, every key mask clears and every taken
+        # item returns.  In PvP none of this runs: the loot is shared and the
+        # arena does not reset per death -- a respawn only returns the player
+        # (match-end design D4).
+        if self.mode == 'pve':
+            self._reset_enemies()
+            self._reset_doors()
+            self._reset_items()
 
     def _reset_doors(self) -> None:
         for d in self.doors.values():
@@ -1309,8 +1524,24 @@ class GameWorld:
                 # no other source in the snapshot.
                 "keys": self._player_keys(eid),
                 "use_reason": self.get_use_reason(player_id),
+                # Match stats ride in the player record so the end screen reads
+                # them from the same frame as the player (see protocol encode).
+                "stats": self._stats_dict(eid),
             })
         return states
+
+    def _stats_dict(self, eid: int) -> dict:
+        st = self.entities.get_component(eid, Stats)
+        if st is None:
+            return {"kills": 0, "deaths": 0, "damage_dealt": 0,
+                    "damage_taken": 0, "shots_fired": 0, "shots_hit": 0,
+                    "items": 0, "secrets": 0}
+        return {
+            "kills": st.kills, "deaths": st.deaths,
+            "damage_dealt": st.damage_dealt, "damage_taken": st.damage_taken,
+            "shots_fired": st.shots_fired, "shots_hit": st.shots_hit,
+            "items": st.items, "secrets": st.secrets,
+        }
 
     def _armor_state(self, eid: int) -> dict | None:
         """``{'type', 'value'}`` for the HUD, or None when there is none.

@@ -27,7 +27,23 @@ RELIABLE_INNER = frozenset({
     PacketType.JOIN_PARTY,
     PacketType.LEAVE_PARTY,
     PacketType.FIRE,
+    PacketType.PLAYER_RESPAWN,
 })
+
+# Hard ceiling on how many peer addresses the server will remember at once.
+# `_endpoints`, `client_info` and `_last_seen` are keyed by source address, and
+# a peer is free to rotate its UDP source port on every datagram: HELLO, ACK and
+# RELIABLE_DATA all create/keep an entry for an address that never joins, so
+# without a cap a flood is unbounded growth (a memory DoS).  Joined sessions and
+# addresses waiting on the update prompt are pinned (never evicted); everything
+# else is dropped least-recently-seen once the table is full.
+MAX_TRACKED_ADDRS = 1024
+
+# Hard ceiling on concurrent joined sessions.  JOIN_REQUEST already requires an
+# accepted handshake, but a single host can complete the handshake from many
+# ports; each session is a player record in the lobby, so the count is capped.
+MAX_SESSIONS = 64
+
 
 
 class ServerNetwork:
@@ -39,6 +55,9 @@ class ServerNetwork:
         self.client_info: dict[tuple[str, int], dict] = {}
         self._next_player_id: int = 1
         self._endpoints: dict[tuple[str, int], ReliableEndpoint] = {}
+        # Last time each tracked address sent a datagram.  The LRU key that
+        # bounds ``_endpoints``/``client_info`` under an address-rotating flood.
+        self._last_seen: dict[tuple[str, int], float] = {}
         self._on_input_callback = None
         self._on_join_callback = None
         self._on_leave_callback = None
@@ -51,6 +70,7 @@ class ServerNetwork:
         self._on_file_request_callback = None
         self._on_file_complete_callback = None
         self._on_fire_callback = None
+        self._on_respawn_callback = None
         # Addresses that produced a connection-reset / port-unreachable error:
         # they get no more traffic and their sessions are removed next tick.
         self.unreachable: set[tuple[str, int]] = set()
@@ -93,6 +113,9 @@ class ServerNetwork:
 
     def on_fire(self, callback):
         self._on_fire_callback = callback
+
+    def on_respawn(self, callback):
+        self._on_respawn_callback = callback
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -145,7 +168,39 @@ class ServerNetwork:
                 lambda ptype, seq, payload: self._send_to(addr, Packet(ptype, seq, payload))
             )
             self._endpoints[addr] = endpoint
+        self._last_seen[addr] = time.monotonic()
+        self._evict_addrs_if_needed()
         return endpoint
+
+    def _evict_addrs_if_needed(self) -> None:
+        """Bound the per-address tables under an address-rotating flood.
+
+        A peer never joins and only needs an entry for HELLO/ACK/RELIABLE_DATA,
+        so its address stays in ``_endpoints`` and ``client_info`` forever unless
+        something removes it.  Joined sessions are pinned (they belong to the
+        lobby and are only removed by the ping timeout), as are addresses still
+        waiting on the update prompt (evicting those would wipe ``protocol_ok``
+        and make the next FILE_REQUEST look unauthorised).  Everything else goes
+        least-recently-seen first until the table fits.
+        """
+        if len(self._last_seen) <= MAX_TRACKED_ADDRS:
+            return
+        pinned = set(self.players)
+        for addr, info in self.client_info.items():
+            if info.get("needs_update"):
+                pinned.add(addr)
+        evictable = [a for a in self._last_seen if a not in pinned]
+        if not evictable:
+            return
+        evictable.sort(key=lambda a: self._last_seen[a])
+        for addr in evictable[:len(self._last_seen) - MAX_TRACKED_ADDRS]:
+            self._drop_addr(addr)
+
+    def _drop_addr(self, addr: tuple[str, int]) -> None:
+        """Forget every per-address table entry (does NOT touch a session)."""
+        self._endpoints.pop(addr, None)
+        self.client_info.pop(addr, None)
+        self._last_seen.pop(addr, None)
 
     def tick(self) -> None:
         now = time.monotonic()
@@ -158,6 +213,8 @@ class ServerNetwork:
         # would otherwise surface as an unhandled callback exception and flood
         # the log.  A malformed datagram is dropped; one bad packet must never
         # affect the rest of the server.
+        self._last_seen[addr] = time.monotonic()
+        self._evict_addrs_if_needed()
         try:
             packet = Packet.decode(data)
             if packet is None:
@@ -214,6 +271,8 @@ class ServerNetwork:
                 self._on_file_complete_callback(addr, decode_file_complete(payload))
         elif inner == PacketType.FIRE:
             self._handle_fire(addr, payload)
+        elif inner == PacketType.PLAYER_RESPAWN:
+            self._with_session(addr, self._on_respawn_callback)
 
     def _get_session(self, addr: tuple[str, int]) -> PlayerSession | None:
         return self.players.get(addr)
@@ -230,6 +289,8 @@ class ServerNetwork:
     def _handle_hello(self, addr: tuple[str, int], payload: bytes) -> None:
         protocol_version, client_version = decode_hello(payload)
         info = self.client_info.setdefault(addr, {})
+        self._last_seen[addr] = time.monotonic()
+        self._evict_addrs_if_needed()
         info["protocol_version"] = protocol_version
         info["client_version"] = client_version
         if self._on_hello_callback:
@@ -245,6 +306,17 @@ class ServerNetwork:
             return
         if not self._protocol_ok(addr):
             logger.info(f"Ignoring JOIN_REQUEST from {addr}: handshake not accepted")
+            return
+        # Cap concurrent sessions BEFORE allocating a player id: one host can
+        # complete the handshake from many source ports, and each session is a
+        # lobby record.  The refusal is a proper JOIN_FAIL so the client is told,
+        # not silently left waiting.
+        if len(self.players) >= MAX_SESSIONS:
+            logger.warning(f"Refusing JOIN_REQUEST from {addr}: at session cap")
+            name_attempt = decode_join_request(payload)
+            self.send_join_fail(
+                PlayerSession(0, name_attempt, addr), "Сервер переполнен"
+            )
             return
 
         name = decode_join_request(payload)
@@ -367,9 +439,11 @@ class ServerNetwork:
         impacts: list[dict] | None = None,
         items: list[dict] | None = None,
         doors: list[dict] | None = None,
+        match: dict | None = None,
     ) -> None:
         payload = encode_world_state(tick, player_states, enemies, bullets,
-                                     corpses, mode, impacts, items, doors)
+                                     corpses, mode, impacts, items, doors,
+                                     match)
         packet = Packet(PacketType.WORLD_STATE, tick & 0xFFFF, payload)
         data = packet.encode()
         for addr in addresses:
@@ -404,8 +478,7 @@ class ServerNetwork:
 
     def remove_player(self, addr: tuple[str, int]) -> PlayerSession | None:
         self.unreachable.discard(addr)
-        self._endpoints.pop(addr, None)
-        self.client_info.pop(addr, None)
+        self._drop_addr(addr)
         return self.players.pop(addr, None)
 
     def stop(self) -> None:

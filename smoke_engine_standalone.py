@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pygame  # noqa: E402
 
 from engine import game_state as gs  # noqa: E402
+from engine.quality import resolution  # noqa: E402
 from shared.sector_map import (  # noqa: E402
     LineDef, Sector, SectorMap, SideDef, Thing, Vertex,
 )
@@ -105,7 +106,7 @@ def test_offline_render():
     rendering.render(700, 0)  # full engine path incl. HUD/upscale
 
     assert gs.frame is not None, "gs.frame not created"
-    assert gs.frame.size == (320, 240), gs.frame.size
+    assert gs.frame.size == resolution('high'), gs.frame.size
     assert len(gs.frame.buf) == gs.frame.iw * gs.frame.ih * 3
     assert max(gs.frame.buf) > 0, "frame buffer empty (VOID)"
     assert len(z_b) == 1000 // gs.render_scale == 250

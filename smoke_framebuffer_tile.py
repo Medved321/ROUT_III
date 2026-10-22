@@ -18,6 +18,7 @@ import pygame  # noqa: E402
 from engine import game_state as gs  # noqa: E402
 from engine import rendering  # noqa: E402
 from engine import textures as texgen  # noqa: E402
+from engine.quality import resolution  # noqa: E402
 from engine.constants import W, H, SCALE, TILE  # noqa: E402
 from client.map_editor import TILE_CHAR_TO_TEX  # noqa: E402
 from client.sprite_factory import get_bot_surface  # noqa: E402
@@ -87,7 +88,7 @@ def test_frame_created():
     _set_map(room)
     _render_at(1.5 * TILE, 2.5 * TILE, 0.0)
     assert gs.frame is not None
-    assert gs.frame.size == (320, 240), gs.frame.size
+    assert gs.frame.size == resolution('high'), gs.frame.size
     print("  framebuffer created per tier   OK")
 
 
@@ -166,8 +167,8 @@ def test_floor_ceiling_band():
 
 
 def test_tiers():
-    for tier, (iw, ih) in (('high', (320, 240)), ('medium', (240, 150)),
-                           ('fast', (160, 100))):
+    for tier in ('high', 'medium', 'fast'):
+        iw, ih = resolution(tier)
         room = [
             "######",
             "#....#",

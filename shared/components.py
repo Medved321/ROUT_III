@@ -99,6 +99,25 @@ class Dash(Component):
 
 
 @dataclass
+class Stats(Component):
+    """Per-player match statistics, carried in every snapshot record.
+
+    Counters are server-authoritative and survive a respawn (a death is not a
+    reason to forget the match so far), so they are reset only when the party
+    starts, never by ``_respawn_player``.  ``kills`` doubles as the frag count:
+    PvP worlds spawn no enemies, so every kill there is player-vs-player.
+    """
+    kills: int = 0
+    deaths: int = 0
+    damage_dealt: int = 0
+    damage_taken: int = 0
+    shots_fired: int = 0
+    shots_hit: int = 0
+    items: int = 0
+    secrets: int = 0
+
+
+@dataclass
 class Enemy(Component):
     """Server-side enemy (PvE)."""
     enemy_type: str = "soldier"

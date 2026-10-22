@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 
 from shared.components import (
-    Velocity, Rotation, Player, Dash, Powerup,
+    Velocity, Rotation, Player, Dash, Powerup, Health,
 )
 from shared.map_data import GameMap
 from shared.sector_map import MAP_FORMAT_SECTOR, SectorMap
@@ -38,6 +38,13 @@ ARTIFACT_RESEND_COOLDOWN = 30.0
 # a flood of sessions (spoofed source ports, each completing HELLO+JOIN before
 # the ping timeout) must not turn into an unbounded number of worlds.
 MAX_PARTIES = 64
+
+# Hard ceiling on members in one party.  Both the lobby snapshot and the world
+# state pack their player count as a single byte ("!B"), so a party with 256
+# members makes ``encode_world_state`` raise ``struct.error`` inside the tick's
+# broadcast -- one over-full party would take down every player's snapshot.
+# The cap stays far below 255 so both counts are safe by construction.
+MAX_PARTY_MEMBERS = 16
 
 
 class GameServer:
@@ -71,6 +78,7 @@ class GameServer:
         self.network.on_file_request(self._on_file_request)
         self.network.on_file_complete(self._on_file_complete)
         self.network.on_fire(self._on_player_fire)
+        self.network.on_respawn(self._on_player_respawn)
 
         await self.network.start()
         logger.info(f"Game server started, tick rate: {TICK_RATE}")
@@ -133,7 +141,14 @@ class GameServer:
                 self.network.tick()
             except Exception:
                 logger.exception("Network tick failed; server continues")
-            left = deadline - time.monotonic()
+            # Следующий тик наступает в `deadline + TICK_INTERVAL`: на выходе
+            # цикла инвариант `deadline <= now < deadline + TICK_INTERVAL`.
+            # Сон по одному `deadline - now` всегда <= 0 после пробуждения с
+            # опозданием меньше тика (а опоздание до тика — норма: asyncio на
+            # Windows квантует вверх до ~15.6 мс), и `sleep(0)` превращался в
+            # карусель, которая жрала целое ядро между тиками. Тайп от этого
+            # не страдал (дедлайн двигался верно), ядро — страдало.
+            left = deadline + TICK_INTERVAL - time.monotonic()
             await asyncio.sleep(left if left > 0.0 else 0.0)
 
     def _broadcast_parties(self) -> None:
@@ -159,7 +174,7 @@ class GameServer:
             addresses = [s.address for s in party.members.values()]
             self.network.broadcast_world_state(
                 addresses, w.tick, players, enemies, bullets, corpses,
-                party.mode, impacts, items, doors,
+                party.mode, impacts, items, doors, w.get_match_state(),
             )
 
     def _remove_stale_players(self) -> None:
@@ -320,12 +335,24 @@ class GameServer:
         if current is party:
             self.network.send_join_accept(session, game_map=party.world.game_map)
             return
+        # Full party is refused here, while the joined session still belongs to
+        # its old party (if any): kicking it out first and then refusing would
+        # drop the player from a party they were in for no reason.
+        if len(party.members) >= MAX_PARTY_MEMBERS and session.player_id not in party.members:
+            self.network.send_join_fail(session, "Партия заполнена")
+            return
         if current is not None:
             self.lobby.remove_player(session)
         self._add_to_party(session, party)
         self._broadcast_lobby()
 
     def _add_to_party(self, session: PlayerSession, party: Party) -> None:
+        # Defensive: every caller must have checked the cap already, but adding
+        # past it would corrupt the "!B" player count in the broadcasts, so the
+        # guard lives next to the mutation as well.
+        if len(party.members) >= MAX_PARTY_MEMBERS and session.player_id not in party.members:
+            self.network.send_join_fail(session, "Партия заполнена")
+            return
         party.add_member(session)
         self.network.send_join_accept(session, game_map=party.world.game_map)
         # For PvE: spawn a starting wave once the party has at least one player
@@ -374,12 +401,32 @@ class GameServer:
             session.last_fire_decided = fire_seq
             session.last_fire_result = FireResult(False, 'noop', 0)
             return
+        # A dead player cannot fire, and neither can anyone after the match is
+        # over: the intent is answered (never dropped silently) but it does not
+        # move fire_seq, so the client sees the refusal, not a phantom shot.
+        hp = party.world.entities.get_component(entity_id, Health)
+        pl = party.world.entities.get_component(entity_id, Player)
+        if party.world.match_phase == 'over' \
+                or (pl is not None and pl.state == 1) \
+                or (hp is not None and hp.value <= 0):
+            session.last_fire_decided = fire_seq
+            session.last_fire_result = FireResult(False, 'noop', 0)
+            return
         apply_weapon_switch(party.world, entity_id, weapon_id)
         result = weapons_handle_shoot(party.world, entity_id)
         if result.fired:
             session.last_fire_seq = fire_seq
         session.last_fire_decided = fire_seq
         session.last_fire_result = result
+
+    def _on_player_respawn(self, session: PlayerSession) -> None:
+        # A reliable request; the world ignores it for a living player, so the
+        # only thing to check here is that the session actually belongs to a
+        # party world with a player entity.
+        party = self.lobby.find_party_of(session)
+        if party is None:
+            return
+        party.world.respawn_player(session.player_id)
 
     def _apply_input(
         self, world: GameWorld, entity_id: int, session: PlayerSession,
@@ -390,6 +437,18 @@ class GameServer:
         rot = world.entities.get_component(entity_id, Rotation)
         pl = world.entities.get_component(entity_id, Player)
         dash = world.entities.get_component(entity_id, Dash)
+
+        # Frozen match: nothing may change.  Dead player: input is ignored
+        # wholesale, so a client that keeps sending movement/dash/use cannot
+        # drive a corpse around or open a door behind it (spec: input of a dead
+        # player is ignored).  Input arrives at 25 Hz, so this cannot be left to
+        # the display state alone.
+        if world.match_phase == 'over':
+            return
+        hp_now = world.entities.get_component(entity_id, Health)
+        if (pl is not None and pl.state == 1) \
+                or (hp_now is not None and hp_now.value <= 0):
+            return
 
         # The input channel is untrusted: move and angle are exactly what the
         # client sent, and nothing downstream re-checks them.  A non-finite

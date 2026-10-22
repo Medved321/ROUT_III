@@ -90,7 +90,7 @@ SPEC: list[dict] = [
     {"key": "view_dist", "label": "Дальность прорисовки",
      "kind": "int", "min": 400, "max": 1600, "step": 100},
     {"key": "render_scale", "label": "Качество (масштаб лучей)",
-     "kind": "int", "min": 2, "max": 8, "step": 1},
+     "kind": "int", "min": 1, "max": 8, "step": 1},
     {"key": "vs_scale", "label": "Вертикальное разрешение",
      "kind": "int", "min": 1, "max": 6, "step": 1},
     {"key": "quality_tier", "label": "Графический тир",
@@ -378,7 +378,7 @@ class Settings:
         gs.show_minimap = bool(self.get("show_minimap"))
         gs.show_crosshair = bool(self.get("show_crosshair"))
 
-        scale = int(self.get("render_scale"))
+        scale = max(1, int(self.get("render_scale")))
         const.SCALE = scale
         rendering.SCALE = scale
         gs.render_scale = scale

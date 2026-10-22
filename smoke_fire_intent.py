@@ -158,6 +158,7 @@ class _WindowsClock:
     def __init__(self, stop_at: float | None = None) -> None:
         self.t = 0.0
         self.stop_at = stop_at
+        self.sleeps: list[float] = []
 
     def monotonic(self) -> float:
         return self.t
@@ -165,6 +166,7 @@ class _WindowsClock:
     async def sleep(self, delay: float) -> None:
         if self.stop_at is not None and self.t >= self.stop_at:
             raise _StopLoop
+        self.sleeps.append(delay)
         if delay <= 0.0:
             self.t += self.GRANULARITY
         else:
@@ -1046,6 +1048,12 @@ def test_server_tick_loop_holds_the_rate_the_fire_gate_is_built_on():
 
     Часы здесь намеренно квантуют ожидание по-виндовски, поэтому проверка
     воспроизводит баг детерминированно, а не «если у машины плохой таймер».
+    Тот же прогон ловит и спин: если цикл спит по одному `deadline - now`,
+    после пробуждения с опозданием меньше тика сон всегда <= 0, и между
+    тиками крутится `sleep(0)`, который жрёт целое ядро. Тайп от него не
+    страдал, поэтому одних замеров tps мало — нужна проверка серий
+    неположительных ожиданий: карусель идёт подряд, единичный сон на границе —
+    нет.
     """
     import asyncio
     from server.server import GameServer
@@ -1118,6 +1126,16 @@ def test_server_tick_loop_holds_the_rate_the_fire_gate_is_built_on():
         rate = n_ticks / seconds
         assert abs(rate - TICK_RATE) <= TICK_RATE * 0.1, \
             f"{WPN[wpn]['n']}: {rate:.2f} tps вместо {TICK_RATE}"
+        # Карусель — это именно ПОДРЯД идущие sleep(0): цикл проспал меньше
+        # тика, спит по deadline - now (<= 0), и так до следующего тика.
+        # Единичный <= 0 на самой границе допустим (сон на ~0 перед тиком).
+        run = worst = 0
+        for d in clock.sleeps:
+            run = run + 1 if d <= 0.0 else 0
+            worst = max(worst, run)
+        assert worst <= 1, \
+            (f"{WPN[wpn]['n']}: серия из {worst} ожиданий <= 0 подряд — "
+             f"sleep(0)-карусель жжёт ядро между тиками")
         assert refused == 0, \
             (f"{WPN[wpn]['n']}: {refused} отказов из {sent} интентов "
              f"({reasons[:4]}) при {rate:.2f} tps")

@@ -16,7 +16,9 @@ path (``client/engine/rendering``) is untouched.
 """
 from __future__ import annotations
 
+import logging
 import math
+import time
 
 import pygame
 
@@ -51,6 +53,27 @@ LIGHT_STEPS = 16
 
 _FALLBACK_WALL = (122, 108, 92)
 _FALLBACK_FLAT = (72, 64, 96)
+
+_log = logging.getLogger(__name__)
+
+# Column-level failures repeat every frame while they last; log the first
+# occurrence at once and summarise the rest once per ``interval_s`` per key,
+# so a broken texture is visible in the log without mirroring the frame rate.
+_warn_state = {}
+
+
+def _warn_throttled(key, msg, interval_s=5.0):
+    now = time.monotonic()
+    st = _warn_state.get(key)
+    if st is None:
+        _log.warning(msg)
+        _warn_state[key] = [0, now]
+        return
+    st[0] += 1
+    if now - st[1] >= interval_s:
+        _log.warning("%s (+%d suppressed)", msg, st[0])
+        st[0] = 0
+        st[1] = now
 
 
 def _bucket_strip_column(cache, raw, level, dist, tex_x, hh, heights, edges):

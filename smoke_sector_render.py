@@ -235,8 +235,10 @@ def test_tier_frames():
     # the sector scene intact (walls still drawn at each tier).
     from engine import sector_render
 
-    for tier, (iw, ih) in (("high", (320, 240)), ("medium", (240, 150)),
-                           ("fast", (160, 100))):
+    from engine.quality import resolution
+
+    for tier in ("high", "medium", "fast"):
+        iw, ih = resolution(tier)
         gs.quality_tier = tier
         gs.flat_textured = tier == "high"
         _, _ = _frame(gs.flat_textured, 4, 2, 256, 240, 0.0)

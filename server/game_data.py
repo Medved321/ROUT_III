@@ -170,12 +170,16 @@ STRAFE_FACTOR = 0.6
 WANDER_SPEED_FACTOR = 0.4
 DIAGONAL_COST = 1.414
 CORPSE_LIFETIME = 6000       # ticks (5 min at 20 tps)
-# Death -> back in the fight. One tick, not zero: the corpse and the death flash
-# are the only feedback that the player died at all, so the player is gone from
-# the snapshot for at least one tick before coming back.
-# Enemies have no timer of their own: a killed enemy stays down until a player
-# dies, and that death restarts the whole wave (see GameWorld._reset_enemies).
-PLAYER_RESPAWN_TICKS = 1
+# --- match end ------------------------------------------------------------
+# How close a live player must get to the map's `exit` thing to finish the
+# level.  Three quarters of a tile: reaching the marker, not merely its cell,
+# so the win is a deliberate walk into the goal.
+EXIT_RADIUS = 48.0
+# PvP time limit, in ticks. When it hits zero the match ends and the player
+# with the most frags wins (a tie is a draw); `time_left` is published in
+# seconds. A dead player has no timer of its own any more: respawn is a client
+# request (_respawn_player), not a countdown (match-end design D4).
+PVP_MATCH_TICKS = TICK_RATE * 180   # 3 minutes
 
 CORPSE_COLORS = {
     'soldier': (160, 80, 80), 'shotgunguy': (180, 120, 50), 'chaingunner': (130, 130, 140),

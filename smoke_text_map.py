@@ -365,8 +365,8 @@ def _two_sided_profile(sm: SectorMap) -> list:
         s = sm.sectors[si]
         return (round(s.floor_h, 2), round(s.ceil_h, 2))
     return sorted(
-        (frozenset((sec(sm.sidedefs[ld.front].sector),
-                    sec(sm.sidedefs[ld.back].sector))),
+        (tuple(sorted((sec(sm.sidedefs[ld.front].sector),
+                       sec(sm.sidedefs[ld.back].sector)))),
          bool(getattr(ld, "solid", False)))
         for ld in sm.linedefs if ld.back >= 0)
 
@@ -449,7 +449,7 @@ def test_hole_triangle_and_single_loop() -> None:
 
 def test_real_maps_keep_two_sided() -> None:
     """Реальные карты: дыры и двусторонность переживают render → parse."""
-    for name, expected in (("sector1", 7), ("sector2", 6)):
+    for name, expected in (("sector1", 22), ("sector2", 6)):
         path = ROOT / "maps" / (name + ".mt1")
         if not path.exists():
             continue

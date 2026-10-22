@@ -78,8 +78,8 @@ sec_scene = None
 frame = None
 quality_tier = "high"
 quality_mode = "auto"   # "auto" | "high" | "medium" | "fast" (manual lock)
-iwidth = 320
-iheight = 240
+iwidth = 640
+iheight = 480
 
 # Effects
 particles = []
@@ -102,14 +102,6 @@ bridge_open = set()
 
 # Other players (filled by the bridge, one dict per opponent)
 players = []
-
-# Legacy single-opponent fields (unused, kept for API compatibility)
-other_active = False
-other_px = 0.0
-other_py = 0.0
-other_pa = 0.0
-other_name = ''
-other_wpn = 0
 
 # HUD / stats
 # Frame rate of the last rendered frame, in whole fps.  The engine has no
@@ -153,10 +145,6 @@ flats = {}
 # client/bridge.py) registers callables here before the first frame.
 #   sprite_provider(color, w, h, frame, state, pa, wpn, view) -> pygame.Surface
 #   tile_provider(tile_char) -> wall texture name
-# None degrades predictably instead of raising: bots get a blank SRCALPHA
-# surface, tiles get the neutral 'wall' texture.
-#   sprite_provider(color, w, h, frame, state, pa, wpn, view) -> pygame.Surface
-#   tile_provider(tile_char) -> wall texture name
 #   enemy_surface_provider(etype, h, frame, state, view, detail) -> Surface
 # None degrades predictably instead of raising: bots get a blank SRCALPHA
 # surface, tiles get the neutral 'wall' texture, enemies get a neutral
@@ -174,10 +162,6 @@ enemy_models_enabled = True
 fog_enabled = False
 fog_color = (80, 75, 70)
 fog_density = 60
-
-# Cache used by map_utils._player_in_any_sector
-player_sector_cache = -1
-player_sector_timer = 0
 
 
 def reset_transient_state() -> None:

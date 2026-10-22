@@ -1,20 +1,18 @@
-"""Smoke: instant respawn — a dead player is back on the point they joined from,
-and a player's death is the ONLY thing that brings enemies back: the wave
-restarts on it (killed enemies revive on their own spots, survivors are
-teleported home, corpses go with them).
+"""Smoke: respawn on request -- a dead player stays dead until the client asks to
+respawn, and in PvE a respawn restarts the wave (killed enemies revive on their
+own spots, survivors are teleported home, corpses go with them, items/keys/doors
+return).
 
-The old behaviour (3 s, random spawn point, enemies returning on their own
-one-tick timer) is what these checks pin down: the delay, the *identity* of the
-respawn point, the fact that every death path -- melee, enemy fireball, friendly
-fire, hitscan -- is covered by the one death routine instead of four hand-written
-copies, and that nothing but a player's death starts the wave over.
+The old behaviour (death arms a one-tick timer and comes back by itself) is what
+these checks pin down as *gone*: a death alone is not a wave restart and not a
+respawn, every death path -- melee, enemy fireball, friendly fire, hitscan -- is
+covered by the one death routine instead of four hand-written copies, and nothing
+but an explicit respawn request brings a player back.
 Server-side deterministic sim."""
 import server.weapons as weapons
 from server.game_world import GameWorld
 from server.server import GameServer
-from server.game_data import (
-    PLAYER_MAX_HP, PLAYER_RESPAWN_TICKS,
-)
+from server.game_data import PLAYER_MAX_HP
 from shared.components import (
     Health, Player, Position, Velocity, Dash, WeaponComponent,
 )
@@ -60,7 +58,7 @@ def test_player_respawns_at_its_own_start_point():
     pos.x, pos.y = join[0] + 300.0, join[1] + 300.0
 
     assert w.damage_player(eid, 1000) is True
-    w.update()
+    w.respawn_player(1)
 
     s = _state(w)
     assert (round(s['x']), round(s['y'])) == (round(join[0]), round(join[1])), (
@@ -70,27 +68,39 @@ def test_player_respawns_at_its_own_start_point():
     print("player respawns at its own start point OK")
 
 
-def test_player_respawn_is_immediate():
-    """One tick, not the old TICK_RATE * 3 (=3 s)."""
+def test_player_stays_dead_without_a_request():
+    """Death is persistent: no timer, no auto-respawn, however long we wait."""
     w = GameWorld(mode='pve')
     eid = w.add_player(1, 'P')
     w.damage_player(eid, 1000)
-    assert PLAYER_RESPAWN_TICKS == 1, PLAYER_RESPAWN_TICKS
-    for _ in range(4):
+    for _ in range(120):
         w.update()
-    assert _state(w)['health'] == PLAYER_MAX_HP, "must be back within 4 ticks"
-    print("player respawn is immediate OK")
+    s = _state(w)
+    assert s['health'] == 0 and s['state'] == 1, s
+    assert w.entities.get_component(eid, Health).value == 0
+    print("player stays dead until a request OK")
+
+
+def test_respawn_of_a_living_player_does_nothing():
+    """Idempotent and not a teleport: a live player is left exactly where it is."""
+    w = GameWorld(mode='pve')
+    eid = _park_player(w, 1, 123.0, 456.0)
+    hp = w.entities.get_component(eid, Health)
+    hp.value = 77
+    w.respawn_player(1)
+    pos = w.entities.get_component(eid, Position)
+    assert (pos.x, pos.y) == (123.0, 456.0), (pos.x, pos.y)
+    assert hp.value == 77, hp.value
+    print("respawn of a living player changes nothing OK")
 
 
 def test_player_death_is_published_at_least_one_snapshot():
-    """Instant must not mean invisible: the corpse/flash is the death feedback."""
+    """Death must be visible: HP 0 and state 1 in the snapshot the moment it lands."""
     w = GameWorld(mode='pve')
     eid = w.add_player(1, 'P')
     w.damage_player(eid, 1000)
     s = _state(w)
     assert s['health'] == 0 and s['state'] == 1, s
-    w.update()
-    assert _state(w)['health'] > 0, "back in the fight on the very next tick"
     print("player death visible in a snapshot OK")
 
 
@@ -107,7 +117,7 @@ def test_player_respawn_refills_the_ammo_reserve():
     wp.current = 0
 
     w.damage_player(eid, 1000)
-    w.update()
+    w.respawn_player(1)
 
     assert dict(wp.ammo) == dict(WeaponComponent().ammo), wp.ammo
     assert wp.owned == lost_guns, wp.owned
@@ -127,7 +137,7 @@ def test_player_respawn_clears_dash_and_cooldowns():
     wp.fire_cooldown = 7
 
     w.damage_player(eid, 1000)
-    w.update()
+    w.respawn_player(1)
 
     assert dash.ticks == 0 and dash.cooldown == 0, (dash.ticks, dash.cooldown)
     assert vel.dx == 0.0 and vel.dy == 0.0, (vel.dx, vel.dy)
@@ -135,13 +145,14 @@ def test_player_respawn_clears_dash_and_cooldowns():
     print("respawn clears dash/velocity/weapon cooldown OK")
 
 
-def test_all_death_paths_schedule_a_respawn():
-    """Melee, enemy fireball, friendly fire and hitscan all respawn.
+def test_all_death_paths_funnel_into_damage_player():
+    """Melee, enemy fireball, friendly fire and hitscan all kill through the one
+    entry point, and each leaves the player dead with no timer (a copy that forgot
+    the guard would leave a 0 HP player respawning on its own).
 
-    They used to be four copies of the same block; a copy that forgot the timer
-    left a 0 HP player stuck in the world with no way back.  Each case drives the
-    real call site with its own damage value -- HP is drained first, so a path
-    that silently stopped killing would show up instead of passing on its own.
+    Each case drives the real call site with its own damage value -- HP is drained
+    first, so a path that silently stopped killing would show up instead of
+    passing on its own.
     """
     def world_at(x, y):
         w = GameWorld(mode='pve')
@@ -150,20 +161,23 @@ def test_all_death_paths_schedule_a_respawn():
         hp.value = 1                      # the next real hit is lethal
         return w, eid
 
+    def assert_dead(w, eid):
+        hp = w.entities.get_component(eid, Health)
+        pl = w.entities.get_component(eid, Player)
+        assert hp.value == 0, hp.value
+        assert pl.state == 1, pl.state
+        w.respawn_player(1)
+        assert hp.value == PLAYER_MAX_HP and pl.state == 0
+
     def melee(w, eid):
         en = _mk_enemy(1, 400.0, 318.0, etype='soldier', spd=0.0)
         w.enemies.append(en)
-        # Spy on the one entry point for player damage.  Its residue is not
-        # observable from outside anymore: the death it causes schedules the
-        # respawn, and the respawn restarts the wave, which clears `en['ls']`
-        # on the very same tick -- so "the enemy still looks like it just
-        # attacked" is no longer evidence that the melee branch fired.
         hits = []
         real = w.damage_player
 
-        def spy(pid, dmg):
+        def spy(pid, dmg, *a, **k):
             hits.append((pid, dmg))
-            return real(pid, dmg)
+            return real(pid, dmg, *a, **k)
 
         w.damage_player = spy
         try:
@@ -175,46 +189,39 @@ def test_all_death_paths_schedule_a_respawn():
             w.damage_player = real
         assert hits and hits[0][0] == eid, "the melee branch never fired"
         assert hits[0][1] > 0, hits
-        assert eid not in w._respawn, "respawn still pending: not tested"
     w, eid = world_at(400.0, 300.0)
     melee(w, eid)
-    assert w.entities.get_component(eid, Health).value == PLAYER_MAX_HP
+    assert_dead(w, eid)
 
     def enemy_ball(w, eid):
         assert w._resolve_enemy_ball(
             {'x': 600.0, 'y': 300.0, 'dmg': 15, 'src': 99}) is True
-        assert eid in w._respawn
-        w.update()
     w, eid = world_at(600.0, 300.0)
     enemy_ball(w, eid)
+    assert_dead(w, eid)
 
     def friendly_fire(w, eid):
         assert w._resolve_player_ball(
             {'x': 600.0, 'y': 300.0, 'dmg': 15, 'src': 7,
              'from_player': True}) is True
-        assert eid in w._respawn
-        w.update()
     w, eid = world_at(600.0, 300.0)
     friendly_fire(w, eid)
+    assert_dead(w, eid)
 
     def hitscan(w, eid):
         assert weapons._hitscan_players(w, 7, 600.0, 200.0, 1.5708, 15, 600.0)
-        assert eid in w._respawn
-        w.update()
     w, eid = world_at(600.0, 300.0)
     hitscan(w, eid)
-
-    for w, eid in [(w, eid)]:
-        assert w.entities.get_component(eid, Health).value == PLAYER_MAX_HP
-    print("every death path respawns the player OK")
+    assert_dead(w, eid)
+    print("every death path kills through damage_player, none auto-respawns OK")
 
 
-def test_input_does_not_clear_death_state():
+def test_live_input_still_fires_but_dead_input_is_ignored():
     """PLAYER_INPUT runs at 25 Hz against a 20 Hz tick and must not resurrect.
 
     Calls the real ``_apply_input`` (it touches nothing on ``self``, so it can be
-    driven unbound) with a dash in flight -- the write that used to clear the
-    death state, and with it the only trace that the player had died.
+    driven unbound): a live player's dash still publishes state 3, a dead player's
+    input changes nothing, and only a respawn clears the death state.
     """
     w = GameWorld(mode='pve')
     eid = w.add_player(1, 'P')
@@ -231,9 +238,9 @@ def test_input_does_not_clear_death_state():
     GameServer._apply_input(None, w, eid, None, 1, 0, 0.0, False,
                             flags=INPUT_FLAG_DASH)
     assert pl.state == 1, "input resurrected a dead player"
-    w.update()
+    w.respawn_player(1)
     assert pl.state == 0, "respawn must clear the death state"
-    print("input does not clear death state OK")
+    print("live input publishes dash, dead input is ignored OK")
 
 
 def test_remove_player_forgets_start_point():
@@ -247,15 +254,15 @@ def test_remove_player_forgets_start_point():
 
 # ---------------------------------------------------------------- enemy
 
-# Long enough that an old one-tick enemy timer, a stray wave timer or a
-# "respawn after a few seconds" regression cannot hide inside it: 60 ticks is
-# 3 s at TICK_RATE, i.e. longer than the delay this project deleted.
+# Long enough that a stray wave timer or a "respawn after a few seconds"
+# regression cannot hide inside it: 60 ticks is 3 s at TICK_RATE, i.e. longer
+# than the delay this project deleted.
 DEAD_TICKS = 60
 
 
 def test_dead_enemy_stays_down():
-    """A kill arms no timer: ticks do not bring an enemy back, only a death
-    of a player does -- and there is no dead player in this test."""
+    """A kill arms no timer: ticks do not bring an enemy back, only a respawn
+    does -- and there is none in this test."""
     w = GameWorld(mode='pve')
     w.add_player(1, 'P')
     en = _mk_enemy(1, 500.0, 300.0)
@@ -268,10 +275,36 @@ def test_dead_enemy_stays_down():
     assert en['a'] is False and en['hp'] == 0, (en['a'], en['hp'])
     assert [e['id'] for e in w.get_enemy_states()] == [], "dead enemy published"
     assert w.enemies, "a dead enemy must keep its record: it carries the home"
-    print("a killed enemy stays down until a player dies OK")
+    print("a killed enemy stays down until a respawn OK")
 
 
-def test_player_death_restarts_the_wave():
+def test_player_death_alone_does_not_restart_the_wave():
+    """Death is not the restart trigger any more; nothing changes while the body
+    lies there."""
+    w = GameWorld(mode='pve')
+    w.add_player(1, 'P')
+    killed = _mk_enemy(1, 500.0, 300.0)
+    roaming = _mk_enemy(2, 640.0, 380.0, etype='soldier')
+    w.enemies.extend([killed, roaming])
+    w.kill_enemy(killed)
+    roaming['x'], roaming['y'] = 900.0, 700.0        # walked away from home
+    w.corpses.append({'eid': 99, 'x': 10.0, 'y': 10.0, 't': 'imp',
+                      'col': (1, 2, 3), 'time': 500})
+
+    w.damage_player(w.players[1], 1000)
+    for _ in range(DEAD_TICKS):
+        w.update()
+
+    by_id = {e['id']: e for e in w.enemies}
+    assert by_id[1]['a'] is False, "a death restarted the wave on its own"
+    assert (roaming['x'], roaming['y']) == (900.0, 700.0), roaming
+    # The pre-existing body is not swept away by anything but a respawn (it is
+    # merely aged by the corpse timer).
+    assert any(c['eid'] == 99 for c in w.corpses), w.corpses
+    print("a player death does not restart the wave OK")
+
+
+def test_player_respawn_restarts_the_wave():
     """The one trigger: the dead revive on their spots, the living go home too."""
     w = GameWorld(mode='pve')
     w.add_player(1, 'P')
@@ -284,7 +317,7 @@ def test_player_death_restarts_the_wave():
                       'col': (1, 2, 3), 'time': 500})
 
     w.damage_player(w.players[1], 1000)
-    w.update()
+    w.respawn_player(1)
 
     by_id = {e['id']: e for e in w.enemies}
     dead = by_id[1]
@@ -294,7 +327,24 @@ def test_player_death_restarts_the_wave():
     assert w.corpses == [], w.corpses
     assert {e['id'] for e in w.get_enemy_states()} == {1, 2}, \
         w.get_enemy_states()
-    print("a player death restarts the wave OK")
+    print("a player respawn restarts the wave OK")
+
+
+def test_pvp_respawn_keeps_shared_loot():
+    """In PvP a respawn only returns the player: the arena and its loot stay."""
+    w = GameWorld(mode='pvp')
+    w.add_player(1, 'P')
+    w.items = [{'id': 1, 'x': 100.0, 'y': 100.0, 't': 'med', 'a': False}]
+    en = _mk_enemy(1, 500.0, 300.0)
+    w.enemies.append(en)
+    w.kill_enemy(en)
+
+    w.damage_player(w.players[1], 1000)
+    w.respawn_player(1)
+
+    assert w.items[0]['a'] is False, "PvP respawn returned a taken item"
+    assert en['a'] is False, "PvP respawn revived an enemy"
+    print("PvP respawn keeps loot and the wave OK")
 
 
 def test_wave_reset_clears_ai_state():
@@ -307,7 +357,7 @@ def test_wave_reset_clears_ai_state():
                'attack_ticks': 30, 'dying': 3, 'd_flash': 5, 'anim_frame': 2})
 
     w.damage_player(w.players[1], 1000)
-    w.update()
+    w.respawn_player(1)
 
     r = w.enemies[0]
     assert (r['stun'], r['alert'], r['ls']) == (0, False, 0), r
@@ -328,7 +378,7 @@ def test_enemy_is_absent_from_snapshot_while_dead():
     for _ in range(DEAD_TICKS):
         w.update()
         assert [e['id'] for e in w.get_enemy_states()] == [], \
-            "a dead enemy came back without a player's death"
+            "a dead enemy came back without a respawn"
     print("dead enemy hidden from the snapshot until the wave restarts OK")
 
 
@@ -344,41 +394,43 @@ def test_corpse_is_cleared_before_its_enemy_returns():
     assert (en['x'], en['y']) == (500.0, 300.0), "killed away from home"
 
     w.damage_player(w.players[1], 1000)
-    w.update()
+    w.respawn_player(1)
 
     assert [c for c in w.corpses if c.get('eid') == 1] == [], w.corpses
     assert en['a'] is True, "the enemy did not come back"
     print("corpse cleared before its enemy returns OK")
 
 
-def test_player_death_is_the_only_trigger():
-    """A kill with a live player arms nothing: there is no timer to run out."""
+def test_only_a_respawn_brings_the_wave_back():
+    """A kill with no respawn request arms nothing: there is no timer to run out."""
     w = GameWorld(mode='pve')
     w.add_player(1, 'P')
     en = _mk_enemy(1, 500.0, 300.0)
     w.enemies.append(en)
     w.kill_enemy(en)
-    assert not w._respawn, w._respawn
     for _ in range(DEAD_TICKS):
         w.update()
-        assert not w._respawn, "a killed enemy armed a player respawn"
-    assert en['a'] is False and en['hp'] == 0, (en['a'], en['hp'])
-    print("nothing but a player's death starts the wave over OK")
+        assert en['a'] is False, "a killed enemy revived on its own"
+    assert en['hp'] == 0, en
+    print("nothing but a respawn starts the wave over OK")
 
 
 if __name__ == '__main__':
     test_player_respawns_at_its_own_start_point()
-    test_player_respawn_is_immediate()
+    test_player_stays_dead_without_a_request()
+    test_respawn_of_a_living_player_does_nothing()
     test_player_death_is_published_at_least_one_snapshot()
     test_player_respawn_clears_dash_and_cooldowns()
     test_player_respawn_refills_the_ammo_reserve()
-    test_all_death_paths_schedule_a_respawn()
-    test_input_does_not_clear_death_state()
+    test_all_death_paths_funnel_into_damage_player()
+    test_live_input_still_fires_but_dead_input_is_ignored()
     test_remove_player_forgets_start_point()
     test_dead_enemy_stays_down()
-    test_player_death_restarts_the_wave()
+    test_player_death_alone_does_not_restart_the_wave()
+    test_player_respawn_restarts_the_wave()
+    test_pvp_respawn_keeps_shared_loot()
     test_wave_reset_clears_ai_state()
     test_enemy_is_absent_from_snapshot_while_dead()
     test_corpse_is_cleared_before_its_enemy_returns()
-    test_player_death_is_the_only_trigger()
+    test_only_a_respawn_brings_the_wave_back()
     print("RESPAWN SMOKE PASSED")

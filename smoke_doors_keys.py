@@ -322,10 +322,12 @@ def test_keys():
     assert w2.entities.get_component(e2, Keys).mask == 0
     print("4b. a dead player does not loot a key OK")
 
-    # Wave restart returns the key and clears the mask.
+    # Wave restart returns the key and clears the mask.  Death no longer
+    # auto-respawns, so the client's request is what restarts the wave.
     _face(world, eid, 100, 100, 0.0)
     world.damage_player(eid, 9999)
-    _tick(world, 3)                       # respawn timer is one tick
+    world.respawn_player(1)
+    _tick(world, 1)
     assert keys.mask == 0, "restart kept the key"
     assert item['a'], "restart did not put the key back"
     print("4c. wave restart returns keys and clears masks OK")
