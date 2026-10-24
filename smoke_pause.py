@@ -125,8 +125,12 @@ def test_client_wires_the_mute_to_pause():
                         "client", "client.py")
     with open(path, encoding="utf-8") as fh:
         src = fh.read()
-    assert "enabled=lambda: not self._paused" in src, \
+    # One gate owns both mute states (pause and the death/victory overlay); the
+    # loop must reference it, and it must fold in _paused.
+    assert "enabled=self._input_enabled" in src, \
         "pause is not wired into the input-send loop"
+    assert "not self._paused and not self._end_active()" in src, \
+        "_input_enabled must mute input while paused"
     print("6 client wires the input mute to _paused OK")
 
 

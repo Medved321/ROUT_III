@@ -27,6 +27,7 @@ from client.settings import (
     Settings, control_hints, is_tractor, save_server_settings, size_text)
 from client.settings_screen import SettingsScreen
 from client.pause_screen import PauseScreen
+from client.end_screen import EndScreen
 from client.editor_screen import MapEditorScreen
 from engine.constants import WPN, INPUT_SEND_INTERVAL
 from client.performance import AdaptiveQuality, input_send_loop
@@ -83,6 +84,7 @@ class GameClient:
         self.settings.load()
         self.settings_screen = SettingsScreen(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.pause_screen = PauseScreen(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.end_screen = EndScreen(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.editor_screen = MapEditorScreen(SCREEN_WIDTH, SCREEN_HEIGHT)
         from client.sector_editor_screen import SectorEditorScreen
         self.sector_editor_screen = SectorEditorScreen(SCREEN_WIDTH, SCREEN_HEIGHT)
@@ -122,6 +124,16 @@ class GameClient:
         # consumed by the bridge for the own-dash feedback only.
         self.local_state: int = 0
         self.mode: str = 'pve'
+        # Match outcome from the snapshot's trailing block, and the local
+        # player's own counters from their record. Read verbatim -- the server
+        # owns both -- so the end screens never show a value of their own.
+        self.match_phase: str = 'playing'
+        self.match_winner: int = 0
+        self.match_time_left: int = 0
+        self.secrets_total: int = 0
+        self._match_tick: int = 0
+        self.local_stats: dict | None = None
+        self._players_snapshot: list[dict] = []
         self.impacts: list[dict] = []
         self.items: list[dict] = []
         self.doors: list[dict] = []
@@ -190,6 +202,9 @@ class GameClient:
         self._seen_first_state: bool = False
         # Frozen world frame shown under the pause menu (None while playing).
         self._pause_bg: pygame.Surface | None = None
+        # Frozen world frame shown under the death/victory overlay; None while
+        # the end screen is not up.
+        self._end_bg: pygame.Surface | None = None
 
     # ── window size and control mode ─────────────────────────────────
     def _apply_window(self) -> None:
@@ -753,15 +768,26 @@ class GameClient:
                 self._input_snapshot,
                 INPUT_SEND_INTERVAL,
                 should_run=lambda: self.running and self.network.state == "game",
-                # While the pause menu is up the loop stays alive but sends
-                # nothing.  Forwarding the last held keys would keep the server
-                # moving and shooting the player behind the frozen frame, which
-                # is exactly "the pause does not stop the game".
-                enabled=lambda: not self._paused,
+                # While the pause menu or an end screen is up the loop stays
+                # alive but sends nothing.  Forwarding the last held keys would
+                # keep the server moving and shooting the player behind the
+                # frozen frame -- and firing while dead is refused anyway, so an
+                # input stream would only cost packets.
+                enabled=self._input_enabled,
             )
         )
         try:
             while self.running and self.network.state == "game":
+                # An end screen takes priority over pause: the world keeps
+                # running under it, so the local player can die while the pause
+                # menu is up, and the death overlay must win.
+                if self._end_active():
+                    if self._end_bg is None:
+                        self._enter_end()
+                    await self._end_frame()
+                    continue
+                if self._end_bg is not None:
+                    self._exit_end()
                 if self._paused:
                     await self._paused_frame()
                     continue
@@ -802,6 +828,172 @@ class GameClient:
         self.input_handler.reset_mouse_position()
         pygame.event.clear()
 
+    # ── end screens (death / victory) ────────────────────────────────
+    def _input_enabled(self) -> bool:
+        """The single gate on outbound gameplay input.
+
+        Pause and the end overlay are the two states in which the client must
+        not send ``PLAYER_INPUT``/``FIRE``: the server is authoritative and
+        trusts fresh input, so keys held across the overlay would otherwise keep
+        feeding a dead or finished player.  One predicate, so a new state cannot
+        forget one of the two loops.
+        """
+        return not self._paused and not self._end_active()
+
+    def _end_active(self) -> bool:
+        """The death or victory overlay is up.
+
+        Two independent triggers, one overlay: the match ended (someone reached
+        the exit, the PvP clock ran out) or the local player is dead and has not
+        been put back in yet.  Read from the authoritative snapshot fields, so
+        the overlay appears on the same frame as the death/phase change.
+        """
+        if self.bridge is None:
+            return False
+        if self.match_phase == 'over':
+            return True
+        return self.local_health <= 0 or self.local_state == 1
+
+    def _enter_end(self) -> None:
+        # A death can land while the pause menu is up (the world never stops).
+        # Drop the pause state and take over the frozen frame, so the two
+        # overlays can never stack.
+        self._paused = False
+        self._pause_bg = None
+        self.end_screen._selected = 0
+        self.input_handler.unlock_mouse()
+        self._end_bg = self.renderer.capture_menu_frame()
+        pygame.event.clear()
+
+    def _exit_end(self) -> None:
+        self._end_bg = None
+        self._dash_pending = False
+        self.input_handler.lock_mouse()
+        self.input_handler.reset_mouse_position()
+        pygame.event.clear()
+
+    def _accuracy_pct(self) -> int:
+        st = self.local_stats or {}
+        fired = int(st.get('shots_fired', 0))
+        if fired <= 0:
+            return 0
+        return int(round(100.0 * int(st.get('shots_hit', 0)) / fired))
+
+    @staticmethod
+    def _format_time(seconds: int) -> str:
+        seconds = max(0, int(seconds))
+        return f"{seconds // 60}:{seconds % 60:02d}"
+
+    def _end_model(self) -> dict:
+        st = self.local_stats or {}
+        stats = [
+            ("Убийства", f"{int(st.get('kills', 0))}"),
+            ("Смерти", f"{int(st.get('deaths', 0))}"),
+            ("Урон нанесён", f"{int(st.get('damage_dealt', 0))}"),
+            ("Урон получен", f"{int(st.get('damage_taken', 0))}"),
+            ("Точность", f"{self._accuracy_pct()}%"),
+            ("Предметы", f"{int(st.get('items', 0))}"),
+            ("Секреты", f"{int(st.get('secrets', 0))}/{int(self.secrets_total)}"),
+            ("Время", self._format_time(self._match_tick // 20)),
+        ]
+        if self.match_phase != 'over':
+            return {
+                "kind": "death",
+                "title": "ВЫ ПОГИБЛИ",
+                "reason": "",
+                "tone": "lose",
+                "stats": stats,
+                "buttons": [("respawn", "ВОЗРОДИТЬСЯ")],
+                "primary": "respawn",
+                "escapable": True,
+                "hint": "Enter — возродиться | Esc — в меню",
+            }
+        if self.mode != 'pvp':
+            return {
+                "kind": "victory",
+                "title": "УРОВЕНЬ ПРОЙДЕН",
+                "reason": "",
+                "tone": "win",
+                "stats": stats,
+                "buttons": [("leave", "В МЕНЮ")],
+                "primary": "leave",
+                "escapable": True,
+                "hint": "Enter — в меню",
+            }
+        if self.match_winner == 0:
+            title, tone = "НИЧЬЯ", "lose"
+        elif self.match_winner == self.player_id:
+            title, tone = "ПОБЕДА", "win"
+        else:
+            title, tone = "ПОРАЖЕНИЕ", "lose"
+        players = sorted(
+            self._players_snapshot,
+            key=lambda p: int((p.get('stats') or {}).get('kills', 0)),
+            reverse=True,
+        )
+        rows = []
+        highlight = None
+        for i, p in enumerate(players):
+            st_p = p.get('stats') or {}
+            rows.append([
+                p.get('name', '') or f"ID{p.get('id')}",
+                str(int(st_p.get('kills', 0))),
+                str(int(st_p.get('deaths', 0))),
+            ])
+            if p.get('id') == self.player_id:
+                highlight = i
+        return {
+            "kind": "victory",
+            "title": title,
+            "reason": "",
+            "tone": tone,
+            "stats": stats,
+            "table": {"headers": ["Игрок", "Убийства", "Смерти"],
+                      "rows": rows, "highlight": highlight},
+            "buttons": [("leave", "В МЕНЮ")],
+            "primary": "leave",
+            "escapable": True,
+            "hint": "Enter — в меню",
+        }
+
+    async def _end_frame(self) -> None:
+        events = pygame.event.get()
+        for event in events:
+            if event.type == pygame.QUIT:
+                self.running = False
+                return
+        # Keep reading the world under the overlay: the server answers the
+        # respawn request with a new snapshot, and only applying it can clear
+        # the death overlay.  Without this the state would freeze on the frame
+        # of death and the overlay could never come down.
+        self._update_local_state()
+        if not self._end_active():
+            self._exit_end()
+            return
+
+        mevents = self._menu_events(events)
+        if self._apply_resizes(events):
+            # The backdrop was captured for the old window; re-grab it so the
+            # frozen frame keeps filling the new one.
+            self._end_bg = self.renderer.capture_menu_frame()
+
+        self.end_screen.set_model(self._end_model())
+        action = self.end_screen.handle(mevents)
+        if action == "respawn":
+            self.network.send_respawn()
+        elif action == "leave":
+            self._exit_end()
+            self._leave_to_lobby()
+            return
+
+        if self._end_bg is not None:
+            self.renderer.ui.blit(self._end_bg, (0, 0))
+        self.end_screen.draw(self.renderer.ui)
+        self.renderer.present()
+        pygame.display.flip()
+        self.renderer.clock.tick(self.fps_cap)
+        await asyncio.sleep(0.005)
+
     def _leave_to_lobby(self) -> None:
         self.network.state = "lobby"
         self.network.send_leave_party()
@@ -823,6 +1015,14 @@ class GameClient:
         self._sfx_prev_health = None
         self._sfx_prev_state = 0
         self._pause_bg = None
+        self._end_bg = None
+        self.match_phase = 'playing'
+        self.match_winner = 0
+        self.match_time_left = 0
+        self.secrets_total = 0
+        self._match_tick = 0
+        self.local_stats = None
+        self._players_snapshot = []
         # A remembered press died with the party: it was meant for a weapon in
         # a world that no longer exists.
         self._fire_press_buffered = False
@@ -1097,6 +1297,15 @@ class GameClient:
         self.doors = doors
         self._sfx_doors(doors)
         self.mode = mode
+        # Match block, read from the newest snapshot: the overlay and the HUD
+        # read these, never a locally guessed phase.
+        lm = self.network.latest_match or {}
+        self.match_phase = lm.get('phase', 'playing')
+        self.match_winner = int(lm.get('winner_id', 0))
+        self.match_time_left = int(lm.get('time_left', 0))
+        self.secrets_total = int(lm.get('secrets_total', 0))
+        self._match_tick = int(_tick)
+        self._players_snapshot = players
 
         latest = self.network.latest_state
         if latest is None:
@@ -1127,6 +1336,8 @@ class GameClient:
                 # from the snapshot: the server owns both (design D6/D9).
                 self.local_keys = p.get("keys", 0)
                 self.local_use_reason = p.get("use_reason", 0)
+                # Per-player counters, verbatim from the record (design D2).
+                self.local_stats = p.get("stats") or {}
                 # Fire decision from the snapshot: drives the local recoil's
                 # length instead of the key press, so a refused intent cannot
                 # leave a phantom shot behind.
@@ -1148,6 +1359,31 @@ class GameClient:
                 elif abs(diff) > 1e-4:
                     self.local_angle = normalize_angle(self.local_angle + diff * 0.3)
             self._seen_first_state = True
+
+        self._feed_engine_meta()
+
+    def _feed_engine_meta(self) -> None:
+        """Publish the snapshot's match counters to the engine HUD state.
+
+        The results overlay is a client screen, but the in-game HUD (kills,
+        accuracy, the PvP clock) is drawn by the engine, and the engine owns no
+        network state.  This is the one place the values cross the boundary, so
+        there is a single owner of "what the HUD shows".
+        """
+        from engine import game_state as gs
+
+        st = self.local_stats or {}
+        gs.kills = int(st.get('kills', 0))
+        gs.shots_fired = int(st.get('shots_fired', 0))
+        gs.shots_hit = int(st.get('shots_hit', 0))
+        gs.damage_dealt = int(st.get('damage_dealt', 0))
+        gs.damage_taken = int(st.get('damage_taken', 0))
+        gs.items_picked = int(st.get('items', 0))
+        gs.secrets_found = int(st.get('secrets', 0))
+        gs.secrets_total = int(self.secrets_total)
+        gs.dm_game_over = self.match_phase == 'over'
+        gs.dm_winner = int(self.match_winner)
+        gs.dm_timer = int(self.match_time_left)
 
     # ── sound effects (state of THIS snapshot vs the last) ────────────────
     def _sfx_impacts(self, impacts) -> None:

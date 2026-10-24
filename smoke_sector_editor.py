@@ -13,11 +13,12 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from shared.sector_map import (  # noqa: E402
-    MAX_SECTOR_HEIGHT, MIN_SECTOR_HEIGHT, LineDef, Sector, SectorMap, SideDef,
-    Thing, Vertex,
+    MAX_SECTOR_HEIGHT, MIN_SECTOR_HEIGHT, SPECIAL_DOORS, LineDef, Sector,
+    SectorMap, SideDef, Thing, Vertex,
 )
 from client.sector_editor import (  # noqa: E402
-    SectorEditor, clamp_sector_heights, new_room, save_mt1_with_bsp,
+    GRID_DEFAULT, WALL_THICKNESS, SectorEditor, clamp_sector_heights, new_room,
+    save_mt1_with_bsp,
 )
 
 
@@ -86,6 +87,17 @@ def test_line_ops():
     print("  line ops         OK")
 
 
+def test_wall_thickness_constant():
+    assert WALL_THICKNESS == GRID_DEFAULT == 16.0
+    print("  wall thickness   OK")
+
+
+def _inner_lines(ed, sid):
+    return [i for i, ld in enumerate(ed.lines)
+            if 0 <= ld.front < len(ed.sides)
+            and ed.sides[ld.front].sector == sid and ld.back < 0]
+
+
 def test_sector_from_contour():
     ed = SectorEditor(new_room(1600, 1600))
     v1 = ed.add_vertex(400, 400)
@@ -96,14 +108,39 @@ def test_sector_from_contour():
     l2 = ed.add_line(v2, v3)   # right
     l3 = ed.add_line(v3, v4)   # bottom
     l4 = ed.add_line(v4, v1)   # left
+    before = ed.sm.to_json()
+    hist = len(ed._history)
     sid, errs = ed.sector_from_contour([l1, l2, l3, l4], floor_h=-64, light=120)
     assert sid == 1 and not errs, errs
+    assert len(ed._history) == hist + 1, "creation must be one undo step"
     assert not ed.validate(), ed.validate()
     assert ed.sm.find_sector_at(600, 600) == 1
     assert ed.sm.find_sector_at(200, 200) == 0
     assert ed.sm.find_sector_at(600, 1200) == 0
-    # the box border is now passable-looking (two-sided) geometry
-    assert sum(1 for l in ed.lines if l.two_sided) == 4
+    # the contour is the OUTER face: one-sided, looking back at the room
+    for li in (l1, l2, l3, l4):
+        ld = ed.lines[li]
+        assert ld.back < 0, (li, ld)
+        assert ed.sides[ld.front].sector == 0, (li, ed.sides[ld.front].sector)
+    # the inner loop is A's own wall, one-sided as well
+    inner = _inner_lines(ed, 1)
+    assert len(inner) == 4, inner
+    assert all(ed.lines[li].back < 0 for li in inner)
+    # the 16px strip between the loops is the wall body: void, and blocking
+    assert ed.sm.find_sector_at(408, 600) == -1
+    assert ed.sm.find_sector_at(392, 600) == 0
+    for li in list((l1, l2, l3, l4)) + inner:
+        assert ed.sm.line_blocks(li), li
+    assert ed.sm.has_polygon(0) and ed.sm.has_polygon(1)
+    # inner walls inherit the contour texture
+    assert all(ed.sides[ed.lines[li].front].mid == "wall" for li in inner)
+    # a 400x400 contour inset by 16 is 368x368
+    pts = set()
+    for li in inner:
+        pts.add((ed.verts[ed.lines[li].v1].x, ed.verts[ed.lines[li].v1].y))
+        pts.add((ed.verts[ed.lines[li].v2].x, ed.verts[ed.lines[li].v2].y))
+    assert pts == {(416.0, 416.0), (784.0, 416.0),
+                   (784.0, 784.0), (416.0, 784.0)}, pts
     # props
     ed.set_sector_props(1, floor_tex="lava", light=200)
     assert ed.sectors[1].floor_tex == "lava" and ed.sectors[1].light == 200
@@ -112,11 +149,138 @@ def test_sector_from_contour():
     assert ed.sm.find_sector_at(600, 600) == 1
     ed.undo()
     assert len(ed.sectors) == 1 and ed.sm.find_sector_at(600, 600) == -1, \
-        "box interior becomes a solid island again"
+        "the contour interior is a hole again"
     assert ed.sm.find_sector_at(400, 1300) == 0, "room must stay intact"
+    assert ed.sm.to_json() == before, "undo must restore the drawing exactly"
     ed.redo()
     assert len(ed.sectors) == 2 and ed.sm.find_sector_at(600, 600) == 1
     print("  sector contour   OK")
+
+
+def test_sector_from_contour_clockwise():
+    """A CW contour is normalized, not rejected: the outside still gets front."""
+    ed = SectorEditor(new_room(1600, 1600))
+    vs = [ed.add_vertex(x, y) for x, y in
+          ((600, 600), (600, 664), (664, 664), (664, 600))]
+    ids = [ed.add_line(vs[i], vs[(i + 1) % 4]) for i in range(4)]
+    for li in ids:
+        ed.sides[ed.lines[li].front].mid = "brick"
+    sid, errs = ed.sector_from_contour(ids, floor_h=0)
+    assert sid == 1 and not errs, errs
+    assert ed.sm.find_sector_at(632, 632) == 1
+    assert ed.sm.find_sector_at(632, 608) == -1
+    assert ed.sm.find_sector_at(580, 580) == 0
+    for li in ids:
+        ld = ed.lines[li]
+        assert ld.back < 0 and ed.sides[ld.front].sector == 0
+        assert ed.sides[ld.front].mid == "brick"
+    inner = _inner_lines(ed, 1)
+    assert len(inner) == 4
+    assert all(ed.sides[ed.lines[li].front].mid == "brick" for li in inner)
+    assert not ed.validate(), ed.validate()
+    print("  contour CW       OK")
+
+
+def test_sector_from_contour_portal():
+    """A two-sided contour edge stays a portal and is not duplicated."""
+    sm = new_room(1600, 1600)
+    ed = SectorEditor(sm)
+    ed.sectors.append(Sector())              # old interior behind the door
+    base = len(ed.verts)
+    for x, y in ((600, 600), (664, 600), (664, 664), (600, 664)):
+        ed.verts.append(Vertex(x, y))
+    ids = []
+    for i in range(4):
+        if i == 0:                           # top edge: the door
+            f = len(ed.sides)
+            ed.sides.append(SideDef(mid="door_D", sector=0))
+            b = len(ed.sides)
+            ed.sides.append(SideDef(mid="door_D", sector=1))
+            ed.lines.append(LineDef(base + i, base + (i + 1) % 4,
+                                    special=SPECIAL_DOORS, front=f, back=b))
+        else:
+            ed.sides.append(SideDef(sector=0))
+            ed.lines.append(LineDef(base + i, base + (i + 1) % 4,
+                                    front=len(ed.sides) - 1))
+        ids.append(len(ed.lines) - 1)
+    sm.invalidate()
+    sid, errs = ed.sector_from_contour(ids, floor_h=0)
+    assert sid == 2 and not errs, errs
+    assert not ed.validate(), ed.validate()
+    door = ed.lines[ids[0]]
+    assert door.two_sided and door.special == SPECIAL_DOORS
+    assert ed.sides[door.front].sector == 0
+    assert ed.sides[door.back].sector == 2
+    assert ed.sides[door.front].mid == "door_D"
+    assert ed.sides[door.back].mid == "door_D"
+    assert not door.solid
+    assert not sm.line_blocks(ids[0]), "a door is not a solid wall"
+    # only the three solid edges get inner walls; the portal is shared
+    inner = _inner_lines(ed, 2)
+    assert len(inner) == 3, inner
+    assert sm.find_sector_at(632, 632) == 2
+    assert sm.find_sector_at(632, 610) == 2, "A reaches the door line"
+    assert sm.find_sector_at(632, 655) == -1, "the solid edge keeps its body"
+    assert sm.find_sector_at(590, 600) == 0
+    print("  contour portal   OK")
+
+
+def test_sector_from_contour_tent():
+    """A lone solid edge between two portals keeps its body as a 'tent'."""
+    sm = new_room(1600, 1600)
+    ed = SectorEditor(sm)
+    ed.sectors.append(Sector())
+    base = len(ed.verts)
+    for x, y in ((600, 600), (664, 600), (664, 664), (600, 664)):
+        ed.verts.append(Vertex(x, y))
+    ids = []
+    for i in range(4):
+        if i in (0, 2):                      # top and bottom are portals
+            f = len(ed.sides)
+            ed.sides.append(SideDef(mid="door_D", sector=0))
+            b = len(ed.sides)
+            ed.sides.append(SideDef(mid="door_D", sector=1))
+            ed.lines.append(LineDef(base + i, base + (i + 1) % 4,
+                                    special=SPECIAL_DOORS, front=f, back=b))
+        else:
+            ed.sides.append(SideDef(sector=0))
+            ed.lines.append(LineDef(base + i, base + (i + 1) % 4,
+                                    front=len(ed.sides) - 1))
+        ids.append(len(ed.lines) - 1)
+    sm.invalidate()
+    sid, errs = ed.sector_from_contour(ids, floor_h=0)
+    assert sid == 2 and not errs, errs
+    assert not ed.validate(), ed.validate()
+    inner = _inner_lines(ed, 2)
+    assert len(inner) == 4, "two segments per lone solid edge"
+    # the tent points sit in the middle of the solid edges, WALL_THICKNESS in
+    mids = {(ed.verts[ed.lines[li].v1].x, ed.verts[ed.lines[li].v1].y)
+            for li in inner}
+    mids |= {(ed.verts[ed.lines[li].v2].x, ed.verts[ed.lines[li].v2].y)
+             for li in inner}
+    assert (616.0, 632.0) in mids and (648.0, 632.0) in mids, mids
+    assert sm.find_sector_at(632, 632) == 2
+    assert sm.find_sector_at(610, 632) == -1
+    assert sm.find_sector_at(655, 632) == -1
+    assert sm.find_sector_at(632, 600) == 2
+    assert sm.find_sector_at(632, 650) == 2
+    print("  contour tent     OK")
+
+
+def test_sector_from_contour_rejects_bad_loops():
+    """A too-small room and a bad contour are refused before any mutation."""
+    for pts in (((400, 400), (432, 400), (432, 432), (400, 432)),
+                ((400, 400), (800, 800), (400, 800), (800, 400))):
+        ed = SectorEditor(new_room(1600, 1600))
+        vs = [ed.add_vertex(x, y) for x, y in pts]
+        ids = [ed.add_line(vs[i], vs[(i + 1) % 4]) for i in range(4)]
+        before = ed.sm.to_json()
+        hist = len(ed._history)
+        sid, errs = ed.sector_from_contour(ids)
+        assert sid == -1 and errs, (pts, sid, errs)
+        assert ed.sm.to_json() == before, "a failed create mutated the map"
+        assert len(ed._history) == hist, "a failed create left an undo entry"
+    print("  contour refused  OK")
 
 
 def test_things_roundtrip():
@@ -263,60 +427,53 @@ def test_height_clamp():
 def test_solid_flag_and_step_textures():
     """solid toggles, survives a split, and step lips keep their textures."""
     ed = SectorEditor(new_room(1600, 1600))
-    v1 = ed.add_vertex(400, 400)
-    v2 = ed.add_vertex(800, 400)
-    v3 = ed.add_vertex(800, 800)
-    v4 = ed.add_vertex(400, 800)
-    l1 = ed.add_line(v1, v2)
-    l2 = ed.add_line(v2, v3)
-    l3 = ed.add_line(v3, v4)
-    l4 = ed.add_line(v4, v1)
-    sid, errs = ed.sector_from_contour([l1, l2, l3, l4], floor_h=16, ceil_h=128)
+    box = _contour_box(ed, 400, 400, 800, 800)
+    sid, errs = ed.sector_from_contour(box, floor_h=16, ceil_h=128)
     assert sid == 1 and not errs, errs
 
-    # a one-sided linedef has no meaningful solid flag
-    assert ed.set_line_solid(0, True) is False
-    assert not ed.lines[0].solid
-    # every contour edge is two-sided now, so the flag is settable
-    for li in (l1, l2, l3, l4):
-        assert ed.set_line_solid(li, True) is True, li
-    assert all(ed.lines[li].solid for li in (l1, l2, l3, l4))
-    assert not ed.validate(), ed.validate()
-    # the 16-unit step is walkable geometry but flagged walls are not
-    assert ed.sm.line_blocks(l1) is True
-    ed.set_line_solid(l1, False)
-    assert ed.sm.line_blocks(l1) is False, "a 16 step stays passable"
-    ed.set_line_solid(l1, True)
-    assert ed.sm.line_blocks(l1) is True
+    # thick walls are one-sided on both faces: the flag is meaningless there
+    for li in box + _inner_lines(ed, sid):
+        assert ed.set_line_solid(li, True) is False, li
+        assert not ed.lines[li].solid
+
+    # a two-sided linedef between two sectors carries the flag
+    two = SectorEditor(new_room(1600, 1600))
+    v1 = two.add_vertex(400, 400)
+    v2 = two.add_vertex(800, 400)
+    li = two.add_line(v1, v2)
+    two.add_sector(floor_h=0, ceil_h=128, light=100)
+    two.add_sector(floor_h=16, ceil_h=128, light=100)
+    assert two.set_two_sided(li, True, back_sector=1) == []
+    assert two.set_line_solid(li, True) is True
+    assert two.sm.line_blocks(li) is True
+    two.set_line_solid(li, False)
+    assert two.sm.line_blocks(li) is False, "a 16 step stays passable"
+    two.set_line_solid(li, True)
+    assert two.sm.line_blocks(li) is True
+    assert not two.validate(), two.validate()
 
     # a split gives both halves the flag, like special/tag
-    nv = ed.split_line_at(l1, 600, 400)
-    halves = [li for li, ld in enumerate(ed.lines)
-              if nv in (ld.v1, ld.v2)]
+    nv = two.split_line_at(li, 600, 400)
+    halves = [i for i, ld in enumerate(two.lines) if nv in (ld.v1, ld.v2)]
     assert len(halves) == 2, halves
-    assert all(ed.lines[li].solid for li in halves), \
+    assert all(two.lines[i].solid for i in halves), \
         "solid must be inherited by both halves"
-    assert not ed.validate(), ed.validate()
-    ed.undo()
-    assert ed.lines[l1].solid is True, "undo must restore the flag"
+    assert not two.validate(), two.validate()
+    two.undo()
+    assert two.lines[li].solid is True, "undo must restore the flag"
 
     # step lips are assignable per sidedef and survive the saved map
-    front = ed.lines[l2].front
-    assert ed.set_side_tex(front, lower="step_low", upper="step_up") is True
-    assert ed.sides[front].lower == "step_low"
-    assert ed.sides[front].upper == "step_up"
-    assert ed.set_side_tex(-1, lower="nope") is False
+    front = two.lines[li].front
+    assert two.set_side_tex(front, lower="step_low", upper="step_up") is True
+    assert two.sides[front].lower == "step_low"
+    assert two.sides[front].upper == "step_up"
+    assert two.set_side_tex(-1, lower="nope") is False
     # an unassigned lip stays "-"
-    other = ed.lines[l3].front
-    assert ed.sides[other].lower == "-", ed.sides[other].lower
+    assert two.sides[two.lines[li].back].lower == "-"
 
     # splitting a region off must not wipe an assigned lip
     ed2 = SectorEditor(new_room(1600, 1600))
-    a = ed2.add_vertex(400, 400)
-    b = ed2.add_vertex(800, 400)
-    c = ed2.add_vertex(800, 800)
-    d = ed2.add_vertex(400, 800)
-    ids = [ed2.add_line(*e) for e in ((a, b), (b, c), (c, d), (d, a))]
+    ids = _contour_box(ed2, 400, 400, 800, 800)
     ed2.set_side_tex(ed2.lines[ids[0]].front, lower="step_low")
     sid2, errs2 = ed2.sector_from_contour(ids, floor_h=16, ceil_h=128)
     assert sid2 == 1 and not errs2, errs2
@@ -333,62 +490,6 @@ def _contour_box(ed, x0, y0, x1, y1):
     v4 = ed.add_vertex(x0, y1)
     return [ed.add_line(a, b) for a, b in
             ((v1, v2), (v2, v3), (v3, v4), (v4, v1))]
-
-
-def test_solid_on_create_seals_the_contour():
-    """The create-time toggle changes flags only, never the geometry."""
-    def build(flag):
-        ed = SectorEditor(new_room(1600, 1600))
-        ed.solid_on_create = flag
-        box = _contour_box(ed, 400, 400, 800, 800)
-        sid, errs = ed.sector_from_contour(box, floor_h=0, ceil_h=128, light=120)
-        assert sid == 1 and not errs, errs
-        return ed, box
-
-    off, off_box = build(False)
-    assert not any(off.lines[li].solid for li in off_box), \
-        "default OFF must leave the contour as portals"
-    assert all(off.sm.line_blocks(li) is False for li in off_box), \
-        "equal floors with no flag is a walk-through portal"
-
-    on, on_box = build(True)
-    assert all(on.lines[li].solid for li in on_box), \
-        "toggle ON must flag every created edge"
-    assert all(on.sm.line_blocks(li) is True for li in on_box), \
-        "a flagged boundary must block"
-    assert not on.validate(), on.validate()
-    assert on.sm.has_polygon(1), "the new sector must keep its contour"
-    assert on.sm.has_polygon(0), "the neighbour's contour must survive"
-
-    # flags are the only difference: the geometry is identical
-    assert (len(on.verts), len(on.lines), len(on.sides)) == \
-        (len(off.verts), len(off.lines), len(off.sides))
-    assert _poly_points(on.sm, 1) == _poly_points(off.sm, 1)
-    assert _poly_points(on.sm, 0) == _poly_points(off.sm, 0)
-    print("  solid on create  OK")
-
-
-def test_solid_on_create_persists_and_undo_ignores_it():
-    """The flag is editor state, not map state: it outlives create and undo."""
-    ed = SectorEditor(new_room(1600, 1600))
-    ed.solid_on_create = True
-    box1 = _contour_box(ed, 300, 300, 600, 600)
-    sid1, errs1 = ed.sector_from_contour(box1, floor_h=0)
-    assert sid1 == 1 and not errs1, errs1
-    assert all(ed.lines[li].solid for li in box1)
-
-    box2 = _contour_box(ed, 900, 900, 1300, 1300)
-    sid2, errs2 = ed.sector_from_contour(box2, floor_h=0)
-    assert sid2 == 2 and not errs2, errs2
-    assert all(ed.lines[li].solid for li in box2), \
-        "the toggle must still be on for the second sector"
-
-    ed.undo()          # undo the second sector
-    assert ed.solid_on_create is True, "undo must not turn the toggle off"
-    assert len(ed.sectors) == 2
-    ed.redo()
-    assert len(ed.sectors) == 3 and ed.sm.find_sector_at(1100, 1100) == 2
-    print("  solid-on-create state OK")
 
 
 def test_solid_cleared_when_line_becomes_one_sided():
@@ -419,30 +520,23 @@ def test_solid_cleared_when_line_becomes_one_sided():
 def test_delete_line_breaks_the_contour():
     """Cutting a wall drops that sector's polygon — and only that one.
 
-    The inner pit loses its own polygon, so ``find_sector_at`` falls back to
-    whatever still covers the point: here the room around it. A void needs the
-    neighbour to lose its polygon too, which the two-room case below covers.
+    The room's inner loop is one-sided, so cutting it leaves A with an open
+    path and the hole in the surrounding sector is still there: nothing covers
+    the point any more. The two-room case below shows the same on a shared wall.
     """
     ed = SectorEditor(new_room(1600, 1600))
-    v1 = ed.add_vertex(400, 400)
-    v2 = ed.add_vertex(800, 400)
-    v3 = ed.add_vertex(800, 800)
-    v4 = ed.add_vertex(400, 800)
-    box = [ed.add_line(a, b) for a, b in
-           ((v1, v2), (v2, v3), (v3, v4), (v4, v1))]
+    box = _contour_box(ed, 400, 400, 800, 800)
     ed.sector_from_contour(box, floor_h=-64)
-    wall = next(i for i, ld in enumerate(ed.lines)
-                if ld.two_sided and 0 <= ld.back
-                and ed.sides[ld.back].sector == 1)
+    wall = _inner_lines(ed, 1)[0]
     assert ed.sm.has_polygon(1)
     notes = ed.delete_line(wall)
     assert not ed.validate(), ed.validate()
     assert not ed.sm.has_polygon(1), "the cut sector must lose its polygon"
-    assert ed.sm.find_sector_at(600, 600) == 0, \
-        "the pit's area falls back to the room around it"
+    assert ed.sm.find_sector_at(600, 600) == -1, \
+        "the wall body still keeps the room outside"
     assert any("без замкнутого контура" in n for n in notes), notes
 
-    # the same cut where the neighbour cannot cover it: a real void
+    # the same cut on a shared portal where both rooms close on it
     two = SectorEditor(_two_rooms())
     assert two.sm.find_sector_at(400, 800) == 0
     assert two.sm.find_sector_at(1200, 800) == 1
@@ -459,28 +553,21 @@ def test_delete_line_breaks_the_contour():
 def test_delete_line_keeps_loop_corners():
     """Orphaned corners go; corners a closed loop still shares stay."""
     ed = SectorEditor(new_room(1600, 1600))
-    v1 = ed.add_vertex(400, 400)
-    v2 = ed.add_vertex(800, 400)
-    v3 = ed.add_vertex(800, 800)
-    v4 = ed.add_vertex(400, 800)
-    box = [ed.add_line(a, b) for a, b in
-           ((v1, v2), (v2, v3), (v3, v4), (v4, v1))]
+    box = _contour_box(ed, 400, 400, 800, 800)
     ed.sector_from_contour(box, floor_h=-64)
     # a dangling line, touching no other line, so its two corners are its own
     d1 = ed.add_vertex(200, 200)
     d2 = ed.add_vertex(400, 200)
     dangle = ed.add_line(d1, d2)
     n_verts, n_lines, n_sides = len(ed.verts), len(ed.lines), len(ed.sides)
-    wall = next(i for i, ld in enumerate(ed.lines)
-                if ld.two_sided and 0 <= ld.back
-                and ed.sides[ld.back].sector == 1)
+    wall = _inner_lines(ed, 1)[0]
 
     ed.delete_line(wall)
     assert not ed.validate(), ed.validate()
     assert len(ed.lines) == n_lines - 1
-    assert len(ed.sides) == n_sides - 2, "both sides of the line must go"
+    assert len(ed.sides) == n_sides - 1, "the inner line has one side"
     # a closed loop shares every corner with another edge, so cutting one of
-    # its lines orphans nothing: the box corners all still have two users
+    # its lines orphans nothing: the room corners all still have two users
     assert len(ed.verts) == n_verts, len(ed.verts)
     ed.undo()
     assert not ed.validate(), ed.validate()
@@ -514,18 +601,19 @@ def test_delete_line_leaves_untouched_sector():
 
 def test_polygon_alive():
     ed = SectorEditor(new_room(1600, 1600))
-    v1 = ed.add_vertex(400, 400)
-    v2 = ed.add_vertex(800, 400)
-    v3 = ed.add_vertex(800, 800)
-    v4 = ed.add_vertex(400, 800)
-    box = [ed.add_line(a, b) for a, b in
-           ((v1, v2), (v2, v3), (v3, v4), (v4, v1))]
+    box = _contour_box(ed, 400, 400, 800, 800)
     ed.sector_from_contour(box, floor_h=-64)
-    for i in box:
+    inner = _inner_lines(ed, 1)
+    assert len(inner) == 4
+    for i in inner:
         assert ed._polygon_alive(1, {i}) is False, \
-            "the box sector dies with any one of its walls"
+            "the room dies with any one of its inner walls"
         assert ed._polygon_alive(0, {i}) is True, \
-            "the outer room keeps its own border loop"
+            "the outer room does not use the inner loop"
+    # the outer contour is sector 0's hole; the map border keeps it alive
+    for i in box:
+        assert ed._polygon_alive(0, {i}) is True
+        assert ed._polygon_alive(1, {i}) is True
     assert ed._polygon_alive(1, set()) is True
     print("  polygon alive    OK")
 
@@ -933,10 +1021,13 @@ def main():
     test_load_repairs_a_broken_map()
     test_two_sided_predicate()
     test_sector_from_contour()
+    test_sector_from_contour_clockwise()
+    test_sector_from_contour_portal()
+    test_sector_from_contour_tent()
+    test_sector_from_contour_rejects_bad_loops()
+    test_wall_thickness_constant()
     test_height_clamp()
     test_solid_flag_and_step_textures()
-    test_solid_on_create_seals_the_contour()
-    test_solid_on_create_persists_and_undo_ignores_it()
     test_solid_cleared_when_line_becomes_one_sided()
     test_things_roundtrip()
     test_undo_redo_roundtrip()

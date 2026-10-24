@@ -8,14 +8,14 @@ import time
 
 from shared.protocol import (
     Packet, PacketType,
-    encode_player_input, decode_world_state,
+    encode_player_input, decode_world_state, decode_match_block,
     encode_join_request, decode_join_accept,
     encode_ping, decode_ping,
     encode_create_party, encode_join_party,
     decode_lobby_state, decode_join_fail,
     encode_hello, decode_hello_ack,
     encode_file_request, encode_file_complete,
-    encode_fire,
+    encode_fire, encode_player_respawn,
 )
 from shared.reliability import ReliableEndpoint
 from shared.version import CLIENT_VERSION, PROTOCOL_VERSION
@@ -55,6 +55,13 @@ class NetworkClient:
         self.last_error: str | None = None
         # (tick, players, enemies, bullets, corpses, mode, impacts, items, doors)
         self.latest_state: tuple[int, list[dict], list[dict], list[dict], list[dict], str, list[dict], list[dict], list[dict]] | None = None
+        # Trailing match block of the newest snapshot (phase/winner/clock/secrets),
+        # read separately from the 9-element entity tuple so nothing that unpacks
+        # `latest_state` has to learn a tenth element.
+        self.latest_match: dict = {
+            "phase": "playing", "winner_id": 0, "time_left": 0,
+            "secrets_total": 0,
+        }
         # Recent (recv_time, state) history for interpolation; trimmed to a
         # small window so the renderer can blend between two consecutive states.
         self.snapshots: list[tuple[float, tuple]] = []
@@ -211,6 +218,8 @@ class NetworkClient:
             return
         self.state = "lobby"
         self.latest_state = None
+        self.latest_match = {"phase": "playing", "winner_id": 0,
+                             "time_left": 0, "secrets_total": 0}
         self.snapshots = []
         self._endpoint.send_reliable(PacketType.LEAVE_PARTY, b"")
 
@@ -254,6 +263,19 @@ class NetworkClient:
             PacketType.FIRE, encode_fire(self._fire_seq, weapon_id)
         )
         return self._fire_seq
+
+    def send_respawn(self) -> None:
+        """Reliable "put me back in" request; the server ignores it while alive.
+
+        Sent exactly like every other control message (single UDP socket,
+        RELIABLE_DATA envelope), so a lost request is retried instead of
+        leaving the client dead on a screen nobody can dismiss.
+        """
+        if self.state != "game" or self._endpoint is None:
+            return
+        self._endpoint.send_reliable(
+            PacketType.PLAYER_RESPAWN, encode_player_respawn()
+        )
 
     def connection_made(self, transport) -> None:
         self.transport = transport
@@ -364,6 +386,7 @@ class NetworkClient:
         state = (tick, players, enemies, bullets, corpses, mode, impacts, items,
                  doors)
         self.latest_state = state
+        self.latest_match = decode_match_block(packet.payload)
         self.snapshots.append((time.monotonic(), state))
         if len(self.snapshots) > 3:
             del self.snapshots[:-3]

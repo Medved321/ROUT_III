@@ -151,8 +151,6 @@ class SectorEditorScreen:
 
     def _button_labels(self) -> dict[str, str]:
         return {"mode": "Тайлы ▶", "snap": "Сетка ✓" if self.editor.snap_on else "Сетка",
-                "walls": "Стены: сплошные ✓" if self.editor.solid_on_create
-                else "Стены: проём",
                 "undo": "Отмена", "redo": "Повтор", "save": "Сохранить",
                 "load": "Загрузить", "play": "▶ Играть", "back": "Назад",
                 "save_mts": "Сохранить .mts", "load_mts": "Открыть .mts"}
@@ -160,10 +158,9 @@ class SectorEditorScreen:
     def _build_toolbar(self) -> dict[str, pygame.Rect]:
         """Bottom toolbar: one button per action, sized to its own label.
 
-        ``snap`` and ``walls`` toggle their labels ("Сетка" / "Сетка ✓",
-        "Стены: проём" / "Стены: сплошные ✓"), so the row is rebuilt whenever
-        either changes; the widths only ever grow by the tick glyph, and
-        ``_build_toolbar`` is cheap enough to call from the toggle.
+        ``snap`` toggles its label ("Сетка" / "Сетка ✓"), so the row is
+        rebuilt whenever it changes; the widths only ever grow by the tick
+        glyph, and ``_build_toolbar`` is cheap enough to call from the toggle.
         """
         labels = self._button_labels()
         items = [(key, fit_width(text, self.tiny_font, TOOLBAR_PAD))
@@ -237,20 +234,44 @@ class SectorEditorScreen:
             self._base_chips[name] = (rect, col)
         self._base_chips_y = y
 
+    def _tex_visible_keys(self) -> tuple[str, ...]:
+        """Chips the palette shows for the current selection.
+
+        A one-sided wall is painted from its single front side, and that side
+        is drawn from ``mid`` only, so the side chips and the lip slots would be
+        dead controls. No line selected keeps the full layout so a later
+        two-sided selection does not need a second layout pass.
+        """
+        if (self.sel_line is None
+                or not (0 <= self.sel_line < len(self.editor.lines))):
+            return tuple(TEX_CHIP_NAMES)
+        if self.editor.line_two_sided(self.sel_line):
+            return tuple(TEX_CHIP_NAMES)
+        return ("mid",)
+
+    def _layout_tex_chips(self) -> None:
+        if not hasattr(self, "_context_y"):
+            return
+        self._build_tex_palette(self.panel.x + 6, self._context_y,
+                                self.panel.width - 12)
+
     def _build_tex_palette(self, x: int, y: int, w: int) -> None:
-        """Fixed layout of the wall texture palette (drawn only when used)."""
+        """Fixed layout of the wall texture palette (drawn only when used).
+
+        Chip geometry depends on the *selected* line: a one-sided wall has one
+        slot (``mid``) and no side choice, so it gets one wide chip instead of
+        five. The rects are the click targets, so they are rebuilt whenever the
+        selection changes kind (``_set_sel``) and never from a hard-coded
+        five-chip pitch.
+        """
         self._tex_rects = {}
         self._tex_chips = {}
         self._tex_label_y = y
         y += 16
-        # Every chip (front/back side + mid/lower/upper slot) has to sit on the
-        # same row inside the panel: the row height feeds the value line and the
-        # swatch grid below, so a fixed 4-wide pitch would push the fifth chip
-        # (the new STENA/mid slot) past the panel edge — the drawn box and the
-        # hit-box are the same rect, so it would simply stop being clickable.
-        n = len(TEX_CHIP_NAMES)
+        keys = self._tex_visible_keys()
+        n = len(keys)
         cw = max(28, (w - (n - 1) * 4) // n)
-        for i, (key, name) in enumerate(TEX_CHIP_NAMES.items()):
+        for i, key in enumerate(keys):
             rect = pygame.Rect(x + i * (cw + 4), y, cw, 18)
             self._tex_chips[key] = rect
         y += 22
@@ -341,10 +362,16 @@ class SectorEditorScreen:
         # this line, so a click on a swatch changes what is on screen. An opaque
         # (solid) wall is painted from its MAIN texture (mid); a portal's visible
         # faces are its step lips (lower/upper), and the renderer never draws a
-        # mid band for a two-sided opening. The chip still lets the author pick
-        # any slot by hand; this is only the default when the selection moves.
-        if line is not None and self.editor.line_two_sided(line):
-            self._tex_target = "mid" if self.editor.lines[line].solid else "lower"
+        # mid band for a two-sided opening. A one-sided wall draws ONLY mid and
+        # has only its front side, so the palette narrows to that one chip.
+        if line is not None and 0 <= line < len(self.editor.lines):
+            ld = self.editor.lines[line]
+            if self.editor.line_two_sided(line):
+                self._tex_target = "mid" if ld.solid else "lower"
+            elif ld.front >= 0:
+                self._tex_side = "front"
+                self._tex_target = "mid"
+        self._layout_tex_chips()
 
     def _sync_sel(self) -> None:
         """Drop a selection that no longer points at a live entity.
@@ -665,11 +692,10 @@ class SectorEditorScreen:
     def _toolbar_changed(self) -> None:
         """Re-lay the toolbar when a ticked label grows.
 
-        "Сетка" and "Стены: проём" gain a tick glyph when toggled, and the
-        label is the button's width, so the row shifts and may wrap to another
-        row. Re-running the layout keeps the hitboxes equal to the drawn boxes
-        instead of letting a label poke out of its own button or the canvas
-        start under the toolbar.
+        "Сетка" gains a tick glyph when toggled, and the label is the button's
+        width, so the row shifts and may wrap to another row. Re-running the
+        layout keeps the hitboxes equal to the drawn boxes instead of letting a
+        label poke out of its own button or the canvas start under the toolbar.
         """
         self.buttons = self._build_toolbar()
         self.canvas.height = self.height - 56 - self._toolbar_h - 8
@@ -682,16 +708,6 @@ class SectorEditorScreen:
         if key == "snap":
             self.editor.snap_on = not self.editor.snap_on
             self._dirty()
-            self._toolbar_changed()
-            return None
-        if key == "walls":
-            # Creation-time policy only: flips what `sector_from_contour` will
-            # flag on the NEXT sector. Existing linedefs are untouched -- the
-            # per-wall "сплошная" chip is how an author edits those.
-            self.editor.solid_on_create = not self.editor.solid_on_create
-            self.status = ("Новые сектора: глухие стены"
-                           if self.editor.solid_on_create
-                           else "Новые сектора: проёмы")
             self._toolbar_changed()
             return None
         if key == "undo":
@@ -732,8 +748,7 @@ class SectorEditorScreen:
             return None
         self.contour = []
         self._set_sel(sector=sec)
-        walls = "глухие стены" if self.editor.solid_on_create else "проёмы"
-        self.status = f"Сектор {sec} создан ({walls})"
+        self.status = f"Сектор {sec} создан (толщина стены 16)"
         self._dirty()
         return None
 
@@ -1306,34 +1321,41 @@ class SectorEditorScreen:
         surface.blit(hint2, (x, self._hint_y + 14))
 
     def _tex_side_idx(self) -> int | None:
-        """Sidedef index the texture palette currently writes to."""
-        if self.sel_line is None:
-            return None
-        if not self.editor.line_two_sided(self.sel_line):
-            # Not "no back side" but "no FRONT side either": the shared
-            # `two_sided` property would have said yes and handed the palette
-            # front == -1, i.e. sides[-1] — a texture written onto a stranger's
-            # wall.
+        """Sidedef index the texture palette currently writes to.
+
+        One-sided walls are paintable too: they have exactly one side, and the
+        renderer draws it from ``mid``. The old "not two-sided -> no palette"
+        rule made solid walls (including the new thick ones) impossible to
+        texture from the editor.
+        """
+        if (self.sel_line is None
+                or not (0 <= self.sel_line < len(self.editor.lines))):
             return None
         ld = self.editor.lines[self.sel_line]
-        return ld.back if self._tex_side == "back" else ld.front
+        if self.editor.line_two_sided(self.sel_line):
+            return ld.back if self._tex_side == "back" else ld.front
+        return ld.front if ld.front >= 0 else None
 
     def _draw_tex_palette(self, surface, x: int) -> bool:
-        """Draw the wall texture palette for the selected two-sided linedef.
+        """Draw the wall texture palette for the selected linedef.
 
-        Only the front/back sidedef slot chosen by the chips is written, so the
-        step lips of a line can be textured as seen from either sector.
+        A two-sided line exposes both sides and all three slots; a one-sided
+        wall exposes only its front ``mid`` because that is all the renderer
+        reads from it. The clickable rects are exactly the drawn ones.
         """
         side_idx = self._tex_side_idx()
         if side_idx is None:
             return False
+        two = self.editor.line_two_sided(self.sel_line)
         sd = self.editor.sides[side_idx]
-        lbl = self.tiny_font.render(
-            f"ТЕКСТУРЫ СТЕН — сторона "
-            f"{'ЗАДНЯЯ' if self._tex_side == 'back' else 'ПЕРЕДНЯЯ'}", True, ACCENT)
+        label = ("ТЕКСТУРЫ СТЕН — сторона "
+                 f"{'ЗАДНЯЯ' if self._tex_side == 'back' else 'ПЕРЕДНЯЯ'}"
+                 if two else "ТЕКСТУРЫ СТЕН")
+        lbl = self.tiny_font.render(label, True, ACCENT)
         surface.blit(lbl, (x, self._tex_label_y))
         for key, rect in self._tex_chips.items():
-            on = (self._tex_side == key if key in ("front", "back")
+            on = ((self._tex_side == key if key in ("front", "back")
+                   else self._tex_target == key) if two
                   else self._tex_target == key)
             pygame.draw.rect(surface, SELECT if on else (40, 44, 62),
                              rect, border_radius=3)
@@ -1358,7 +1380,9 @@ class SectorEditorScreen:
             return
         if not self.editor.set_side_tex(side_idx, **{self._tex_target: name}):
             return
-        self.status = (f"Текстура {self._tex_target} стороны "
-                       f"{'задней' if self._tex_side == 'back' else 'передней'}: "
-                       f"{name}")
+        if self.editor.line_two_sided(self.sel_line):
+            where = ("задней" if self._tex_side == "back" else "передней")
+            self.status = f"Текстура {self._tex_target} стороны {where}: {name}"
+        else:
+            self.status = f"Текстура {self._tex_target}: {name}"
         self._dirty()

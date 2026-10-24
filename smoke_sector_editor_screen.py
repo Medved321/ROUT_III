@@ -20,6 +20,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pygame  # noqa: E402
 
 from client.sector_editor import SectorEditor, new_room  # noqa: E402
+from shared.sector_map import (  # noqa: E402
+    LineDef, Sector, SectorMap, SideDef, Vertex,
+)
 from client.sector_editor_screen import (  # noqa: E402
     BASE_CHIPS_H, HINT_BLOCK_H, MAPS_DIR, MAP_ROW_H, SectorEditorScreen)
 
@@ -114,8 +117,7 @@ def main():
     _check_load_reports_a_repair(scr, surface)
     _check_selection_survives_nothing(scr, surface)
     _check_map_list(scr, surface)
-    _check_walls_toggle(surface)
-    _check_walls_create_status(scr, surface)
+    _check_create_status(scr, surface)
     print("smoke_sector_editor_screen: ALL OK")
 
 
@@ -185,6 +187,10 @@ def _check_map_list(scr, surface) -> None:
     the list: the rows were invisible and their clicks went to the canvas.
     """
     scr._map_list_open = False
+    # draw() persists the current map; the stress fixture here is degenerate, so
+    # stub the write out and keep the shared maps/sector1.mts on disk intact.
+    real_save = scr._save
+    scr._save = lambda: None
     real = scr._scan_map_files()
     assert real, f"no maps to list in {MAPS_DIR}"
     assert len(real) == len(set(real)), f"a map is listed twice: {real}"
@@ -259,6 +265,7 @@ def _check_map_list(scr, surface) -> None:
     finally:
         scr._map_files = real
         scr._map_list_open = False
+        scr._save = real_save
         scr.draw(surface)
     print("  map list overlays the canvas OK")
 
@@ -380,26 +387,33 @@ def _check_heights_and_solid(scr, surface) -> None:
 
     # 2D overlay tells a wall, a walkable step and a portal apart
     fresh = SectorEditor(new_room(1600, 1600))
-    fresh.begin_batch()
     a = fresh.add_vertex(100, 100)
     b = fresh.add_vertex(900, 100)
     c = fresh.add_vertex(900, 500)
     d = fresh.add_vertex(100, 500)
     ids = [fresh.add_line(*e) for e in ((a, b), (b, c), (c, d), (d, a))]
-    fresh.end_batch()
     sid, errs = fresh.sector_from_contour(ids, floor_h=16, ceil_h=128)
     assert sid > 0 and not errs, errs
-    fresh.set_line_solid(ids[0], True)          # solid: reads as a wall
-    assert fresh.line_wall_kind(ids[0]) == "wall"
-    fresh.set_line_solid(ids[0], False)
-    assert fresh.line_wall_kind(ids[0]) == "step", "a 16 step is walkable"
-    fresh.sectors[sid].floor_h = 64             # over STEP_HEIGHT: impassable
-    assert fresh.line_wall_kind(ids[0]) == "wall"
-    fresh.sectors[sid].floor_h = 0              # equal heights: plain portal
-    assert fresh.line_wall_kind(ids[0]) == "open"
-    # the one-sided room border is always a wall
+    # every thick wall (both faces) is one-sided and therefore a wall
     assert all(fresh.line_wall_kind(i) == "wall"
                for i, ld in enumerate(fresh.lines) if not ld.two_sided)
+    # a hand-built portal gives the step/open branches
+    p = fresh.add_vertex(200, 900)
+    q = fresh.add_vertex(900, 900)
+    step = fresh.add_line(p, q)
+    fresh.add_sector(floor_h=16, ceil_h=128, light=90)
+    back = len(fresh.sectors) - 1
+    assert fresh.set_two_sided(step, True, back_sector=back) == []
+    assert fresh.line_wall_kind(step) == "step", "a 16 step is walkable"
+    fresh.set_line_solid(step, True)            # solid: reads as a wall
+    assert fresh.line_wall_kind(step) == "wall"
+    fresh.set_line_solid(step, False)
+    assert fresh.line_wall_kind(step) == "step"
+    fresh.sectors[0].floor_h = 64               # over STEP_HEIGHT: impassable
+    assert fresh.line_wall_kind(step) == "wall"
+    fresh.sectors[0].floor_h = 16               # equal heights: plain portal
+    fresh.sectors[back].floor_h = 16
+    assert fresh.line_wall_kind(step) == "open"
     # the overlay actually draws all three kinds
     scr._set_sel()
     scr.editor = fresh
@@ -444,12 +458,13 @@ def _check_panel_layout(surface) -> None:
         scr.thing_type = name
         scr._panel_down(rect.center)
         assert scr.thing_type == name
-        # a one-sided line shows the flats block instead of the textures
+        # a one-sided line has no lips: only the main texture chip is shown
         scr.draw(surf)
         spare = ed.add_line(*(ed.add_vertex(200, 900), ed.add_vertex(900, 900)))
         scr._set_sel(line=spare)
         scr.draw(surf)
-        assert scr._tex_side_idx() is None
+        assert scr._tex_side_idx() == ed.lines[spare].front
+        assert scr._tex_visible_keys() == ("mid",)
     print("  panel layout fits OK")
 
 
@@ -463,27 +478,43 @@ def _check_tex_palette(scr, surface) -> None:
     ids = [ed.add_line(*e) for e in ((a, b), (b, c), (c, d), (d, a))]
     sid, errs = ed.sector_from_contour(ids, floor_h=16, ceil_h=128)
     assert sid > 0 and not errs, errs
-    li = ids[0]
-    assert ed.lines[li].two_sided
+    outer = ids[0]
+    assert not ed.lines[outer].two_sided
     scr.editor = ed
     scr.frame_around()
 
-    # no palette while nothing (or a one-sided line) is selected.  A fresh line is
-# one-sided by construction: sealing an existing portal would be refused when
-# the sector behind it would lose its contour, and that is covered elsewhere.
-    spare = ed.add_line(*(ed.add_vertex(200, 900), ed.add_vertex(900, 900)))
-    assert not ed.line_two_sided(spare)
-    scr._set_sel(line=spare)
+    # A one-sided thick wall has exactly one texture: the main one, on its
+    # only side.  Lips belong to a two-sided portal and are not offered.
+    scr._set_sel(line=outer)
     scr.draw(surface)
-    assert scr._tex_side_idx() is None, "one-sided linedef has no texture palette"
-    assert not scr._base_chips_y > scr.panel.bottom - BASE_CHIPS_H, \
-        "base chips must stay inside the panel"
+    assert scr._tex_visible_keys() == ("mid",)
+    assert (scr._tex_side, scr._tex_target) == ("front", "mid")
+    assert "bridge" in scr._tex_rects, sorted(scr._tex_rects)[:4]
+    assert scr._tex_side_idx() == ed.lines[outer].front
+    for rect in list(scr._tex_rects.values()) + list(scr._tex_chips.values()):
+        assert scr.panel.contains(rect), \
+            f"texture palette escapes the panel: {rect} not in {scr.panel}"
+    assert "lower" not in scr._tex_chips and "front" not in scr._tex_chips
+    front = ed.lines[outer].front
+    assert ed.sides[front].mid == "wall"
+    scr.handle([_evt(pygame.MOUSEBUTTONDOWN,
+                     pos=scr._tex_rects["bridge"].center, button=1)])
+    assert ed.sides[front].mid == "bridge", ed.sides[front].mid
+    assert "Текстура mid" in scr.status, scr.status
+    scr._button("undo")
+    assert ed.sides[front].mid == "wall"
 
-    # a two-sided linedef exposes the palette, defaulting to the front/lower
+    # A two-sided portal exposes the full palette, defaulting to front/lower.
+    p = ed.add_vertex(200, 900)
+    q = ed.add_vertex(900, 900)
+    li = ed.add_line(p, q)
+    ed.add_sector(floor_h=16, ceil_h=128, light=90)
+    assert ed.set_two_sided(li, True, back_sector=len(ed.sectors) - 1) == []
     scr._set_sel(line=li)
     scr.draw(surface)
     assert "bridge" in scr._tex_rects, sorted(scr._tex_rects)[:4]
     assert (scr._tex_side, scr._tex_target) == ("front", "lower")
+    assert set(scr._tex_visible_keys()) == {"front", "back", "mid", "upper", "lower"}
     for rect in list(scr._tex_rects.values()) + list(scr._tex_chips.values()):
         assert scr.panel.contains(rect), \
             f"texture palette escapes the panel: {rect} not in {scr.panel}"
@@ -543,9 +574,8 @@ def _check_tex_palette(scr, surface) -> None:
     # The MAIN wall texture (mid) is now a first-class slot.  A solid wall is
     # painted from its mid texture — the renderer draws no lower/upper lip for an
     # opaque wall — so selecting it must default the palette to STENA (mid), and
-    # a click must land in sd.mid.  Before this the UI only ever wrote the
-    # lower/upper step lips, so "setting a wall texture" changed nothing visible.
-    ed.lines[li].solid = True
+    # a click must land in sd.mid.
+    assert ed.set_line_solid(li, True) is True
     scr._set_sel(line=li)
     scr.draw(surface)
     assert scr._tex_target == "mid", scr._tex_target
@@ -557,7 +587,7 @@ def _check_tex_palette(scr, surface) -> None:
         ed.sides[ed.lines[li].front].mid
     assert "martyr" in scr.status, scr.status
     # a non-solid portal goes back to defaulting on the step lip (lower)
-    ed.lines[li].solid = False
+    ed.set_line_solid(li, False)
     scr._set_sel(line=li)
     assert scr._tex_target == "lower", scr._tex_target
     # the palette survives deselect/reselect with the assigned values in place
@@ -690,6 +720,34 @@ def _check_front_side_invariant(scr, surface) -> None:
     print("  refused Flip and wall repair both reach the status line")
 
 
+def _two_rooms_map():
+    """Two rooms side by side, split by the one wall they share.
+
+    Built by hand: ``sector_from_contour`` now makes a thick room whose outer
+    face is one-sided, so a contour can no longer donate a portal edge.
+    """
+    sm = SectorMap()
+    sm.sectors.append(Sector(floor_h=0, ceil_h=128, light=90))
+    sm.sectors.append(Sector(floor_h=64, ceil_h=128, light=120))
+    for x, y in ((0.0, 0.0), (800.0, 0.0), (800.0, 1600.0), (0.0, 1600.0),
+                 (1600.0, 0.0), (1600.0, 1600.0)):
+        sm.verts.append(Vertex(x, y))
+
+    def side(sector):
+        sm.sidedefs.append(SideDef(sector=sector))
+        return len(sm.sidedefs) - 1
+
+    sm.linedefs.append(LineDef(0, 1, front=side(0)))                    # left
+    sm.linedefs.append(LineDef(1, 2, front=side(0), back=side(1)))     # shared
+    sm.linedefs.append(LineDef(2, 3, front=side(0)))
+    sm.linedefs.append(LineDef(3, 0, front=side(0)))
+    sm.linedefs.append(LineDef(1, 4, front=side(1)))                    # right
+    sm.linedefs.append(LineDef(4, 5, front=side(1)))
+    sm.linedefs.append(LineDef(5, 2, front=side(1)))
+    sm.invalidate()
+    return sm
+
+
 def _check_side_toggle_refusals_reach_the_status_line(scr, surface) -> None:
     """Both sidedness toggles must be able to SAY no, and the map must survive it.
 
@@ -699,25 +757,11 @@ def _check_side_toggle_refusals_reach_the_status_line(scr, surface) -> None:
     whatever sector was picked last, which can be the wall's own — a self-portal
     that reads, to the staircase, like two floors at the same height.
     """
-    ed = SectorEditor(new_room(1600, 1600))
-    a = ed.add_vertex(100, 100)
-    b = ed.add_vertex(900, 100)
-    c = ed.add_vertex(900, 700)
-    d = ed.add_vertex(100, 700)
-    ids = [ed.add_line(*e) for e in ((a, b), (b, c), (c, d), (d, a))]
-    _, errs = ed.sector_from_contour(ids, floor_h=0, ceil_h=128)
-    assert not errs, errs
-    # a second room hanging off the divider, so the divider is a real portal:
-    # the new room walks it backwards, which is what a back side is for
-    f2 = ed.add_vertex(1400, 100)
-    g2 = ed.add_vertex(1400, 700)
-    far = [ed.add_line(*e) for e in ((b, f2), (f2, g2), (g2, c))]
-    sid, errs = ed.sector_from_contour(far + [ids[1]], floor_h=64, ceil_h=128)
-    assert sid >= 0 and not errs, errs
+    ed = SectorEditor(_two_rooms_map())
     scr.editor = ed
     scr.frame_around()
 
-    divider = ids[1]
+    divider = 1
     assert ed.lines[divider].two_sided, "precondition: a portal between rooms"
     heights = [ed.sectors[i].floor_h for i in range(len(ed.sectors))]
     alive = {i for i in range(len(ed.sectors)) if ed.sm.has_polygon(i)}
@@ -772,10 +816,19 @@ def _check_load_reports_a_repair(scr, surface) -> None:
     wall = ed.add_line(*(ed.add_vertex(100, 500), ed.add_vertex(900, 500)))
     ld = ed.lines[wall]
     assert ld.back < 0, "precondition: the wall starts one-sided"
-    ld.v1, ld.v2 = ld.v2, ld.v1          # the damage the old editor could leave:
-    ld.front, ld.back = ld.back, ld.front  # front side gone, back side alive
+    # A healthy .mts written while the map is still valid, reopened at the end.
+    # It keeps its spawn so it validates clean.
+    healthy_mts = text_map.render(ed.sm)
+    ed.things.clear()
+    # what the .mts path is checked for: a validation error it used to swallow
+    # (no spawn), which the text form can express and the repair cannot fix
+    broken_mts = text_map.render(ed.sm)
+
+    # the damage the old editor could leave: front side gone, back side alive.
+    # The .mt1 below carries it; the .mts texts above stay parseable.
+    ld.v1, ld.v2 = ld.v2, ld.v1
+    ld.front, ld.back = ld.back, ld.front
     ed.sm.invalidate()
-    ed.things.clear()                     # so validate() still has something to say
     assert [e for e in ed.validate() if "sidedef" in e], ed.validate()
 
     name = "smoke_broken_load"
@@ -784,7 +837,7 @@ def _check_load_reports_a_repair(scr, surface) -> None:
     mt1_path = scr._mts_path("mt1")
     os.makedirs(os.path.dirname(mts_path), exist_ok=True)
     with open(mts_path, "w", encoding="utf-8") as fh:
-        fh.write(text_map.render(ed.sm))
+        fh.write(broken_mts)
     save_mt1_with_bsp(ed.sm, mt1_path)
     try:
         # (a) the .mt1 path: repaired on load, and the status names the wall
@@ -811,73 +864,36 @@ def _check_load_reports_a_repair(scr, surface) -> None:
                 os.remove(p)
         scr.map_name = "sector1"
 
-    # (c) a healthy map opens with the plain message, no repair noise
-    scr._load_mts()
-    assert scr.status == f"Загружено: maps/{os.path.basename(scr._mts_path('mts'))}",\
-        scr.status
-    assert scr.editor.repair_notes == [], scr.editor.repair_notes
+    # (c) a healthy map opens with the plain message, no repair noise.  The
+    # healthy file is rebuilt here under its own name so this check does not
+    # depend on whatever the shared maps/sector1.mts holds on disk.
+    healthy_path = os.path.join(MAPS_DIR, "smoke_healthy_load.mts")
+    with open(healthy_path, "w", encoding="utf-8") as fh:
+        fh.write(healthy_mts)
+    scr.map_name = "smoke_healthy_load"
+    try:
+        scr._load_mts()
+        assert scr.status == "Загружено: maps/smoke_healthy_load.mts", scr.status
+        assert scr.editor.repair_notes == [], scr.editor.repair_notes
+    finally:
+        scr.map_name = "sector1"
+        if os.path.exists(healthy_path):
+            os.remove(healthy_path)
     print("  load status names the repair, and stays quiet on a healthy map")
 
 
-def _check_walls_toggle(surface) -> None:
-    """The create-time walls toggle flips flag, tick and layout together.
+def _check_create_status(scr, surface) -> None:
+    """Creating through the screen builds a thick room and says so.
 
-    The label IS the button's width, so gaining a tick can push a button into
-    a new row. The canvas sits above the toolbar at a height derived from it,
-    so both have to follow, or the drawn boxes and the hitboxes drift apart
-    and the canvas starts under the toolbar it is supposed to end above.
+    The sector is born with its inner loop inset by ``WALL_THICKNESS``: the
+    surrounding sector keeps a hole where the old contour was, and the strip
+    between the two loops is the solid wall body.
     """
-    for w, h in ((1000, 700), (1152, 648), (1600, 900)):
-        scr = SectorEditorScreen(w, h)
-        surf = pygame.Surface((w, h))
-        scr.draw(surf)
-        ed = scr.editor
-        assert not ed.solid_on_create, "OFF (portals) is the default"
-        assert scr._button_labels()["walls"] == "Стены: проём"
+    from client.sector_editor import WALL_THICKNESS
 
-        rebuilt: list[bool] = []
-        real_panel = scr._build_panel
-        scr._build_panel = lambda: rebuilt.append(True) or real_panel()
-        before = scr.buttons["walls"]
-        scr.handle([_evt(pygame.MOUSEBUTTONDOWN, pos=before.center, button=1)])
-        scr._build_panel = real_panel
-
-        assert ed.solid_on_create is True, "the click must flip the model flag"
-        assert "глухие стены" in scr.status, scr.status
-        assert rebuilt == [True], "a changed toolbar must re-build the panel"
-        scr.draw(surf)
-        label = scr._button_labels()["walls"]
-        assert label.endswith("✓"), label
-        assert scr.buttons["walls"].size != before.size, \
-            "the grown label must re-lay the row, not poke out of its button"
-
-        # geometry is consistent after the rebuild
-        assert scr.canvas.height == h - 56 - scr._toolbar_h - 8, \
-            f"{w}x{h}: canvas {scr.canvas.height} follows neither the toolbar"
-        rects = list(scr.buttons.values())
-        for r in rects:
-            assert r.y >= scr.canvas.bottom, \
-                f"{w}x{h}: a button at {r} sits over the canvas {scr.canvas}"
-        for i, a in enumerate(rects):
-            for b in rects[i + 1:]:
-                assert not a.colliderect(b), f"{w}x{h}: {a} overlaps {b}"
-        assert all(0 <= r.x and r.right <= w and 0 <= r.y and r.bottom <= h
-                   for r in rects), f"{w}x{h}: a button left the window"
-        # clicking the redrawn button still lands on it, and switches back
-        scr.handle([_evt(pygame.MOUSEBUTTONDOWN,
-                         pos=scr.buttons["walls"].center, button=1)])
-        assert ed.solid_on_create is False, "the second click must switch off"
-        assert "проёмы" in scr.status, scr.status
-        scr.draw(surf)
-        assert not scr._button_labels()["walls"].endswith("✓")
-        assert scr.canvas.height == h - 56 - scr._toolbar_h - 8
-    print("  walls toggle     OK")
-
-
-def _check_walls_create_status(scr, surface) -> None:
-    """Creating through the screen seals only with the toggle on, and says so."""
-    ed = SectorEditor(new_room(1600, 1600))
-    scr.editor = ed
+    ed = scr.editor = SectorEditor(new_room(1600, 1600))
+    n0 = len(ed.lines)
+    scr.contour = []
     scr.frame_around()
 
     def box(x0, y0, x1, y1):
@@ -890,21 +906,18 @@ def _check_walls_create_status(scr, surface) -> None:
 
     scr.contour = box(300, 300, 700, 700)
     scr._create_sector()
-    assert scr.status.endswith("(проёмы)"), scr.status
-    assert not any(l.solid for l in ed.lines), \
-        "the default must leave the new boundary as portals"
+    assert scr.status == "Сектор 1 создан (толщина стены 16)", scr.status
+    n = len(ed.lines) - n0
+    assert n == 8, f"4 contour + 4 inner lines: {n}"
+    inner = [i for i, ld in enumerate(ed.lines)
+             if 0 <= ld.front < len(ed.sides)
+             and ed.sides[ld.front].sector == 1 and ld.back < 0]
+    assert len(inner) == 4, inner
+    assert ed.sm.find_sector_at(500, 500) == 1, "the room interior"
+    assert ed.sm.find_sector_at(500, 300 + WALL_THICKNESS / 2) == -1, \
+        "the strip between the loops is the wall body"
     assert not ed.validate(), ed.validate()
-
-    scr.contour = box(1000, 1000, 1400, 1400)
-    ed.solid_on_create = True
-    scr._create_sector()
-    assert scr.status.endswith("(глухие стены)"), scr.status
-    sealed = [l for l in ed.lines if l.solid]
-    assert len(sealed) == 4, f"exactly the second box: {sealed}"
-    assert all(ed.sm.line_blocks(i) for i, l in enumerate(ed.lines) if l.solid)
-    assert not ed.validate(), ed.validate()
-    assert ed.sm.has_polygon(1) and ed.sm.has_polygon(2), "both contours alive"
-    assert ed.sm.find_sector_at(500, 500) == 1, "the portal box stays open"
+    assert ed.sm.has_polygon(0) and ed.sm.has_polygon(1), "both contours alive"
     scr.draw(surface)
     print("  create status    OK")
 

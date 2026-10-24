@@ -34,6 +34,7 @@ from client.connect_screen import ConnectScreen
 from client.editor_screen import MapEditorScreen
 from client.lobby_screen import LobbyScreen
 from client.pause_screen import PauseScreen
+from client.end_screen import EndScreen
 from client.renderer import SCREEN_HEIGHT, SCREEN_WIDTH, Renderer
 from client.sector_editor_screen import SectorEditorScreen
 from client.settings import DEFAULTS, Settings, format_value
@@ -99,6 +100,9 @@ def elements(name: str, screen) -> list[tuple[str, pygame.Rect]]:
         ]
     if isinstance(screen, PauseScreen):
         return [(f"option{i}", r) for i, r in enumerate(screen.buttons)]
+    if isinstance(screen, EndScreen):
+        buttons = (screen.model or {}).get("buttons", [])
+        return [(a, r) for (a, _), r in zip(buttons, screen.buttons)]
     if isinstance(screen, MapEditorScreen):
         out = [("name", screen.name_box)]
         return out + [(k, r) for k, r in screen.buttons.items()]
@@ -127,6 +131,10 @@ def button_labels(screen) -> list[tuple[str, str, pygame.Rect]]:
     elif isinstance(screen, PauseScreen):
         from client.pause_screen import OPTIONS
         for (key, label), r in zip(OPTIONS, screen.buttons):
+            out.append((key, label, r))
+    elif isinstance(screen, EndScreen):
+        for (key, label), r in zip((screen.model or {}).get("buttons", []),
+                                   screen.buttons):
             out.append((key, label, r))
     elif isinstance(screen, MapEditorScreen):
         for k, r in screen.buttons.items():
@@ -174,6 +182,21 @@ _lobby.set_state([{"id": 0, "name": "x" * 30, "players": [], "max": 4}], "Ста
 SCREENS.append(("lobby", _lobby))
 
 SCREENS.append(("pause", PauseScreen(SCREEN_WIDTH, SCREEN_HEIGHT)))
+
+_end = EndScreen(SCREEN_WIDTH, SCREEN_HEIGHT)
+_end.set_model({
+    "title": "ПОБЕДА",
+    "reason": "",
+    "tone": "win",
+    "stats": [("Убийства", "3"), ("Смерти", "1"), ("Точность", "42%")],
+    "table": {"headers": ["Игрок", "Убийства", "Смерти"],
+              "rows": [["Player", "3", "1"], ["Enemy", "1", "3"]],
+              "highlight": 0},
+    "buttons": [("leave", "В МЕНЮ")],
+    "primary": "leave",
+    "hint": "Enter — в меню",
+})
+SCREENS.append(("end_victory", _end))
 
 _editor = MapEditorScreen(SCREEN_WIDTH, SCREEN_HEIGHT)
 _editor.map_name = "m" * 60
@@ -315,6 +338,9 @@ def expected_action(name: str, key: str) -> object:
         "field_label": None, "field": None, "error": None,
         # "mode" switches the sector editor back to the tile editor.
         "mode": "tile",
+        # End-screen buttons: only "В МЕНЮ" is drawn here, so only that action
+        # is reachable by a centre click.
+        "leave": "leave",
     }.get(key, "?")
 
 

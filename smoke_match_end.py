@@ -107,6 +107,19 @@ def test_dead_on_exit_does_not_win():
     print("PvE: a dead player on the exit does not win OK")
 
 
+def test_dead_player_stays_dead_without_a_request():
+    w = GameWorld(mode='pve')
+    eid = w.add_player(1, 'A')
+    w.damage_player(eid, 1000)
+    for _ in range(30):
+        w.update()
+    hp = w.entities.get_component(eid, Health)
+    pl = w.entities.get_component(eid, Player)
+    assert hp.value <= 0, "the player revived without a respawn request"
+    assert pl.state == 1, pl.state
+    print("a dead player stays dead until respawn is requested OK")
+
+
 # ---------------------------------------------------------------------------
 # 2. PvP time limit / winner / draw
 # ---------------------------------------------------------------------------
@@ -194,6 +207,19 @@ def test_respawn_routing_via_server():
     server._respawn_via(session)
     assert w.entities.get_component(w.players[1], Health).value == PLAYER_MAX_HP
     print("PLAYER_RESPAWN routing respawns the player OK")
+
+
+def test_respawn_of_living_player_is_a_noop():
+    w = GameWorld(mode='pve')
+    eid = w.add_player(1, 'A')
+    pos = w.entities.get_component(eid, Position)
+    pos.x, pos.y = 100.0, 200.0
+    hp = w.entities.get_component(eid, Health)
+    hp.value = 150                      # hurt, but alive
+    w.respawn_player(1)
+    assert (pos.x, pos.y) == (100.0, 200.0), "a live respawn teleported the player"
+    assert hp.value == 150, "a live respawn healed the player"
+    print("respawning a living player is a noop OK")
 
 
 def test_dead_player_cannot_fire_respawn_restores():
@@ -392,11 +418,13 @@ if __name__ == '__main__':
     test_exit_reached_only_within_radius()
     test_no_exit_is_endless()
     test_dead_on_exit_does_not_win()
+    test_dead_player_stays_dead_without_a_request()
     test_pvp_timer_ends_the_match_by_frags()
     test_pvp_draw_on_equal_frags()
     test_pvp_time_left_counts_down()
     test_world_freezes_when_over()
     test_respawn_routing_via_server()
+    test_respawn_of_living_player_is_a_noop()
     test_dead_player_cannot_fire_respawn_restores()
     test_match_over_blocks_firing()
     test_dead_player_input_is_ignored()
