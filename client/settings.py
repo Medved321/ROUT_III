@@ -12,16 +12,12 @@ import math
 import os
 import sys
 
-
-def _project_root() -> str:
-    """Project root even when running from a .pyz (it is a file, not a dir)."""
-    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if base and os.path.isdir(base):
-        return base
-    return os.getcwd()
+from client.mobile import writable_root
 
 
-CONFIG_PATH = os.path.join(_project_root(), "config.json")
+# On Android this is the app-private files directory, not the program tree:
+# the program tree is replaced when the APK updates, and settings must not be.
+CONFIG_PATH = os.path.join(writable_root(), "config.json")
 
 DEFAULTS: dict = {
     "mouse_sensitivity": 0.0035,
@@ -36,6 +32,13 @@ DEFAULTS: dict = {
     "quality_tier": 0,
     "show_minimap": True,
     "show_crosshair": True,
+    # Touch overlay (phone mode). Sizes are multipliers of the authored stick
+    # and button sizes, so the layout keeps the same share of the screen at any
+    # device resolution; see ``client/touch_controls.py``.
+    "touch_stick_size": 1.0,
+    "touch_button_size": 1.0,
+    "touch_opacity": 0.45,
+    "touch_look_speed": 3.0,
     "fps_cap": 60,
     "sfx_vol": 0.8,
     "music_vol": 0.4,
@@ -61,7 +64,7 @@ WINDOW_SIZE_PRESETS: list[str] = [
     "3840\u00d72160",
 ]
 
-CONTROL_MODES: list[str] = ["Мышь", "Трактор"]
+CONTROL_MODES: list[str] = ["Мышь", "Трактор", "Телефон"]
 
 # Smallest usable window. Below this the raycaster loses columns
 # (``const.W // SCALE``) and the HUD has no room.
@@ -83,8 +86,20 @@ SPEC: list[dict] = [
      "kind": "float", "min": 0.5, "max": 6.0, "step": 0.2},
     {"key": "turn_accel", "label": "Разгон поворота (трактор)",
      "kind": "float", "min": 1.0, "max": 24.0, "step": 1.0},
+    {"key": "touch_stick_size", "label": "Размер стиков (телефон)",
+     "kind": "float", "min": 0.6, "max": 1.6, "step": 0.1},
+    {"key": "touch_button_size", "label": "Размер кнопок (телефон)",
+     "kind": "float", "min": 0.6, "max": 1.6, "step": 0.1},
+    {"key": "touch_opacity", "label": "Прозрачность кнопок",
+     "kind": "float", "min": 0.15, "max": 0.9, "step": 0.05},
+    {"key": "touch_look_speed", "label": "Обзор стиком (рад/с)",
+     "kind": "float", "min": 1.0, "max": 6.0, "step": 0.2},
     {"key": "window_size", "label": "Разрешение окна",
      "kind": "list", "values": WINDOW_SIZE_PRESETS, "custom": True},
+    # The address is typed on the phone (there is no --host flag and no file
+    # editor there), so it is a normal text row reusing the free-text field.
+    {"key": "server_host", "label": "Адрес сервера",
+     "kind": "text"},
     {"key": "fov", "label": "Угол обзора (FOV)",
      "kind": "int", "min": 60, "max": 110, "step": 5},
     {"key": "view_dist", "label": "Дальность прорисовки",
@@ -109,12 +124,20 @@ SPEC_BY_KEY = {s["key"]: s for s in SPEC}
 
 CONTROL_MODE_MOUSE = 0
 CONTROL_MODE_TRACTOR = 1
+CONTROL_MODE_TOUCH = 2
 
 
 def control_mode(values) -> int:
-    """Stored control mode (label, legacy index or name) -> 0 = Мышь, 1 = Трактор."""
+    """Stored control mode (label, legacy index or name) -> 0/1/2.
+
+    The touch label is matched *before* the generic ``text in CONTROL_MODES``
+    branch: that branch answers "Мышь" for anything it recognises, so a new
+    label reaching it would silently be read as the mouse mode.
+    """
     if isinstance(values, str):
         text = values.strip().lower()
+        if text in ("телефон", "touch", "phone") or text == str(CONTROL_MODE_TOUCH):
+            return CONTROL_MODE_TOUCH
         if text in ("трактор", "tractor") or text == str(CONTROL_MODE_TRACTOR):
             return CONTROL_MODE_TRACTOR
         if text in CONTROL_MODES or text == str(CONTROL_MODE_MOUSE):
@@ -124,11 +147,16 @@ def control_mode(values) -> int:
         index = int(values)
     except (TypeError, ValueError):
         return CONTROL_MODE_MOUSE
+    if index == CONTROL_MODE_TOUCH:
+        return CONTROL_MODE_TOUCH
     return CONTROL_MODE_TRACTOR if index == CONTROL_MODE_TRACTOR else CONTROL_MODE_MOUSE
 
 
 def control_hints(mode) -> str:
     """Control layout shown in the lobby and in the party-start log."""
+    if is_touch(mode):
+        return ("Левый стик — движение | Правый стик — обзор | "
+                "Огонь | Дэш | Использовать | ⇄ — оружие")
     if is_tractor(mode):
         return ("WASD — движение | ←/→ — обзор | Пробел — огонь | "
                 "Левый Shift — дэш | E — использовать")
@@ -138,6 +166,10 @@ def control_hints(mode) -> str:
 
 def is_tractor(values) -> bool:
     return control_mode(values) == CONTROL_MODE_TRACTOR
+
+
+def is_touch(values) -> bool:
+    return control_mode(values) == CONTROL_MODE_TOUCH
 
 
 def _parse_size(text) -> tuple[int, int] | None:
@@ -161,6 +193,34 @@ def _parse_size(text) -> tuple[int, int] | None:
 
 def size_text(width: int, height: int) -> str:
     return f"{int(width)}\u00d7{int(height)}"
+
+
+def parse_address(text) -> tuple[str, int | None, str]:
+    """Parse ``host`` or ``host:port`` -> ``(host, port|None, error)``.
+
+    An empty string is refused rather than silently meaning ``localhost``: on a
+    phone ``localhost`` is the phone itself, so a silently accepted empty address
+    would leave the player staring at a connection that cannot ever succeed.
+    """
+    value = str(text or "").strip()
+    if not value:
+        return "", None, "Адрес не может быть пустым"
+    if any(ch.isspace() for ch in value):
+        return "", None, "Адрес не должен содержать пробелов"
+    if len(value) > 64:
+        return "", None, "Слишком длинный адрес"
+    host, port = value, None
+    if ":" in value:
+        head, _, tail = value.rpartition(":")
+        if not tail.isdigit():
+            return "", None, "Порт после «:» должен быть числом"
+        port = int(tail)
+        if not 1 <= port <= 65535:
+            return "", None, "Порт вне диапазона 1–65535"
+        if not head:
+            return "", None, "Перед «:» нужен адрес"
+        host = head
+    return host, port, ""
 
 
 def validate_size(text) -> tuple[tuple[int, int] | None, str]:
@@ -236,6 +296,10 @@ def format_value(key: str, value) -> str:
 
     if key == "turn_accel":
         return f"{float(value):.1f}"
+    if key in ("touch_stick_size", "touch_button_size", "touch_opacity"):
+        return f"{int(round(float(value) * 100))}%"
+    if key == "touch_look_speed":
+        return f"{float(value):.1f} рад/с"
     if key == "window_size":
         text = str(value)
         return text if text in WINDOW_SIZE_PRESETS else f"Другое → {text}"
@@ -268,6 +332,9 @@ class Settings:
         if spec["kind"] == "bool":
             self.values[key] = not bool(self.values.get(key))
             self.dirty = True
+            return
+        if spec["kind"] == "text":
+            # Free text has no direction to step in; it is edited in the field.
             return
         if spec["kind"] == "list":
             values = spec.get("values") or []
@@ -337,6 +404,25 @@ class Settings:
         self.resolution_error = error
         return parsed
 
+    # ── server address ──────────────────────────────────────────────
+    @property
+    def address_text(self) -> str:
+        return f"{self.get('server_host')}:{int(self.get('server_port'))}"
+
+    def set_address(self, text: str) -> tuple[bool, str]:
+        """Apply a typed ``host`` or ``host:port`` -> ``(ok, error)``.
+
+        Refused input leaves both fields untouched, so the screen can say why
+        instead of pointing the client at an address nobody asked for.
+        """
+        host, port, error = parse_address(text)
+        if error:
+            return False, error
+        self.set("server_host", host)
+        if port is not None:
+            self.set("server_port", port)
+        return True, ""
+
     def store_preset(self, key: str, index: int) -> None:
         """Store a list-kind setting as the *label* of its entry.
 
@@ -366,6 +452,13 @@ class Settings:
             input_handler.control_mode = control_mode(self.get("control_mode"))
             input_handler.turn_speed = float(self.get("turn_speed"))
             input_handler.turn_accel = float(self.get("turn_accel"))
+            # Sizes are multipliers of the authored overlay geometry, pushed as
+            # numbers: the handler owns the overlay and re-lays it out lazily, so
+            # changing a slider takes effect on the next frame without a restart.
+            input_handler.touch_stick_size = float(self.get("touch_stick_size"))
+            input_handler.touch_button_size = float(self.get("touch_button_size"))
+            input_handler.touch_opacity = float(self.get("touch_opacity"))
+            input_handler.touch_look_speed = float(self.get("touch_look_speed"))
 
         from engine import constants as const
         from engine import rendering

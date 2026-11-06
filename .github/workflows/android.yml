@@ -1,0 +1,91 @@
+# Build the Android APK on a cloud x86_64 runner.
+#
+# The NDK ships no host toolchain for linux-aarch64, and this project is
+# developed on an aarch64 Jetson, so an APK cannot be produced locally.  This
+# workflow is therefore the canonical build: it installs the Android
+# SDK/NDK through buildozer, builds ``bin/*.apk`` and uploads it as an artifact.
+#
+# Manual run: Actions -> Android APK -> Run workflow.
+# Download:    the run page -> Artifacts -> rout3-android-apk.
+#
+# Every branch push builds too, so the artifact exists before a PR is opened
+# (the development host is aarch64 and cannot build it locally).  A pull request
+# from this repository therefore needs no second run; fork PRs can be built with
+# "Run workflow" (workflow_dispatch).
+name: Android APK
+
+on:
+  push:
+    paths:
+      - "client/**"
+      - "engine/**"
+      - "shared/**"
+      - "main.py"
+      - "buildozer.spec"
+      - "tools/android/**"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    # A cold cache compiles CPython, OpenSSL, SDL2 and numpy from source on a
+    # 2-core runner; the first run is the slow one.
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Buildozer needs the host build tools plus a JDK for Gradle.  The SDK
+      # platform/build-tools and the NDK are downloaded by buildozer itself.
+      # `libncurses-dev` rather than `libncurses5-dev`: the -5 package does not
+      # exist on ubuntu-24.04 and a missing package fails the whole apt step.
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip openjdk-17-jdk-headless \
+            autoconf libtool pkg-config \
+            zlib1g-dev libncurses-dev \
+            cmake libffi-dev libssl-dev libltdl-dev
+
+      - name: Install buildozer
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "buildozer>=1.5" cython
+
+      # The p4a checkout, the SDK/NDK and the per-architecture build trees all
+      # live under ~/.buildozer.  Gradle caches separately in ~/.gradle.
+      - name: Cache Android toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            ~/.gradle
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec', 'tools/android/recipes/**') }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-
+
+      - name: Build debug APK
+        run: buildozer -v android debug
+        env:
+          # Keep Gradle from asking for a daemon it cannot keep alive.
+          GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+
+      - name: List artifacts
+        run: ls -lh bin/ || true
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: rout3-android-apk
+          path: bin/*.apk
+          if-no-files-found: error
+          retention-days: 30

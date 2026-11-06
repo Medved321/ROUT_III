@@ -25,12 +25,22 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+from client.mobile import IS_ANDROID
+
 INSTALL_MESSAGE = "Установка numpy…"
 FAILED_MESSAGE = """\
 Клиенту требуется numpy, но установить его не удалось.
 
 Установите numpy вручную и запустите клиент снова:
     python -m pip install numpy
+"""
+
+ANDROID_FAILED_MESSAGE = """\
+Клиенту требуется numpy, но его нет в этой сборке APK.
+
+APK обязан содержать numpy: пересоберите его из исходников
+(buildozer android debug) или установите релизный APK.
+Внутри Android установка через pip невозможна.
 """
 
 MARKER = ".complete"
@@ -143,6 +153,11 @@ def ensure_numpy() -> bool:
         return True
     if _load_bundled():
         return True
+    if IS_ANDROID:
+        # An APK has no pip, no network promise and a read-only program tree:
+        # the only supported path is numpy compiled into the build.  Trying
+        # ``pip install`` here would just fail slowly on the phone.
+        return False
     if not _auto_install_allowed():
         return False
     print(INSTALL_MESSAGE, flush=True)
@@ -154,5 +169,5 @@ def ensure_numpy() -> bool:
 def require_numpy() -> bool:
     if ensure_numpy():
         return True
-    print(FAILED_MESSAGE, file=sys.stderr)
+    print(ANDROID_FAILED_MESSAGE if IS_ANDROID else FAILED_MESSAGE, file=sys.stderr)
     return False
