@@ -48,6 +48,11 @@ p = {
 px = 128.0
 py = 128.0
 pz = 0.0
+# Support height of the local player, or None when the map has no vertical
+# (tile maps): the camera eye is ``player_z + CAM_Z`` when this is set, else
+# the floor of the sector under the player.  Kept apart from ``pz`` on purpose:
+# ``pz`` is a dead aim/world height with a different history.
+player_z = None
 pa = 0.0
 pitch = 0.0
 # Weapon animation clock: frames at 60 fps still to run in the current
@@ -72,6 +77,15 @@ vs_scale = 2
 flat_textured = True
 # Built SectorScene for sector-mode maps (tasks 3.1-3.7).
 sec_scene = None
+# Floating slab overlay (change ``floating-sector-platforms``, task 4.3).
+# ``platforms_enabled`` is the rollback switch: False renders a plate map as if
+# it had no plates (the slab borders stay real walls, the base pass is
+# untouched) instead of failing.  ``platform_occluders`` carries the per-column
+# slab intervals of the last sector frame to the sprite pass, so an actor behind
+# a plate does not shine through it; it is reset every frame and in
+# ``reset_transient_state``.
+platforms_enabled = True
+platform_occluders = None
 
 # Framebuffer backend (total-performance): internal fixed-resolution RGB
 # buffer and the effective graphic tier.
@@ -176,6 +190,7 @@ def reset_transient_state() -> None:
     global particles, decals, weather, weather_type
     global enemies, bots, items, barrels, portals, bul, proj, corpses, players
     global dwall_hp, bridge_open, explored
+    global player_z, platform_occluders
     particles = []
     decals = []
     weather = []
@@ -192,3 +207,8 @@ def reset_transient_state() -> None:
     dwall_hp = {}
     bridge_open = set()
     explored = []
+    # A new party starts without a known support height: the first snapshot
+    # fills it in, and a tile map keeps it None so the camera stays flat.
+    player_z = None
+    # Slab occluders belong to the previous map's frame.
+    platform_occluders = None

@@ -475,6 +475,177 @@ def test_protocol_roundtrip() -> None:
     print("  protocol roundtrip OK")
 
 
+def make_platform_map(host_floor: int = 16, host_ceil: int = 200,
+                      slab_top: int = 88, slab_under: int = 72,
+                      two_sided: bool = True, solid: bool = False,
+                      floating: bool = True) -> SectorMap:
+    """Host room with a floating slab inside it.
+
+    The slab border is two-sided: the slab keeps its own closed loop from its
+    side, while the host's loop skips the edge so its floor survives.
+    """
+    sm = SectorMap()
+    sm.sectors.append(Sector(floor_h=host_floor, ceil_h=host_ceil))
+    sm.sectors.append(Sector(floor_h=slab_top, ceil_h=slab_under,
+                             floating=floating))
+    make_rect(sm, 0, 0, 512, 512, 0)
+    make_rect(sm, 128, 128, 384, 384, 1)
+    if two_sided:
+        host_side = len(sm.sidedefs)
+        sm.sidedefs.append(SideDef(sector=0))
+        for ld in sm.linedefs:
+            if sm.sidedefs[ld.front].sector == 1:
+                ld.back = host_side
+                ld.solid = solid
+    sm.things.append(Thing(64, 64))
+    return sm
+
+
+def test_platform_geometry() -> None:
+    """Slab keeps the host floor whole; sectors_at sees both sectors."""
+    from shared.sector_map import ACTOR_HEIGHT, MIN_PLATFORM_THICKNESS
+
+    assert MIN_PLATFORM_THICKNESS == 8, MIN_PLATFORM_THICKNESS
+    assert ACTOR_HEIGHT == 56, ACTOR_HEIGHT
+
+    sm = make_platform_map()
+    assert sm.validate() == [], sm.validate()
+
+    # The slab border does not carve a hole in the host: both sectors contain
+    # a point under the slab, innermost (smallest loop) first.
+    assert sm.find_sector_at(256, 256) == 1
+    assert sm.sectors_at(256, 256) == [1, 0], sm.sectors_at(256, 256)
+    assert sm.sectors_at(64, 64) == [0]
+    assert sm.sectors_at(-10, 64) == []
+    assert sm.floor_under(256, 256) == 16
+    assert sm.floor_under(64, 64) == 16
+    # getter parity for non-floating maps
+    assert make_simple_map().sectors_at(10, 10) == [0]
+
+    # Support: under the slab the host floor is the support; the top is too
+    # far above the feet to be stepped onto.
+    assert sm.support_at(256, 256, 16) == 16.0
+    # ... and the top is reachable when the feet are one step below it.
+    assert sm.support_at(256, 256, 80) == 88.0
+    # Fully under with a headroom of exactly ACTOR_HEIGHT is passable.
+    assert sm.support_at(256, 256, 16) is not None
+
+    # A low slab is a step: the top becomes the support and can be left.
+    low = make_platform_map(slab_top=32, slab_under=24)
+    assert low.support_at(256, 256, 16) == 32.0
+    assert low.support_at(64, 64, 32) == 16.0
+    # Too high above the feet → not a support, pass underneath instead.
+    high = make_platform_map(slab_top=100, slab_under=84)
+    assert high.support_at(256, 256, 16) == 16.0
+    # Too little clearance → not passable at all.
+    tight = make_platform_map(slab_top=100, slab_under=60)
+    assert tight.support_at(256, 256, 16) is None
+    # No support / no sector.
+    assert make_platform_map().support_at(-10, 64, 0) is None
+
+    # The slab border is not a wall: movement and sight cross both ways.
+    from shared import mt1 as _mt1
+    border = next(i for i, ld in enumerate(sm.linedefs)
+                  if sm.sidedefs[ld.front].sector == 1)
+    assert sm.line_blocks(border) is False
+    assert sm.can_move_px(256, 116, 16)
+    assert sm.can_move_px(256, 140, 16)
+    assert sm.has_los_px(64, 64, 256, 256)
+    assert sm.has_los_px(256, 256, 64, 64)
+    assert not _mt1.reject_test(sm.build_reject(), 2, 0, 1), \
+        "slab border must not make the host opaque"
+
+    # Ordinary walls and tall steps keep blocking.
+    plain = make_simple_map()
+    assert plain.line_blocks(0) is True
+    assert not plain.can_move_px(8, 256, 16)
+    tall_step, portal = two_room_map(0, 32)
+    assert tall_step.line_blocks(portal) is True
+    assert not tall_step.can_move_px(512, 256, 16)
+    print("  platform geometry OK")
+
+
+def test_platform_validation() -> None:
+    """Thin slab, one-sided border, solid border, nesting, containment."""
+    # A map without floating sectors stays valid.
+    assert make_simple_map().validate() == []
+
+    thin = make_platform_map(slab_top=76, slab_under=72)
+    assert any("thinner than" in e for e in thin.validate()), thin.validate()
+
+    one_side = make_platform_map(two_sided=False)
+    assert any("one-sided border" in e for e in one_side.validate()), \
+        one_side.validate()
+
+    solid = make_platform_map(solid=True)
+    assert any("solid flag on a floating sector border" in e
+               for e in solid.validate()), solid.validate()
+
+    # Slab top above the host ceiling: it does not fit in the neighbour.
+    tall = make_platform_map(host_ceil=80, slab_top=88)
+    assert any("does not fit inside sector 0" in e for e in tall.validate()), \
+        tall.validate()
+
+    # A thing whose innermost sector is the slab is rejected.
+    thing = make_platform_map()
+    thing.things.clear()
+    thing.things.append(Thing(256, 256))
+    assert any("stands on floating sector 1" in e for e in thing.validate()), \
+        thing.validate()
+
+    # Overlapping slabs are rejected (no stacked platforms).
+    nested = make_platform_map()
+    nested.sectors.append(Sector(floor_h=34, ceil_h=24, floating=True))
+    make_rect(nested, 160, 160, 200, 200, 2)
+    host_side = len(nested.sidedefs)
+    nested.sidedefs.append(SideDef(sector=0))
+    for ld in nested.linedefs:
+        if nested.sidedefs[ld.front].sector == 2:
+            ld.back = host_side
+    errs = nested.validate()
+    assert any("floating slabs overlap" in e for e in errs), errs
+    print("  platform validation OK")
+
+
+def test_platform_json() -> None:
+    """JSON v2 writes the flag, reads v1/7-field payloads, rejects v3."""
+    from shared.sector_map import SECTOR_FORMAT_VERSION
+
+    assert SECTOR_FORMAT_VERSION == 2, SECTOR_FORMAT_VERSION
+    sm = make_platform_map()
+    js = sm.to_json()
+    assert js["version"] == 2, js["version"]
+    assert len(js["sectors"][1]) == 8, js["sectors"][1]
+    assert js["sectors"][0][7] is False
+    assert js["sectors"][1][7] is True
+
+    again = SectorMap.from_json(js)
+    assert again.sectors[1].floating is True
+    assert (again.sectors[1].floor_h, again.sectors[1].ceil_h) == (88, 72)
+    assert again.to_json() == js
+
+    # A 7-element sector payload (version 1) reads as "anchored".
+    old = dict(js)
+    old["version"] = 1
+    old["sectors"] = [s[:7] for s in js["sectors"]]
+    old_map = SectorMap.from_json(old)
+    assert all(not s.floating for s in old_map.sectors)
+
+    # Version 2 with a 7-element record is also "anchored".
+    partial = dict(js)
+    partial["sectors"] = [s[:7] for s in js["sectors"]]
+    assert not SectorMap.from_json(partial).sectors[1].floating
+
+    bad = dict(js)
+    bad["version"] = 3
+    try:
+        SectorMap.from_json(bad)
+        raise AssertionError("v3 accepted")
+    except ValueError:
+        pass
+    print("  platform json OK")
+
+
 if __name__ == "__main__":
     test_roundtrip()
     test_validation()
@@ -483,4 +654,7 @@ if __name__ == "__main__":
     test_physics()
     test_passability()
     test_protocol_roundtrip()
+    test_platform_geometry()
+    test_platform_validation()
+    test_platform_json()
     print("SECTOR MODEL TEST PASSED")

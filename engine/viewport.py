@@ -120,7 +120,8 @@ def _tile_ground_y(vh: float, vy: int, perp: float) -> float:
 
 
 def project_point(x: float, y: float, world_h: float,
-                  vh: float | None = None, vy: int | None = None):
+                  vh: float | None = None, vy: int | None = None,
+                  floor_z: float | None = None):
     """Project a world point to ``(sx, sh, ground_y, perp)``, or ``None``.
 
     ``sh``      on-screen height of something ``world_h`` units tall.
@@ -132,7 +133,9 @@ def project_point(x: float, y: float, world_h: float,
 
     In sector mode this delegates to ``sector_render.project_object``, so
     particles follow the floor of the sector they are in instead of the
-    horizon.
+    horizon.  ``floor_z`` overrides that floor (an actor standing on a
+    floating slab passes its own support height); ``None`` keeps the sector
+    floor, so every existing caller is unchanged.
     """
     if vh is None:
         vh = const.H
@@ -140,7 +143,8 @@ def project_point(x: float, y: float, world_h: float,
         vy = 0
     if gs.sector_mode and gs.sec_scene is not None:
         from engine import sector_render
-        proj = sector_render.project_object(x, y, world_h, vh, vy)
+        proj = sector_render.project_object(x, y, world_h, vh, vy,
+                                            floor_z=floor_z)
         if proj is None:
             return None
         sx, sh, ground_y, perp = proj

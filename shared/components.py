@@ -12,6 +12,10 @@ class Component:
 class Position(Component):
     x: float = 0.0
     y: float = 0.0
+    # Height of the support surface under the actor (the top of a floating
+    # slab or the host floor).  The server is the only writer: the client
+    # reads it back from the snapshot and never sends it.
+    z: float = 0.0
 
 
 @dataclass

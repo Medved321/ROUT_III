@@ -7,6 +7,7 @@ Covers tasks 2.2-2.3 of the advanced-sector-editor change:
 """
 import asyncio
 import math
+import struct
 
 from server.server import GameServer
 from server.game_world import GameWorld
@@ -15,6 +16,8 @@ from server.weapons import _ray_wall_dist
 from client.network_client import NetworkClient
 from shared.components import Position, Velocity
 from shared.map_data import GameMap, TILE
+from shared.protocol import decode_world_state, encode_world_state
+from shared.version import PROTOCOL_VERSION
 from shared.sector_map import (MAP_FORMAT_SECTOR, LineDef, Sector, SectorMap,
                                 SideDef, Thing, Vertex)
 
@@ -135,7 +138,107 @@ async def run():
     print(f"enemies from map things OK (spawned {n})")
 
     await _steps_and_solid_world()
+    _vertical_protocol()
+    _floating_platform_world()
     print("SECTOR SERVER TEST PASSED")
+
+
+def _vertical_protocol():
+    """Task 3.1: the player record carries the support height at its tail."""
+    assert PROTOCOL_VERSION == 14, PROTOCOL_VERSION
+    assert struct.calcsize("!HfffBBBBBBBBIBBBBBBBHHIIHHHHh") == 55
+    for z in (-96, 0, 88):
+        p = {"id": 1, "x": 1.0, "y": 2.0, "angle": 0.5, "health": 100,
+             "state": 0, "wpn": 1, "ammo": {}, "name": "Z", "z": z}
+        out = decode_world_state(encode_world_state(1, [p]))
+        assert out[1][0]["z"] == z, out[1][0]
+    print("  protocol vertical OK (55-byte record, z round-trip)")
+
+
+def _slab_map(top: int = 88, under: int = 72, w: int = 1024,
+              h: int = 512) -> SectorMap:
+    """Host room with one floating slab whose top/underside are given."""
+    sm = SectorMap()
+    sm.sectors.append(Sector(floor_h=0, ceil_h=256))
+    sm.sectors.append(Sector(floor_h=top, ceil_h=under, floating=True))
+
+    def vid(px: float, py: float) -> int:
+        for idx, v in enumerate(sm.verts):
+            if v.x == px and v.y == py:
+                return idx
+        sm.verts.append(Vertex(px, py))
+        return len(sm.verts) - 1
+
+    def rect(x1, y1, x2, y2, sector, back=None):
+        front = len(sm.sidedefs)
+        sm.sidedefs.append(SideDef(sector=sector))
+        back_side = None
+        if back is not None:
+            back_side = len(sm.sidedefs)
+            sm.sidedefs.append(SideDef(sector=back))
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+        for i in range(4):
+            ax, ay = corners[i]
+            bx, by = corners[(i + 1) % 4]
+            if (bx - ax) * (cy - ay) - (by - ay) * (cx - ax) < 0:
+                ax, ay, bx, by = bx, by, ax, ay
+            sm.linedefs.append(LineDef(
+                vid(ax, ay), vid(bx, by), front=front,
+                back=back_side if back_side is not None else -1))
+
+    rect(0, 0, w, h, 0)
+    rect(384, 128, 640, 384, 1, back=0)
+    sm.things = [Thing(128, 256, "player1")]
+    sm.invalidate()
+    assert sm.validate() == [], sm.validate()
+    return sm
+
+
+def _floating_platform_world():
+    """Tasks 3.2-3.3: support decides passability, not the slab border."""
+    # Clearance 72 >= ACTOR_HEIGHT: walk under the slab on the host floor.
+    world = GameWorld(mode='pve', game_map=_slab_map(88, 72))
+    eid = world.add_player(1, "Under")
+    pos = _drive(world, eid, 8.0, 0.0, 100)
+    assert pos.x > 640, f"did not pass under the slab: {pos.x}"
+    assert pos.z == 0, f"walked under the slab but rose to {pos.z}"
+
+    # Clearance 40 < ACTOR_HEIGHT: the slab underside blocks the same path.
+    low = GameWorld(mode='pve', game_map=_slab_map(88, 40))
+    eid = low.add_player(1, "Blocked")
+    pos = _drive(low, eid, 8.0, 0.0, 100)
+    assert pos.x < 384, f"walked into a slab with no headroom: {pos.x}"
+    assert pos.z == 0, pos.z
+
+    # A 16-high slab top is within STEP_HEIGHT: step up, then walk off.
+    step = GameWorld(mode='pve', game_map=_slab_map(16, 8))
+    eid = step.add_player(1, "Climber")
+    pos = _drive(step, eid, 8.0, 0.0, 45)
+    assert 384 < pos.x < 640, f"did not step onto the slab: {pos.x}"
+    assert pos.z == 16, f"slab top not adopted as support: {pos.z}"
+    pos = _drive(step, eid, -8.0, 0.0, 60)
+    assert pos.x < 384, f"did not walk off the slab: {pos.x}"
+    assert pos.z == 0, f"kept the slab height after leaving: {pos.z}"
+
+    # Spawn under a slab: the support is the host floor, not the slab top.
+    spawn = GameWorld(mode='pve', game_map=_slab_map(88, 72))
+    spawn.spawn_points = [(512.0, 256.0)]
+    eid = spawn.add_player(1, "Spawned")
+    pos = spawn.entities.get_component(eid, Position)
+    assert pos.z == 0, f"spawned on the slab top: {pos.z}"
+
+    # Enemies never take the slab top as support (allow_platforms=False).
+    enemies = GameWorld(mode='pve', game_map=_slab_map(16, 8))
+    enemies.add_player(1, "Bait")
+    enemies._add_enemy('soldier', 512.0, 256.0, 0.0)
+    en = enemies.enemies[-1]
+    en['alert'] = True
+    en['pa'] = 0.0
+    for _ in range(20):
+        enemies.update()
+    assert en['z'] == 0, f"enemy climbed onto the slab: {en['z']}"
+    print("  floating support OK (under/climb/headroom/spawn/enemy)")
 
 
 def _strip_map(floors, solid_edge=None, w=512, h=512):

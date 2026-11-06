@@ -10,7 +10,7 @@ from shared import mt1
 from shared.map_data import TILE, GameMap
 
 SECTOR_FORMAT = "sector"
-SECTOR_FORMAT_VERSION = 1
+SECTOR_FORMAT_VERSION = 2
 
 MAP_FORMAT_TILE = 0
 MAP_FORMAT_SECTOR = 1
@@ -37,6 +37,17 @@ LINE_FLAG_SOLID = 0x02
 # two-sided linedef lets an actor cross. Beyond it the linedef blocks like a
 # wall. Symmetric: passability is one boolean per linedef.
 STEP_HEIGHT = 24
+
+# A floating sector is a solid slab, not a room: ``floor_h`` is its walkable
+# top surface and ``ceil_h`` its underside, so the two heights are reversed
+# relative to an ordinary sector and their difference is the slab thickness.
+MIN_PLATFORM_THICKNESS = 8
+
+# Vertical clearance (world units) an actor needs between its support and the
+# nearest ceiling. Lives here, next to ``STEP_HEIGHT``, because it is a
+# property of the geometry that the editor must show and the server enforce —
+# not a balance number.
+ACTOR_HEIGHT = 56
 
 # Linedef special: a door. The number matches ``SPECIAL_NAMES["дверь"]`` in
 # ``shared/text_map.py``. A door is an ordinary two-sided linedef that blocks
@@ -122,6 +133,7 @@ class Sector:
     light: int = 160
     special: int = 0
     tag: int = 0
+    floating: bool = False
 
 
 @dataclass(slots=True)
@@ -209,7 +221,7 @@ class SectorMap:
             ],
             "sectors": [
                 [s.floor_h, s.ceil_h, s.floor_tex, s.ceil_tex, s.light,
-                 s.special, s.tag]
+                 s.special, s.tag, s.floating]
                 for s in self.sectors
             ],
             "things": [
@@ -225,7 +237,7 @@ class SectorMap:
         if fmt != SECTOR_FORMAT:
             raise ValueError(f"unknown map format: {fmt!r}")
         ver = data.get("version")
-        if ver != SECTOR_FORMAT_VERSION:
+        if ver not in (1, SECTOR_FORMAT_VERSION):
             raise ValueError(f"unsupported sector format version: {ver!r}")
         try:
             verts = [Vertex(float(v[0]), float(v[1])) for v in data["vertices"]]
@@ -241,7 +253,8 @@ class SectorMap:
             ]
             sectors = [
                 Sector(int(s[0]), int(s[1]), str(s[2]), str(s[3]), int(s[4]),
-                       int(s[5]), int(s[6]))
+                       int(s[5]), int(s[6]),
+                       bool(s[7]) if len(s) > 7 else False)
                 for s in data["sectors"]
             ]
             things = [
@@ -264,10 +277,27 @@ class SectorMap:
             [(s.floor_h, s.ceil_h, s.floor_tex, s.ceil_tex, s.light,
               s.special, s.tag) for s in self.sectors],
             [(t.x, t.y, t.type, t.angle, t.z) for t in self.things],
+            [s.floating for s in self.sectors],
         )
         if extra_lumps:
             lumps.update(extra_lumps)
         return mt1.pack(lumps)
+
+    @staticmethod
+    def _model_from_lumps(lumps: dict[str, bytes]) -> SectorMap:
+        """Build a model from decoded geometry + the optional ``SFLAGS``."""
+        verts, linedefs, sidedefs, sectors, things = mt1.decode_geometry(lumps)
+        flags = mt1.decode_sflags(lumps.get(mt1.L_SFLAGS), len(sectors))
+        return SectorMap(
+            [Vertex(v[0], v[1]) for v in verts],
+            [LineDef(*ld) for ld in linedefs],
+            [SideDef(upper=sd[0], mid=sd[1], lower=sd[2], x_off=sd[3],
+                     y_off=sd[4], sector=sd[5]) for sd in sidedefs],
+            [Sector(floor_h=s[0], ceil_h=s[1], floor_tex=s[2], ceil_tex=s[3],
+                    light=s[4], special=s[5], tag=s[6], floating=flags[i])
+             for i, s in enumerate(sectors)],
+            [Thing(t[0], t[1], t[2], t[3], t[4]) for t in things],
+        )
 
     @staticmethod
     def from_mt1(data: bytes,
@@ -278,23 +308,14 @@ class SectorMap:
         lumps = mt1.unpack(data)
         if extra_lumps:
             lumps.update(extra_lumps)
-        verts, linedefs, sidedefs, sectors, things = mt1.decode_geometry(lumps)
-        sm = SectorMap(
-            [Vertex(v[0], v[1]) for v in verts],
-            [LineDef(*ld) for ld in linedefs],
-            [SideDef(upper=sd[0], mid=sd[1], lower=sd[2], x_off=sd[3],
-                     y_off=sd[4], sector=sd[5]) for sd in sidedefs],
-            [Sector(floor_h=s[0], ceil_h=s[1], floor_tex=s[2], ceil_tex=s[3],
-                    light=s[4], special=s[5], tag=s[6]) for s in sectors],
-            [Thing(t[0], t[1], t[2], t[3], t[4]) for t in things],
-        )
+        sm = SectorMap._model_from_lumps(lumps)
         # BSP slices (if the file was saved with them) ride along so the
         # scene can reuse them instead of rebuilding (task 2.3).
         if (mt1.L_SEGS in lumps and mt1.L_SUBSECTORS in lumps
                 and mt1.L_NODES in lumps):
             sm._bsp = {
                 "lumps": lumps,
-                "verts": verts,  # extended vertex table incl. split points
+                "verts": mt1.decode_vertices(lumps.get(mt1.L_VERTEXES, b"")),
             }
         return sm
 
@@ -321,19 +342,9 @@ class SectorMap:
         except mt1.Mt1Error as exc:
             return [f"container: {exc}"]
         try:
-            verts, linedefs, sidedefs, sectors, things = mt1.decode_geometry(
-                lumps)
+            sm = SectorMap._model_from_lumps(lumps)
         except mt1.Mt1Error as exc:
             return [f"geometry: {exc}"]
-        sm = SectorMap(
-            [Vertex(v[0], v[1]) for v in verts],
-            [LineDef(*ld) for ld in linedefs],
-            [SideDef(upper=sd[0], mid=sd[1], lower=sd[2], x_off=sd[3],
-                     y_off=sd[4], sector=sd[5]) for sd in sidedefs],
-            [Sector(floor_h=s[0], ceil_h=s[1], floor_tex=s[2], ceil_tex=s[3],
-                    light=s[4], special=s[5], tag=s[6]) for s in sectors],
-            [Thing(t[0], t[1], t[2], t[3], t[4]) for t in things],
-        )
         return sm.validate()
 
     @staticmethod
@@ -404,7 +415,13 @@ class SectorMap:
                 errs.append(f"sidedef {i}: sector {sd.sector} out of range")
 
         for i, s in enumerate(self.sectors):
-            if s.floor_h > s.ceil_h:
+            if s.floating:
+                if s.floor_h - s.ceil_h < MIN_PLATFORM_THICKNESS:
+                    errs.append(
+                        f"sector {i}: floating slab {s.ceil_h}..{s.floor_h}"
+                        f" is thinner than {MIN_PLATFORM_THICKNESS}"
+                    )
+            elif s.floor_h > s.ceil_h:
                 errs.append(
                     f"sector {i}: floor {s.floor_h} above ceiling {s.ceil_h}"
                 )
@@ -459,15 +476,107 @@ class SectorMap:
                     f"linedef {i}: door lock differs between sides "
                     f"(«{ft}» / «{bt}»)")
 
+        # Floating slabs: every border must be a two-sided portal to exactly
+        # one ordinary sector, which has to contain the slab vertically.
+        for i, ld in enumerate(self.linedefs):
+            if not (0 <= ld.front < n_sides):
+                continue
+            fs = self.sidedefs[ld.front].sector
+            bs = (self.sidedefs[ld.back].sector
+                  if 0 <= ld.back < n_sides else -1)
+            f_float = 0 <= fs < n_secs and self.sectors[fs].floating
+            b_float = 0 <= bs < n_secs and self.sectors[bs].floating
+            if not (f_float or b_float):
+                continue
+            if ld.back < 0 or bs < 0:
+                errs.append(
+                    f"linedef {i}: floating sector has a one-sided border")
+                continue
+            if f_float and b_float:
+                # Allow doors between floating sectors; otherwise forbid.
+                if ld.special != SPECIAL_DOORS:
+                    errs.append(
+                        f"linedef {i}: two floating sectors share a border")
+                    continue
+            if ld.solid:
+                errs.append(
+                    f"linedef {i}: solid flag on a floating sector border")
+            slab = fs if f_float else bs
+            host = bs if f_float else fs
+            if not (0 <= host < n_secs):
+                continue
+            slab_s = self.sectors[slab]
+            host_s = self.sectors[host]
+            if not (host_s.floor_h <= slab_s.ceil_h
+                    and host_s.ceil_h >= slab_s.floor_h):
+                errs.append(
+                    f"sector {slab}: slab {slab_s.ceil_h}..{slab_s.floor_h}"
+                    f" does not fit inside sector {host}"
+                    f" {host_s.floor_h}..{host_s.ceil_h}")
+
+        # Slabs may not overlap or nest in plan view (non-goal: no stacked
+        # platforms), so the footprint of each floating sector is unique.
+        floats = [i for i, s in enumerate(self.sectors) if s.floating]
+        if floats:
+            polys = self._ensure_polys()
+            if len(floats) > 1:
+                for ai in range(len(floats)):
+                    for bi in range(ai + 1, len(floats)):
+                        a, b = floats[ai], floats[bi]
+                        if self._loops_overlap(polys[a], polys[b]):
+                            errs.append(
+                                f"sectors {a} and {b}: floating slabs overlap")
+            # A regular sector carved inside a floating sector also counts as
+            # nesting/overlap for the purposes of this validation, but a
+            # floating sector sitting on its non-floating host is fine.
+            for fi in floats:
+                for si in range(len(self.sectors)):
+                    if si == fi or self.sectors[si].floating:
+                        continue
+                    if not (polys[fi] and polys[si]):
+                        continue
+                    if not self._loops_overlap(polys[fi], polys[si]):
+                        continue
+                    # If the floating sector is nested inside this non-floating
+                    # sector and shares borders with it as host, that's normal.
+                    # Check if this non-floating sector is a host of the floating slab.
+                    is_host = False
+                    for ld in self.linedefs:
+                        if not (0 <= ld.front < n_sides and 0 <= ld.back < n_sides):
+                            continue
+                        fs = self.sidedefs[ld.front].sector
+                        bs = self.sidedefs[ld.back].sector
+                        if (fs == fi and bs == si) or (bs == fi and fs == si):
+                            is_host = True
+                            break
+                    if is_host:
+                        continue
+                    errs.append(f"sectors {fi} and {si}: floating slabs overlap")
+                    break
+
         if not any(t.type == "player1" for t in self.things):
             errs.append("map has no player1 spawn")
         key_types = set(KEY_TYPES.values())
         for i, t in enumerate(self.things):
             if not (math.isfinite(t.x) and math.isfinite(t.y)):
                 errs.append(f"thing {i}: non-finite coordinates")
-            elif t.type in key_types and n_secs >= 1 \
-                    and self.find_sector_at(t.x, t.y) < 0:
-                errs.append(f"thing {i}: key «{t.type}» is outside every sector")
+                continue
+            if n_secs < 1:
+                continue
+            containing = self.sectors_at(t.x, t.y)
+            if not containing:
+                if t.type in key_types:
+                    errs.append(
+                        f"thing {i}: key «{t.type}» is outside every sector")
+                continue
+            inner = containing[0]
+            if self.sectors[inner].floating:
+                errs.append(
+                    f"thing {i}: stands on floating sector {inner}")
+                continue
+            feet = self.floor_under(t.x, t.y)
+            if self.support_at(t.x, t.y, feet, allow_platforms=False) is None:
+                errs.append(f"thing {i}: no floor with enough headroom")
 
         return errs
 
@@ -512,8 +621,6 @@ class SectorMap:
         ld = self.linedefs[li]
         if ld.back < 0:
             return True
-        if ld.flags & LINE_FLAG_SOLID:
-            return True
         n_sides = len(self.sidedefs)
         if not (0 <= ld.front < n_sides and 0 <= ld.back < n_sides):
             return True
@@ -521,6 +628,13 @@ class SectorMap:
         fs = self.sidedefs[ld.front].sector
         bs = self.sidedefs[ld.back].sector
         if not (0 <= fs < n_secs and 0 <= bs < n_secs):
+            return True
+        # A slab border is not a wall: whether an actor fits under it or can
+        # step onto it is a question about the actor, answered by
+        # ``support_at``, not a property of the line (design §3).
+        if self.sectors[fs].floating or self.sectors[bs].floating:
+            return False
+        if ld.flags & LINE_FLAG_SOLID:
             return True
         return abs(self.sectors[fs].floor_h
                    - self.sectors[bs].floor_h) > STEP_HEIGHT
@@ -576,14 +690,21 @@ class SectorMap:
         # Directed boundary segments per sector: start vertex -> end vertices.
         outs: list[dict[int, list[int]]] = [dict() for _ in range(n_secs)]
         for ld in self.linedefs:
+            if ld.v1 == ld.v2:
+                continue
             if 0 <= ld.front < n_sides:
                 s = self.sidedefs[ld.front].sector
-                if 0 <= s < n_secs and ld.v1 != ld.v2:
-                    outs[s].setdefault(ld.v1, []).append(ld.v2)
+                if 0 <= s < n_secs:
+                    other = (self.sidedefs[ld.back].sector
+                             if 0 <= ld.back < n_sides else -1)
+                    if not self._border_hidden(s, other):
+                        outs[s].setdefault(ld.v1, []).append(ld.v2)
             if 0 <= ld.back < n_sides:
                 s = self.sidedefs[ld.back].sector
-                if 0 <= s < n_secs and ld.v1 != ld.v2:
-                    outs[s].setdefault(ld.v2, []).append(ld.v1)
+                if 0 <= s < n_secs:
+                    other = self.sidedefs[ld.front].sector
+                    if not self._border_hidden(s, other):
+                        outs[s].setdefault(ld.v2, []).append(ld.v1)
         verts = self.verts
         polys: list[list[tuple[list[tuple[float, float]], tuple[float, float, float, float], float]]] = [
             [] for _ in range(n_secs)
@@ -622,6 +743,18 @@ class SectorMap:
                 polys[s].append((points, bbox, abs(area2) * 0.5))
         self._polys = polys
         return polys
+
+    def _border_hidden(self, s: int, other: int) -> bool:
+        """True when this directed edge must not shape sector ``s``'s loop.
+
+        A floating slab's border is a hole in the *slab's* outline, not in its
+        host: dropping the edge from the host's directed edges keeps the host
+        footprint whole, so the floor under the slab still exists (design §2).
+        The slab's own loop is still built from its side of the border.
+        """
+        return (not self.sectors[s].floating
+                and 0 <= other < len(self.sectors)
+                and self.sectors[other].floating)
 
     def has_polygon(self, sid: int) -> bool:
         """True when sector ``sid`` has at least one closed contour loop.
@@ -670,6 +803,103 @@ class SectorMap:
                 best = si
                 best_area = inner_area
         return best
+
+    def sectors_at(self, x: float, y: float) -> list[int]:
+        """Every sector whose loop contains the point, innermost first.
+
+        Ordered by the smallest containing loop area, so a floating slab
+        nested in its host comes before the host. A flat world has exactly one
+        entry; a slab point has two.
+        """
+        polys = self._ensure_polys()
+        found: list[tuple[float, int]] = []
+        for si, loops in enumerate(polys):
+            inside_count = 0
+            inner_area = math.inf
+            for points, bbox, area in loops:
+                if x < bbox[0] or x > bbox[2] or y < bbox[1] or y > bbox[3]:
+                    continue
+                if self._point_in_loop(x, y, points):
+                    inside_count += 1
+                    if area < inner_area:
+                        inner_area = area
+            if inside_count & 1:
+                found.append((inner_area, si))
+        found.sort()
+        return [si for _, si in found]
+
+    def support_at(self, x: float, y: float, feet_z: float,
+                   allow_platforms: bool = True) -> float | None:
+        """Support height for an actor whose feet are at ``feet_z``.
+
+        Considers every sector containing the point (not just the innermost).
+        The support is the highest surface no more than ``STEP_HEIGHT`` away
+        from the feet; the nearest ceiling above it — a slab's underside
+        included — must leave ``ACTOR_HEIGHT`` of clearance. ``None`` means the
+        point is not passable for that actor.
+        """
+        sids = self.sectors_at(x, y)
+        if not sids:
+            return None
+        supports: list[int] = []
+        ceilings: list[int] = []
+        for si in sids:
+            s = self.sectors[si]
+            ceilings.append(s.ceil_h)
+            if s.floating:
+                if allow_platforms:
+                    supports.append(s.floor_h)
+            else:
+                supports.append(s.floor_h)
+        best: int | None = None
+        for top in supports:
+            if abs(feet_z - top) > STEP_HEIGHT:
+                continue
+            if best is None or top > best:
+                best = top
+        if best is None:
+            return None
+        above = [c for c in ceilings if c >= best]
+        if not above or min(above) - best < ACTOR_HEIGHT:
+            return None
+        return float(best)
+
+    def floor_under(self, x: float, y: float) -> int:
+        """Floor of the nearest ordinary sector under the point.
+
+        Under a floating slab this is the host floor, never the slab top —
+        the camera, the editor and spawn heights all stand on the ground.
+        """
+        for si in self.sectors_at(x, y):
+            s = self.sectors[si]
+            if not s.floating:
+                return s.floor_h
+        return 0
+
+    def _loops_overlap(self, loops_a, loops_b) -> bool:
+        """True when two sector polygon sets share plan-view area."""
+        for points_a, bbox_a, _ in loops_a:
+            for points_b, bbox_b, _ in loops_b:
+                if (bbox_a[0] > bbox_b[2] or bbox_b[0] > bbox_a[2]
+                        or bbox_a[1] > bbox_b[3] or bbox_b[1] > bbox_a[3]):
+                    continue
+                if self._point_in_loop(points_a[0][0], points_a[0][1],
+                                       points_b):
+                    return True
+                if self._point_in_loop(points_b[0][0], points_b[0][1],
+                                       points_a):
+                    return True
+                na = len(points_a)
+                nb = len(points_b)
+                for i in range(na):
+                    ax, ay = points_a[i]
+                    bx, by = points_a[(i + 1) % na]
+                    for j in range(nb):
+                        cx, cy = points_b[j]
+                        dx, dy = points_b[(j + 1) % nb]
+                        if _segments_cross(ax, ay, bx, by, cx, cy, dx, dy):
+                            return True
+        return False
 
     def get_spawn_points(self) -> list[tuple[float, float]]:
         return [(t.x, t.y) for t in self.things if t.type == "player1"]

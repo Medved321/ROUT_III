@@ -116,6 +116,10 @@ class GameClient:
         self.player_id: int | None = None
         self.local_x: float = 96.0
         self.local_y: float = 96.0
+        # Support height under the local player, straight from the snapshot.
+        # None until the first snapshot of a sector party, and always None on
+        # a tile map, where the world is flat by construction.
+        self.local_z: float | None = None
         self.local_angle: float = 0.0
         self.local_health: int = 200
         self.local_weapon: int = 1
@@ -660,6 +664,9 @@ class GameClient:
         # leak from the party we just left.
         from engine import game_state as gs
         gs.reset_transient_state()
+        # A tile world is flat: no support height, so the camera and sprites
+        # keep the old sector-floor path even if the previous party had one.
+        self.local_z = None
         if self.network.map_format == MAP_FORMAT_SECTOR:
             self.game_map = None
             self.sector_map = SectorMap.from_bytes(self.network.map_data)
@@ -999,6 +1006,7 @@ class GameClient:
         self.network.send_leave_party()
         self.bridge = None
         self.game_map = None
+        self.local_z = None
         self.other_players = []
         self.enemies = []
         self.bullets = []
@@ -1315,6 +1323,10 @@ class GameClient:
                 self._server_angle = p["angle"]
                 self.local_x = p["x"]
                 self.local_y = p["y"]
+                # Tile maps are flat: the server still sends z=0, but the
+                # camera must keep the "no vertical" path there.
+                self.local_z = (p.get("z")
+                                if self.sector_map is not None else None)
                 self.local_health = p["health"]
                 self.local_weapon = p["wpn"]
                 self.local_ammo = p.get("ammo", self.local_ammo)
@@ -1456,6 +1468,7 @@ class GameClient:
             doors=self.doors, keys=self.local_keys,
             use_hint=(self.local_use_reason == USE_REASON_LOCKED
                       and time.monotonic() < self._use_hint_until),
+            player_z=self.local_z,
         )
         self.bridge.render()
         pygame.display.flip()

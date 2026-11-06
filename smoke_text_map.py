@@ -405,6 +405,105 @@ def test_room_with_hole() -> None:
     assert text_map.render(again) == text_map.render(sm), "текст канонический"
 
 
+FLOATING_ROOM = """\
+КОМНАТА Зал
+пол 16
+потолок 200
+угол 0 0
+угол 0 512
+угол 512 512
+угол 512 0
+контур
+угол 128 128
+угол 128 384
+угол 384 384
+угол 384 128
+
+КОМНАТА Плита
+пол 88
+потолок 72
+парит да
+угол 128 128
+угол 128 384
+угол 384 384
+угол 384 128
+
+ИГРОК 64 64
+"""
+
+
+def test_floating_room() -> None:
+    """`.mts`: плита — дыра-контур зала, `парит да`, текст и round-trip."""
+    sm = text_map.parse(FLOATING_ROOM)
+    assert sm.validate() == [], sm.validate()
+    assert [s.floating for s in sm.sectors] == [False, True], \
+        [s.floating for s in sm.sectors]
+    assert (sm.sectors[1].floor_h, sm.sectors[1].ceil_h) == (88, 72)
+
+    # The slab does not carve a hole in the host model: the floor under it
+    # exists and the slab comes first (smallest loop) when both contain the
+    # point. The *text* still spells the border as the host's `контур` hole,
+    # because that is how the format attaches a slab to its carrier.
+    assert len(sm._ensure_polys()[0]) == 1, "у зала нет дыры в модели"
+    assert "контур" in text_map.render(sm)
+    assert len(text_map._sector_loops(sm, 1)) == 1
+    assert sm.sectors_at(256, 256) == [1, 0], sm.sectors_at(256, 256)
+    assert sm.floor_under(256, 256) == 16
+    assert sm.support_at(256, 256, 16) == 16.0
+    assert sm.support_at(256, 256, 80) == 88.0
+
+    # Every slab border is a two-sided portal, not a wall.
+    border = [ld for ld in sm.linedefs if ld.back >= 0]
+    assert len(border) == 4, len(border)
+    for ld in border:
+        assert sm.line_blocks(sm.linedefs.index(ld)) is False
+        sectors = {sm.sidedefs[ld.front].sector, sm.sidedefs[ld.back].sector}
+        assert sectors == {0, 1}, sectors
+
+    # The flag survives render → parse; the text says `парит да` only for it.
+    text = text_map.render(sm)
+    assert "парит да" in text, text
+    assert text.count("парит") == 1, text
+    again = text_map.parse(text)
+    assert again.validate() == [], again.validate()
+    assert [s.floating for s in again.sectors] == [False, True]
+    assert signature(again) == signature(sm)
+    assert text_map.render(again) == text, "текст канонический"
+
+    # `парит нет` is an explicit anchored sector: with real room heights it
+    # parses as an ordinary raised room and the text never says `парит`.
+    no = text_map.parse(
+        FLOATING_ROOM.replace("пол 88", "пол 32")
+        .replace("потолок 72", "потолок 64")
+        .replace("парит да", "парит нет"))
+    assert all(not s.floating for s in no.sectors)
+    assert "парит" not in text_map.render(no)
+
+    # A slab thinner than MIN_PLATFORM_THICKNESS is rejected with its line.
+    thin = FLOATING_ROOM.replace("пол 88", "пол 76")
+    try:
+        text_map.parse(thin)
+        raise AssertionError("thin slab accepted")
+    except text_map.TextMapError as exc:
+        assert "тоньше" in str(exc), str(exc)
+        assert exc.line == 17, exc.line
+
+    # A slab whose contour is not a hole of another room is rejected too.
+    orphan = FLOATING_ROOM.replace("контур\n", "")
+    try:
+        text_map.parse(orphan)
+        raise AssertionError("orphan slab accepted")
+    except text_map.TextMapError as exc:
+        assert "несущей" in str(exc), str(exc)
+
+    # Bad value for the flag is a plain parse error.
+    try:
+        text_map.parse(FLOATING_ROOM.replace("парит да", "парит может быть"))
+        raise AssertionError("bad flag value accepted")
+    except text_map.TextMapError as exc:
+        assert "парит" in str(exc), str(exc)
+
+
 def test_hole_triangle_and_single_loop() -> None:
     """Треугольник-дыра разбирается; сектор из одной петли не даёт `контур`."""
     single = text_map.parse(SIMPLE_ROOM)
@@ -772,6 +871,7 @@ def main() -> int:
             test_solid_round_trip,
             test_triangle_needs_explicit_close,
             test_room_with_hole,
+            test_floating_room,
             test_hole_triangle_and_single_loop,
             test_real_maps_keep_two_sided,
             test_round_trip,

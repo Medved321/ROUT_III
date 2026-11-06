@@ -1,4 +1,4 @@
 from __future__ import annotations
 
-PROTOCOL_VERSION = 13
+PROTOCOL_VERSION = 14
 CLIENT_VERSION = "1.1.0"

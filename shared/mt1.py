@@ -47,10 +47,11 @@ L_SEGS = "SEGS"
 L_SUBSECTORS = "SSECTORS"
 L_NODES = "NODES"
 L_REJECT = "REJECT"
+L_SFLAGS = "SFLAGS"
 
 ALL_LUMPS = (
     L_VERTEXES, L_LINEDEFS, L_SIDEDEFS, L_SECTORS, L_THINGS, L_NAMES,
-    L_SEGS, L_SUBSECTORS, L_NODES, L_REJECT,
+    L_SEGS, L_SUBSECTORS, L_NODES, L_REJECT, L_SFLAGS,
 )
 
 # --- geometry lump record formats (big-endian, task 1.2) -------------------
@@ -419,6 +420,33 @@ SsLine = list[tuple[int, int, int, int, int, int, int]]
 SsVertex = list[tuple[float, float]]
 
 
+# --- sector flags (SFLAGS) -------------------------------------------------
+# Optional lump: one byte per sector, bit 0 = "floating" (the sector is a
+# slab). Absent when no sector floats, so old readers lose the flag and see
+# ordinary sectors instead of failing (design §8).
+
+SFLAG_FLOATING = 0x01
+
+
+def encode_sflags(flags: list[bool]) -> bytes:
+    out = bytearray(len(flags))
+    for i, flag in enumerate(flags):
+        if flag:
+            out[i] |= SFLAG_FLOATING
+    return bytes(out)
+
+
+def decode_sflags(data: bytes | None, n_sectors: int) -> list[bool]:
+    """Per-sector floating flags; a missing lump means "no floating slabs"."""
+    if not data:
+        return [False] * n_sectors
+    if len(data) != n_sectors:
+        raise Mt1Error(
+            Mt1Code.MALFORMED_LUMP,
+            f"SFLAGS: {len(data)} bytes for {n_sectors} sectors")
+    return [bool(b & SFLAG_FLOATING) for b in data]
+
+
 def _collect_geometry_names(
     sidedefs: SsSidedef, sectors: SsSector, things: SsThing,
 ) -> list[str]:
@@ -438,11 +466,14 @@ def encode_geometry(
     sidedefs: SsSidedef,
     sectors: SsSector,
     things: SsThing,
+    floating: list[bool] | None = None,
 ) -> dict[str, bytes]:
     """Encode the source-geometry lumps; returns {VERTEXES..NAMES} bytes.
 
     Texture/type names are turned into a NAMES table automatically; every
-    other lump references positions of the raw degree-1 tables.
+    other lump references positions of the raw degree-1 tables. ``floating``
+    adds the optional ``SFLAGS`` slice, but only when a sector actually
+    floats — maps without slabs keep the exact old byte layout.
     """
     names = _collect_geometry_names(sidedefs, sectors, things)
     idx = _names_indices(names)
@@ -461,6 +492,13 @@ def encode_geometry(
             for x, y, type_name, angle, z in things]),
         L_NAMES: encode_names(names),
     }
+    if floating is not None:
+        if len(floating) != len(sectors):
+            raise Mt1Error(
+                Mt1Code.OUT_OF_RANGE,
+                f"SFLAGS: {len(floating)} flags for {len(sectors)} sectors")
+        if any(floating):
+            lumps[L_SFLAGS] = encode_sflags(floating)
     return lumps
 
 
