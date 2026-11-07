@@ -73,13 +73,33 @@ jobs:
           restore-keys: |
             buildozer-${{ runner.os }}-
 
+      # ``tee`` keeps the output available when the step fails.  A failed
+      # buildozer run is almost always a p4a recipe problem, and the raw job log
+      # needs a repository token to read; the next step turns the interesting
+      # lines into public check annotations instead (see the script).
       - name: Build debug APK
-        run: buildozer -v android debug
+        run: |
+          set -o pipefail
+          buildozer -v android debug 2>&1 | tee buildozer.log
         env:
           # Keep Gradle from asking for a daemon it cannot keep alive.
           GRADLE_OPTS: "-Dorg.gradle.daemon=false"
 
+      - name: Publish build failure
+        if: failure()
+        run: python .github/scripts/report_build_log.py buildozer.log
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rout3-buildozer-log
+          path: buildozer.log
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: List artifacts
+        if: success()
         run: ls -lh bin/ || true
 
       - name: Upload APK

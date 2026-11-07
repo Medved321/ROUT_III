@@ -269,7 +269,55 @@ def section_workflow():
     check("workflow_dispatch" in flow, "the APK must be buildable on demand")
     check("tools/android/recipes/**" in flow,
           "the toolchain cache key must follow the recipe pins")
+    # The build is diagnosed from the annotations, not from the job log: the
+    # run log is 403 without a token on this public repository.
+    check("tee buildozer.log" in flow, "a failed build must leave a log to read")
+    check("report_build_log.py" in flow, "the log must reach the check annotations")
+    check("rout3-buildozer-log" in flow, "the raw log must be downloadable")
     print("CI workflow builds and uploads the debug APK OK")
+
+
+# ── 7. a failed build explains itself without the private job log ─
+def section_failure_log():
+    script = ROOT / ".github/scripts/report_build_log.py"
+    check(script.is_file(), "the failure reporter is missing")
+
+    log = "\n".join([
+        "Running 'make'",
+        "  CC  Modules/posixmodule.c",
+        "patch: **** Only garbage was found in the patch input.",
+        "Error: one of the patches failed to apply",
+        "Traceback (most recent call last):",
+        '  File "toolchain.py", line 1, in <module>',
+        "BuildInterruptingException: python3 failed",
+        *(f"line {i} of ordinary build chatter" for i in range(400)),
+    ])
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        log_path = tmp / "buildozer.log"
+        log_path.write_text(log, encoding="utf-8")
+        summary = tmp / "summary.md"
+        env = dict(os.environ, GITHUB_STEP_SUMMARY=str(summary))
+        run = subprocess.run(
+            [sys.executable, str(script), str(log_path)],
+            capture_output=True, text=True, env=env)
+        check(run.returncode == 0, "reporting a failure must never fail the job")
+        out = run.stdout
+
+        check("::error title=buildozer errors::" in out,
+              "the failing lines must become an annotation")
+        check("patches failed to apply" in out,
+              "the annotation must quote the failure, not just say it failed")
+        check("BuildInterruptingException: python3 failed" in out,
+              "the tail of the traceback must survive")
+        check("%0A" in out,
+              "a multiline annotation must be escaped, not dropped")
+        check(all(line.startswith("::error") for line in out.splitlines()),
+              "every emitted line must be a workflow command")
+        check(summary.is_file() and "line 399 of ordinary build chatter"
+              in summary.read_text(encoding="utf-8"),
+              "a human reading the run needs the tail in the step summary")
+    print("a failed cloud build publishes its own diagnosis OK")
 
 
 def main():
@@ -279,6 +327,7 @@ def main():
     section_writable_root()
     section_fullscreen()
     section_workflow()
+    section_failure_log()
     print("ALL ANDROID PACKAGING SMOKE TESTS PASSED")
 
 
