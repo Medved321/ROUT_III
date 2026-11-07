@@ -15,6 +15,17 @@ script turns the interesting part of it into workflow commands:
 
 GitHub turns each of those into an annotation on the check run and prints it on
 the job page, which is the only channel that survives the token requirement.
+
+Three limits shape the code below, and ignoring any of them silently loses the
+one line that explains the failure:
+
+* **Ten annotations per step.**  GitHub stores at most ten of them, so the
+  *tail* -- where a failed Makefile prints its verdict -- is emitted first and
+  the keyword matches only fill what is left.
+* **~4 KiB per annotation.**  A build log is mostly compiler command lines, so
+  each chunk is cut well below that limit and each line is shortened.
+* **One line per workflow command.**  Newlines and percent signs are escaped.
+
 The same text goes to ``$GITHUB_STEP_SUMMARY`` for a human reading the run, and
 the raw file is uploaded as an artifact by the workflow.
 
@@ -28,22 +39,26 @@ import re
 import sys
 from pathlib import Path
 
-# A workflow command has to fit on one line, and GitHub truncates a very long
-# annotation anyway.  Chunking keeps every line readable instead of losing the
-# middle of the message.
-CHUNK = 5500
-MAX_CHUNKS = 10
+# Ten annotations per step: keep the tail in the first few and let keyword
+# matches use the rest.  Chunks stay under GitHub's ~4 KiB annotation cap.
+CHUNK = 3000
+TAIL_CHUNKS = 4
+ERROR_CHUNKS = 6
+TAIL_LINES = 100
+LINE_MAX = 300
+ERROR_CONTEXT = 3
+MAX_ERRORS = 30
 
-# Lines worth surfacing first: p4a/buildozer say "Error:", "ERROR", "fatal:",
-# python raises "Traceback", make says "Error 1", gradle says "FAILURE:".
+# Keyword matches use whole words, so ``-Werror=implicit-function-declaration``
+# in a compiler command line is not "an interesting error": it matched every
+# single compile line and filled all ten annotation slots with noise.
 _INTERESTING = re.compile(
-    r"(error|Error|ERROR|fatal|Fatal|Traceback|Exception|Failed|FAILED|FAILURE"
-    r"|not found|No such file|undefined reference|cannot find|refused)"
+    r"\b(error|Error|ERROR|fatal|failed|Failed|FAILED|FAILURE|Traceback|Exception"
+    r"|undefined reference|cannot find|No such file|refused|not found)\b"
 )
 
-_TAIL_LINES = 160
-_ERROR_CONTEXT = 4
-_MAX_ERRORS = 40
+_TAIL_TITLE = "buildozer tail"
+_ERROR_TITLE = "buildozer errors"
 
 
 def _escape(text: str) -> str:
@@ -53,7 +68,12 @@ def _escape(text: str) -> str:
                 .replace("\n", "%0A"))
 
 
-def _chunks(title: str, lines: list[str]) -> list[str]:
+def _short(line: str) -> str:
+    """Keep the start of a long line; compiler commands are thousands wide."""
+    return line if len(line) <= LINE_MAX else line[:LINE_MAX] + " [...]"
+
+
+def _chunks(title: str, lines: list[str], limit: int) -> list[str]:
     """Split ``lines`` into annotation-sized workflow commands."""
     commands: list[str] = []
     buf: list[str] = []
@@ -66,7 +86,7 @@ def _chunks(title: str, lines: list[str]) -> list[str]:
         size += len(line) + 1
     if buf:
         commands.append(f"::error title={title}::{_escape(chr(10).join(buf))}")
-    return commands[:MAX_CHUNKS]
+    return commands[:limit]
 
 
 def _error_block(lines: list[str]) -> list[str]:
@@ -76,16 +96,16 @@ def _error_block(lines: list[str]) -> list[str]:
         return []
     # Collapse adjacent hits so a traceback is printed once, not per line.
     groups: list[tuple[int, int]] = []
-    for idx in hits[-_MAX_ERRORS:]:
-        start = max(0, idx - _ERROR_CONTEXT)
-        end = min(len(lines), idx + _ERROR_CONTEXT + 1)
+    for idx in hits[-MAX_ERRORS:]:
+        start = max(0, idx - ERROR_CONTEXT)
+        end = min(len(lines), idx + ERROR_CONTEXT + 1)
         if groups and start <= groups[-1][1]:
             groups[-1] = (groups[-1][0], max(groups[-1][1], end))
         else:
             groups.append((start, end))
     out: list[str] = []
     for start, end in groups:
-        out.extend(lines[start:end])
+        out.extend(_short(line) for line in lines[start:end])
         out.append("--")
     return out
 
@@ -96,7 +116,7 @@ def main(argv: list[str]) -> int:
         return 0
     path = Path(argv[1])
     if not path.is_file():
-        print(f"::error title=buildozer log::no log file at {path}")
+        print("::error title=buildozer log::no log file at %s" % path)
         return 0
 
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -105,8 +125,9 @@ def main(argv: list[str]) -> int:
         print("::error title=buildozer log::the build produced no output")
         return 0
 
-    commands = _chunks("buildozer errors", _error_block(lines))
-    commands += _chunks("buildozer tail", lines[-_TAIL_LINES:])
+    commands = _chunks(_TAIL_TITLE, [_short(l) for l in lines[-TAIL_LINES:]],
+                       TAIL_CHUNKS)
+    commands += _chunks(_ERROR_TITLE, _error_block(lines), ERROR_CHUNKS)
     for command in commands:
         print(command)
 
@@ -114,7 +135,7 @@ def main(argv: list[str]) -> int:
     if summary:
         with open(summary, "a", encoding="utf-8") as handle:
             handle.write("## buildozer log (tail)\n\n```\n")
-            handle.write("\n".join(lines[-_TAIL_LINES:]))
+            handle.write("\n".join(lines[-TAIL_LINES:]))
             handle.write("\n```\n")
     return 0
 

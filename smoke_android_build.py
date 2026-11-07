@@ -306,6 +306,10 @@ def section_failure_log():
 
         check("::error title=buildozer errors::" in out,
               "the failing lines must become an annotation")
+        # GitHub stores only ten annotations per step, so the tail has to be
+        # emitted before the keyword matches or it is dropped.
+        check(out.splitlines()[0].startswith("::error title=buildozer tail::"),
+              "the tail must be the first annotation")
         check("patches failed to apply" in out,
               "the annotation must quote the failure, not just say it failed")
         check("BuildInterruptingException: python3 failed" in out,
