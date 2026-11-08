@@ -167,7 +167,14 @@ def _side_bands(scene, sid, px, py, pa, eye, F, hc, iw, ih,
     tan_h = math.tan(const.FOV * 0.5)
     inv_iw = 1.0 / iw
     bands = []
-    for (ax1, ay1, ax2, ay2, mid_tex, sign, seg_len) in borders:
+    for (ax1, ay1, ax2, ay2, mid_tex, sign, seg_len, other) in borders:
+        # Two plates on the same level share a side face that has no height
+        # difference: drawing both would leave a seam along the bridge.  A
+        # level change keeps both faces — that is the visible step.
+        if (0 <= other < len(scene.floating) and scene.floating[other]
+                and scene.floor_h[other] == top
+                and scene.ceil_h[other] == bot):
+            continue
         # Outward-facing test: the contour's interior is on the ``sign`` side,
         # so the camera sees the face only from the other one.  A camera inside
         # the footprint (e.g. below the plate) therefore never draws a side.

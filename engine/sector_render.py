@@ -220,15 +220,18 @@ class SectorScene:
         return False
 
     def slab_borders(self, sid: int) -> list:
-        """Boundary quads of one slab: ``(x1, y1, x2, y2, mid, sign, length)``.
+        """Boundary quads of one slab.
 
-        ``(x1, y1) -> (x2, y2)`` is the direction ``_ensure_polys`` builds the
-        slab's own contour with, so a texture ``u`` measured from the edge
-        start runs the same way the wall path measures it.  ``sign`` is the
-        contour's winding (+1 = counter-clockwise): a side face is visible
-        when the camera sits on the *outside* of that contour, which is
-        ``cross(edge, cam - start) * sign < 0``.  Cached per scene — geometry
-        does not change while a party runs.
+        Each quad is ``(x1, y1, x2, y2, mid, sign, length, other)`` where
+        ``other`` is the sector on the far side of the linedef (-1 when the
+        border is one-sided).  ``(x1, y1) -> (x2, y2)`` is the direction
+        ``_ensure_polys`` builds the slab's own contour with, so a texture
+        ``u`` measured from the edge start runs the same way the wall path
+        measures it.  ``sign`` is the contour's winding (+1 =
+        counter-clockwise): a side face is visible when the camera sits on the
+        *outside* of that contour, which is ``cross(edge, cam - start) * sign
+        < 0``.  Cached per scene — geometry does not change while a party
+        runs.
         """
         cached = self._slab_border_cache.get(sid)
         if cached is not None:
@@ -250,13 +253,16 @@ class SectorScene:
             x1, y1 = verts[a].x, verts[a].y
             x2, y2 = verts[b].x, verts[b].y
             side = sides[ld.front] if on_front else sides[ld.back]
+            far = ld.back if on_front else ld.front
+            other = (sides[far].sector
+                     if 0 <= far < len(sides) else -1)
             mid = side.mid
             length = math.hypot(x2 - x1, y2 - y1) or 1.0
             area2 += x1 * y2 - x2 * y1
-            out.append((x1, y1, x2, y2, mid, length))
+            out.append((x1, y1, x2, y2, mid, length, other))
         sign = 1 if area2 >= 0.0 else -1
-        out = [(x1, y1, x2, y2, mid, sign, length)
-               for (x1, y1, x2, y2, mid, length) in out]
+        out = [(x1, y1, x2, y2, mid, sign, length, other)
+               for (x1, y1, x2, y2, mid, length, other) in out]
         self._slab_border_cache[sid] = out
         return out
 

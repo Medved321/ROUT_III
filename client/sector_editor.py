@@ -669,7 +669,7 @@ class SectorEditor:
                     return px, py
         return None
 
-    def _merge_loop_lines(self, idx: int) -> list[int]:
+    def _merge_loop_lines(self, idx: int, only: int | None = None) -> list[int]:
         """The surrounding sector's loop around ``idx``, for dissolving it.
 
         A thick room's outer face is a hole in the surrounding sector, not one
@@ -677,6 +677,10 @@ class SectorEditor:
         the wall body as a void, so the enclosing hole loop goes with it — and
         only when the surrounding sector keeps another loop (the old
         ``_polygon_alive`` protection).
+
+        ``only`` restricts the search to one surrounding sector, so a room
+        ringed by several hosts collects one hole loop per host instead of the
+        single smallest one.
         """
         point = self._interior_point(idx)
         if point is None:
@@ -684,7 +688,7 @@ class SectorEditor:
         sm = self.sm
         best = None
         for sid in range(len(sm.sectors)):
-            if sid == idx:
+            if sid == idx or (only is not None and sid != only):
                 continue
             for pts, area, lids in self._sector_loops_with_lines(sid):
                 if area <= 0 or not sm._point_in_loop(point[0], point[1], pts):
@@ -850,6 +854,36 @@ class SectorEditor:
                     return False       # a neighbour, not a ring
         return True
 
+    def _host_outside(self, idx: int, li: int) -> int | None:
+        """Nearest non-void sector just outside wall ``li`` of ``idx``.
+
+        The wall body of a thick room is a band of void ``WALL_THICKNESS``
+        wide; the host is the first sector the outward normal reaches after
+        crossing it.  Looking at a few distances instead of one tolerates a
+        band that is slightly wider at a corner.  ``None`` means there is no
+        host on that side (a real map edge, not a ring).
+        """
+        sm = self.sm
+        ld = sm.linedefs[li]
+        a, b = sm.verts[ld.v1], sm.verts[ld.v2]
+        dx, dy = b.x - a.x, b.y - a.y
+        ln = math.hypot(dx, dy)
+        if ln <= 1e-9:
+            return None
+        mx, my = (a.x + b.x) * 0.5, (a.y + b.y) * 0.5
+        for sign in (1.0, -1.0):
+            nx, ny = -dy / ln * sign, dx / ln * sign
+            if sm.find_sector_at(mx + nx * 0.5, my + ny * 0.5) == idx:
+                continue
+            for k in range(1, 512):
+                sid = sm.find_sector_at(mx + nx * k, my + ny * k)
+                if sid == idx:
+                    break
+                if sid >= 0:
+                    return sid
+            break
+        return None
+
     def _swap_plate_heights(self, idx: int) -> None:
         """Heights of a room become the plate's: old ceiling on top.
 
@@ -874,10 +908,12 @@ class SectorEditor:
         two-sided border with the one hosting sector, and the heights swap so
         the old ceiling is the walkable top.  Everything is one undo step.
 
-        Both directions refuse instead of guessing when the sector is not a
-        candidate: borders shared with several sectors, a plate nested in a
-        plate, no border at all, or a wall band that is not empty.  A refusal
-        leaves the map untouched.
+        A sector that already has shared borders only swaps heights: several
+        hosts and a neighbouring plate are fine, and the neighbours' heights
+        are never adjusted silently.  A ringed room loses its wall body: every
+        inner line is bound to the nearest non-void sector outside the band,
+        and the surrounding hole loop(s) go with it.  Everything is one undo
+        step; a refusal leaves the map untouched.
         """
         if not (0 <= idx < len(self.sectors)):
             return ["сектор не выделен"]
@@ -908,48 +944,45 @@ class SectorEditor:
                     f"сделать"]
 
         if shared:
-            # Only the height swap is left to do when the border is already a
-            # portal to ONE non-floating host; anything else would have to
-            # invent a host, and that is a refusal, not a guess.
-            hosts = {sid for li in shared for sid in self._line_sides(
-                sm.linedefs[li]) if 0 <= sid and sid != idx}
-            if own or len(hosts) != 1:
-                return [f"сектор {idx}: границы общие с несколькими секторами — "
-                        f"плиту не сделать"]
-            host = hosts.pop()
-            if sm.sectors[host].floating:
-                return [f"сектор {idx}: несущий сектор {host} сам парит"]
+            # Already a portal to the world: only the heights swap.  Several
+            # hosts and a floating neighbour are supported; no host is
+            # adjusted behind the author's back.
             self._record()
             self._swap_plate_heights(idx)
             self._after_mutate()
             return [f"сектор {idx}: парит (высоты обменяны)"]
 
-        outer = [li for li in self._merge_loop_lines(idx) if li >= 0]
-        if not outer or set(outer) & set(own):
-            return [f"сектор {idx}: нет стены-кольца с несущим сектором — "
-                    f"плиту не сделать"]
-        hosts = set()
-        for li in outer:
-            f, b = self._line_sides(sm.linedefs[li])
-            if f < 0 or b >= 0:
-                return [f"сектор {idx}: стена-кольцо не односторонняя — "
-                        f"плиту не сделать"]
-            hosts.add(f)
-        if len(hosts) != 1:
-            return [f"сектор {idx}: у кольца несколько несущих секторов — "
-                    f"плиту не сделать"]
-        host = hosts.pop()
-        if host == idx or sm.sectors[host].floating:
-            return [f"сектор {idx}: несущий сектор {host} сам парит"]
         if not self._ring_is_void(idx, own):
             return [f"сектор {idx}: вокруг стены не пустота — плиту не "
                     f"сделать"]
 
+        host_by_line: dict[int, int] = {}
+        for li in own:
+            host = self._host_outside(idx, li)
+            if host is None:
+                return [f"сектор {idx}: за стеной нет несущего сектора — "
+                        f"плиту не сделать"]
+            host_by_line[li] = host
+        hosts = set(host_by_line.values())
+
+        outer: set[int] = set()
+        for host in hosts:
+            loop = self._merge_loop_lines(idx, only=host)
+            if not loop:
+                return [f"сектор {idx}: несущий сектор {host} не образует "
+                        f"кольца — плиту не сделать"]
+            outer.update(loop)
+        if not outer or set(outer) & set(own):
+            return [f"сектор {idx}: нет стены-кольца с несущим сектором — "
+                    f"плиту не сделать"]
+
         self._record()
         # The inner contour becomes the plate's border: its own side keeps the
-        # plate's texture, the cloned side belongs to the host and closes the
-        # host's hole in the opposite direction (a back side runs v2->v1).
+        # plate's texture, the cloned side belongs to the nearest host and
+        # closes that host's hole in the opposite direction (a back side runs
+        # v2->v1).
         for li in own:
+            host = host_by_line[li]
             ld = sm.linedefs[li]
             if 0 <= ld.back < len(sm.sidedefs) and \
                     sm.sidedefs[ld.back].sector == idx:
@@ -957,20 +990,6 @@ class SectorEditor:
             else:
                 ld.back = self._clone_side(ld.front, host)
         self._swap_plate_heights(idx)
-        # adjust host to contain the plate vertically if needed
-        try:
-            h = sm.sectors[host]
-            p = sm.sectors[idx]
-            changed = False
-            if h.floor_h > p.ceil_h:
-                h.floor_h = p.ceil_h
-                changed = True
-            if h.ceil_h < p.floor_h:
-                h.ceil_h = p.floor_h
-                changed = True
-            # if nothing changed but validation would fail, try to be lenient
-        except Exception:
-            pass
         # last, so its single diff flush covers the whole operation
         self._drop(lines=set(outer),
                    sides={li_side for li in outer

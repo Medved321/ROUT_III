@@ -1090,6 +1090,23 @@ def test_set_sector_floating():
     assert len(ed.lines) == n_lines, "no geometry may be touched here"
     assert not ed.validate(), ed.validate()
 
+    # several hosts plus a ring are allowed now: the shared-border path only
+    # swaps heights and never touches the drawing
+    ed = SectorEditor(new_room(1600, 1600))
+    sid, errs = ed.sector_from_contour(_contour_box(ed, 400, 400, 800, 800),
+                                       floor_h=0, ceil_h=128)
+    assert sid == 1 and not errs, errs
+    inner = _inner_lines(ed, 1)
+    assert ed.set_two_sided(inner[0], True, back_sector=0) is not None
+    n_lines = len(ed.lines)
+    hist = len(ed._history)
+    assert ed.set_sector_floating(1, True)
+    assert ed.sectors[1].floating
+    assert (ed.sectors[1].floor_h, ed.sectors[1].ceil_h) == (128, 0)
+    assert len(ed.lines) == n_lines, "shared-border path must not touch geometry"
+    assert len(ed._history) == hist + 1
+    assert not ed.validate(), ed.validate()
+
     # refusals never touch the map
     def unchanged(fn):
         snap = ed.sm.to_json()
@@ -1100,35 +1117,24 @@ def test_set_sector_floating():
         assert len(ed._history) == hist0, notes
         return notes
 
-    ed = SectorEditor(new_room(1600, 1600))
-    sid, errs = ed.sector_from_contour(_contour_box(ed, 400, 400, 800, 800),
-                                       floor_h=0, ceil_h=128)
-    assert sid == 1 and not errs, errs
-    # one shared border plus the ring: borders belong to more than one sector
-    inner = _inner_lines(ed, 1)
-    assert ed.set_two_sided(inner[0], True, back_sector=0) is not None
-    notes = unchanged(lambda: ed.set_sector_floating(1, True))
-    assert "несколькими" in notes[0], notes
-
     # a sector with no walls at all cannot become a plate
     ed = SectorEditor(new_room(1600, 1600))
     sid = ed.add_sector(floor_h=0, ceil_h=128)
     notes = unchanged(lambda: ed.set_sector_floating(sid, True))
     assert "нет границы" in notes[0], notes
 
-    # a plate nested in a plate is refused too
-    ed = SectorEditor(new_room(1600, 1600))
-    sid, errs = ed.sector_from_contour(_contour_box(ed, 400, 400, 800, 800),
-                                       floor_h=0, ceil_h=128)
-    assert sid == 1 and not errs, errs
-    assert ed.set_sector_floating(1, True)
-    sid2, errs = ed.sector_from_contour(_contour_box(ed, 500, 500, 700, 700),
-                                        floor_h=0, ceil_h=128)
-    assert sid2 == 2 and not errs, errs
-    notes = unchanged(lambda: ed.set_sector_floating(2, True))
-    assert "парит" in notes[0], notes
-    # the server-side model refuses a plate on a plate as well
-    assert any("overlap" in e for e in ed.validate()), ed.validate()
+    # a plate sharing a border with another plate is allowed: the shared
+    # path swaps heights only, so a bridge/two-plate layout round-trips
+    from smoke_sector_model import make_plate_bridge
+    ed = SectorEditor(make_plate_bridge())
+    assert [s.floating for s in ed.sectors] == [False, True, True]
+    assert ed.set_sector_floating(2, False)
+    assert not ed.sectors[2].floating
+    assert not ed.validate(), ed.validate()
+    assert ed.set_sector_floating(2, True)
+    assert ed.sectors[2].floating
+    assert (ed.sectors[2].floor_h, ed.sectors[2].ceil_h) == (80, 64)
+    assert not ed.validate(), ed.validate()
     print("  set floating     OK")
 
 

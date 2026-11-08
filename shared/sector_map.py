@@ -476,8 +476,11 @@ class SectorMap:
                     f"linedef {i}: door lock differs between sides "
                     f"(«{ft}» / «{bt}»)")
 
-        # Floating slabs: every border must be a two-sided portal to exactly
-        # one ordinary sector, which has to contain the slab vertically.
+        # Floating slabs: the topology is free (a plate may share a border,
+        # abut a wall from the side, span several sectors or another plate).
+        # The one data invariant that matters is that the ``solid`` flag is
+        # meaningless on a plate border: ``line_blocks`` ignores it, so it is
+        # reported instead of silently doing nothing.
         for i, ld in enumerate(self.linedefs):
             if not (0 <= ld.front < n_sides):
                 continue
@@ -486,73 +489,9 @@ class SectorMap:
                   if 0 <= ld.back < n_sides else -1)
             f_float = 0 <= fs < n_secs and self.sectors[fs].floating
             b_float = 0 <= bs < n_secs and self.sectors[bs].floating
-            if not (f_float or b_float):
-                continue
-            if ld.back < 0 or bs < 0:
-                errs.append(
-                    f"linedef {i}: floating sector has a one-sided border")
-                continue
-            if f_float and b_float:
-                # Allow doors between floating sectors; otherwise forbid.
-                if ld.special != SPECIAL_DOORS:
-                    errs.append(
-                        f"linedef {i}: two floating sectors share a border")
-                    continue
-            if ld.solid:
+            if (f_float or b_float) and ld.solid:
                 errs.append(
                     f"linedef {i}: solid flag on a floating sector border")
-            slab = fs if f_float else bs
-            host = bs if f_float else fs
-            if not (0 <= host < n_secs):
-                continue
-            slab_s = self.sectors[slab]
-            host_s = self.sectors[host]
-            if not (host_s.floor_h <= slab_s.ceil_h
-                    and host_s.ceil_h >= slab_s.floor_h):
-                errs.append(
-                    f"sector {slab}: slab {slab_s.ceil_h}..{slab_s.floor_h}"
-                    f" does not fit inside sector {host}"
-                    f" {host_s.floor_h}..{host_s.ceil_h}")
-
-        # Slabs may not overlap or nest in plan view (non-goal: no stacked
-        # platforms), so the footprint of each floating sector is unique.
-        floats = [i for i, s in enumerate(self.sectors) if s.floating]
-        if floats:
-            polys = self._ensure_polys()
-            if len(floats) > 1:
-                for ai in range(len(floats)):
-                    for bi in range(ai + 1, len(floats)):
-                        a, b = floats[ai], floats[bi]
-                        if self._loops_overlap(polys[a], polys[b]):
-                            errs.append(
-                                f"sectors {a} and {b}: floating slabs overlap")
-            # A regular sector carved inside a floating sector also counts as
-            # nesting/overlap for the purposes of this validation, but a
-            # floating sector sitting on its non-floating host is fine.
-            for fi in floats:
-                for si in range(len(self.sectors)):
-                    if si == fi or self.sectors[si].floating:
-                        continue
-                    if not (polys[fi] and polys[si]):
-                        continue
-                    if not self._loops_overlap(polys[fi], polys[si]):
-                        continue
-                    # If the floating sector is nested inside this non-floating
-                    # sector and shares borders with it as host, that's normal.
-                    # Check if this non-floating sector is a host of the floating slab.
-                    is_host = False
-                    for ld in self.linedefs:
-                        if not (0 <= ld.front < n_sides and 0 <= ld.back < n_sides):
-                            continue
-                        fs = self.sidedefs[ld.front].sector
-                        bs = self.sidedefs[ld.back].sector
-                        if (fs == fi and bs == si) or (bs == fi and fs == si):
-                            is_host = True
-                            break
-                    if is_host:
-                        continue
-                    errs.append(f"sectors {fi} and {si}: floating slabs overlap")
-                    break
 
         if not any(t.type == "player1" for t in self.things):
             errs.append("map has no player1 spawn")
@@ -570,7 +509,9 @@ class SectorMap:
                         f"thing {i}: key «{t.type}» is outside every sector")
                 continue
             inner = containing[0]
-            if self.sectors[inner].floating:
+            ordinary = [si for si in containing
+                        if not self.sectors[si].floating]
+            if not ordinary:
                 errs.append(
                     f"thing {i}: stands on floating sector {inner}")
                 continue
@@ -619,21 +560,28 @@ class SectorMap:
         if extra_blocked and li in extra_blocked:
             return True
         ld = self.linedefs[li]
+        n_sides = len(self.sidedefs)
+        n_secs = len(self.sectors)
+        # A slab border is not a wall — not even a one-sided one: whether an
+        # actor fits under it or can step onto it is a question about the
+        # actor, answered by ``support_at``, not a property of the line
+        # (design §3).
+        if 0 <= ld.front < n_sides:
+            fs = self.sidedefs[ld.front].sector
+            if 0 <= fs < n_secs and self.sectors[fs].floating:
+                return False
+        if 0 <= ld.back < n_sides:
+            bs = self.sidedefs[ld.back].sector
+            if 0 <= bs < n_secs and self.sectors[bs].floating:
+                return False
         if ld.back < 0:
             return True
-        n_sides = len(self.sidedefs)
         if not (0 <= ld.front < n_sides and 0 <= ld.back < n_sides):
             return True
-        n_secs = len(self.sectors)
         fs = self.sidedefs[ld.front].sector
         bs = self.sidedefs[ld.back].sector
         if not (0 <= fs < n_secs and 0 <= bs < n_secs):
             return True
-        # A slab border is not a wall: whether an actor fits under it or can
-        # step onto it is a question about the actor, answered by
-        # ``support_at``, not a property of the line (design §3).
-        if self.sectors[fs].floating or self.sectors[bs].floating:
-            return False
         if ld.flags & LINE_FLAG_SOLID:
             return True
         return abs(self.sectors[fs].floor_h
@@ -687,74 +635,207 @@ class SectorMap:
             return self._polys
         n_secs = len(self.sectors)
         n_sides = len(self.sidedefs)
-        # Directed boundary segments per sector: start vertex -> end vertices.
-        outs: list[dict[int, list[int]]] = [dict() for _ in range(n_secs)]
-        for ld in self.linedefs:
-            if ld.v1 == ld.v2:
-                continue
-            if 0 <= ld.front < n_sides:
-                s = self.sidedefs[ld.front].sector
-                if 0 <= s < n_secs:
-                    other = (self.sidedefs[ld.back].sector
-                             if 0 <= ld.back < n_sides else -1)
-                    if not self._border_hidden(s, other):
-                        outs[s].setdefault(ld.v1, []).append(ld.v2)
-            if 0 <= ld.back < n_sides:
-                s = self.sidedefs[ld.back].sector
-                if 0 <= s < n_secs:
-                    other = self.sidedefs[ld.front].sector
-                    if not self._border_hidden(s, other):
-                        outs[s].setdefault(ld.v2, []).append(ld.v1)
+        floating = [bool(getattr(s, "floating", False))
+                    for s in self.sectors]
+
+        def _edges(skip_floating_borders: bool):
+            # Directed boundary segments per sector:
+            # start vertex -> [(end vertex, sector on the other side)].
+            outs: list[dict[int, list[tuple[int, int]]]] = [
+                {} for _ in range(n_secs)]
+            n_verts = len(self.verts)
+            for ld in self.linedefs:
+                if ld.v1 == ld.v2:
+                    continue
+                if not (0 <= ld.v1 < n_verts and 0 <= ld.v2 < n_verts):
+                    # Malformed input: validate() reports it, geometry just
+                    # has to stay crash-free.
+                    continue
+                fsec = (self.sidedefs[ld.front].sector
+                        if 0 <= ld.front < n_sides else -1)
+                bsec = (self.sidedefs[ld.back].sector
+                        if 0 <= ld.back < n_sides else -1)
+                if 0 <= fsec < n_secs:
+                    if not (skip_floating_borders and not floating[fsec]
+                            and 0 <= bsec < n_secs and floating[bsec]):
+                        outs[fsec].setdefault(ld.v1, []).append((ld.v2, bsec))
+                if 0 <= bsec < n_secs:
+                    if not (skip_floating_borders and not floating[bsec]
+                            and 0 <= fsec < n_secs and floating[fsec]):
+                        outs[bsec].setdefault(ld.v2, []).append((ld.v1, fsec))
+            return outs
+
+        def _build(outs):
+            loops: list[tuple[int, list[int], list[int]]] = []
+            had_open = False
+            verts = self.verts
+            for s in range(n_secs):
+                m = outs[s]
+                used = {k: [False] * len(v) for k, v in m.items()}
+                for start in list(m.keys()):
+                    for first, _o in enumerate(m[start]):
+                        if used[start][first]:
+                            continue
+                        path = [start]
+                        others: list[int] = []
+                        cur = start
+                        ei = first
+                        closed = False
+                        while True:
+                            nxt, other = m[cur][ei]
+                            used[cur][ei] = True
+                            others.append(other)
+                            if nxt == start:
+                                closed = True
+                                break
+                            path.append(nxt)
+                            cand = m.get(nxt)
+                            if not cand:
+                                break
+                            dx_in = verts[nxt].x - verts[cur].x
+                            dy_in = verts[nxt].y - verts[cur].y
+                            # Trace faces, not a random walk: at a vertex where
+                            # a plate border touches the host outline the inner
+                            # path and the outer path share the vertex, and
+                            # popping an arbitrary edge glued the two together.
+                            # The leftmost turn keeps each loop on its own side.
+                            best = -1
+                            best_turn = 0.0
+                            for j, (w, _ow) in enumerate(cand):
+                                if used[nxt][j]:
+                                    continue
+                                dx_out = verts[w].x - verts[nxt].x
+                                dy_out = verts[w].y - verts[nxt].y
+                                turn = math.atan2(
+                                    dx_in * dy_out - dy_in * dx_out,
+                                    dx_in * dx_out + dy_in * dy_out)
+                                if best < 0 or turn > best_turn:
+                                    best_turn = turn
+                                    best = j
+                            if best < 0:
+                                break
+                            cur = nxt
+                            ei = best
+                        if not closed or len(path) < 3:
+                            had_open = True
+                            continue
+                        loops.append((s, path, others))
+            return loops, had_open
+
+        # Prefer the ordinary borders: for a plate nested in a host they are
+        # already the host's complete outer contour, and the plate border does
+        # not carve a hole.  When a plate abuts a wall from the side the
+        # ordinary borders are an open path, so the full set is used and only
+        # the genuine plate-covered holes are dropped afterwards.
+        loops, had_open = _build(_edges(True))
+        if had_open and any(floating):
+            loops, _ = _build(_edges(False))
+        loops = self._drop_plate_holes(loops, floating)
+
         verts = self.verts
         polys: list[list[tuple[list[tuple[float, float]], tuple[float, float, float, float], float]]] = [
             [] for _ in range(n_secs)
         ]
-        for s in range(n_secs):
-            m = outs[s]
-            while True:
-                start = next((k for k, v in m.items() if v), None)
-                if start is None:
-                    break
-                path = [start]
-                cur = start
-                closed = False
-                while True:
-                    nxt_list = m.get(cur)
-                    if not nxt_list:
-                        break
-                    nxt = nxt_list.pop()
-                    if nxt == start:
-                        closed = True
-                        break
-                    path.append(nxt)
-                    cur = nxt
-                if not closed or len(path) < 3:
-                    continue  # open contour: drop (spec: validation catches it)
-                points = [(verts[i].x, verts[i].y) for i in path]
-                xs = [p[0] for p in points]
-                ys = [p[1] for p in points]
-                bbox = (min(xs), min(ys), max(xs), max(ys))
-                area2 = 0.0
-                np_ = len(points)
-                for i in range(np_):
-                    x1, y1 = points[i]
-                    x2, y2 = points[(i + 1) % np_]
-                    area2 += x1 * y2 - x2 * y1
-                polys[s].append((points, bbox, abs(area2) * 0.5))
+        for s, path, _others in loops:
+            points = [(verts[i].x, verts[i].y) for i in path]
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            bbox = (min(xs), min(ys), max(xs), max(ys))
+            area2 = 0.0
+            np_ = len(points)
+            for i in range(np_):
+                x1, y1 = points[i]
+                x2, y2 = points[(i + 1) % np_]
+                area2 += x1 * y2 - x2 * y1
+            polys[s].append((points, bbox, abs(area2) * 0.5))
         self._polys = polys
         return polys
 
-    def _border_hidden(self, s: int, other: int) -> bool:
-        """True when this directed edge must not shape sector ``s``'s loop.
+    @staticmethod
+    def _point_on_loop(px: float, py: float,
+                       loop: list[tuple[float, float]],
+                       eps: float = 1e-6) -> bool:
+        """True when ``(px, py)`` lies on the boundary of ``loop``."""
+        e2 = eps * eps
+        n = len(loop)
+        for i in range(n):
+            x1, y1 = loop[i]
+            x2, y2 = loop[(i + 1) % n]
+            if _dist2_point_seg(px, py, x1, y1, x2, y2) <= e2:
+                return True
+        return False
 
-        A floating slab's border is a hole in the *slab's* outline, not in its
-        host: dropping the edge from the host's directed edges keeps the host
-        footprint whole, so the floor under the slab still exists (design §2).
-        The slab's own loop is still built from its side of the border.
+    def _point_in_loops(self, px: float, py: float,
+                        loops: list[list[tuple[float, float]]]) -> bool:
+        """True when the point is inside-or-on a sector's footprint."""
+        inside = 0
+        for loop in loops:
+            if self._point_on_loop(px, py, loop):
+                return True
+            if self._point_in_loop(px, py, loop):
+                inside += 1
+        return bool(inside & 1)
+
+    def _drop_plate_holes(self, loops, floating):
+        """Remove host holes that are only the outline of a covering plate.
+
+        A plate nested in a host adds a closed inner loop to the host's
+        outline.  That loop is not a real hole: the host's floor has to keep
+        spanning the footprint underneath, so it is dropped.  A hole that is
+        not covered by one plate, or that shares an edge with an ordinary
+        sector (a real room inside a room), is kept.
         """
-        return (not self.sectors[s].floating
-                and 0 <= other < len(self.sectors)
-                and self.sectors[other].floating)
+        if not any(floating):
+            return loops
+        points = [[(self.verts[i].x, self.verts[i].y) for i in path]
+                  for _s, path, _others in loops]
+        float_loops: dict[int, list[list[tuple[float, float]]]] = {}
+        by_sector: dict[int, list[int]] = {}
+        for idx, (s, _path, _others) in enumerate(loops):
+            by_sector.setdefault(s, []).append(idx)
+            if floating[s]:
+                float_loops.setdefault(s, []).append(points[idx])
+        if not float_loops:
+            return loops
+
+        keep = [True] * len(loops)
+        for s, idxs in by_sector.items():
+            if floating[s] or len(idxs) < 2:
+                continue
+            for li in idxs:
+                pts = points[li]
+                # Inner (hole) loop: a vertex lies inside another loop of the
+                # same sector.  Outer loops have no vertex inside a sibling.
+                inner = False
+                for lj in idxs:
+                    if lj == li:
+                        continue
+                    for vx, vy in pts:
+                        if self._point_in_loop(vx, vy, points[lj]):
+                            inner = True
+                            break
+                    if inner:
+                        break
+                if not inner:
+                    continue
+                # A real hole borders an ordinary neighbour; a plate outline
+                # only ever borders the plate (or the void outside it).
+                if any(0 <= o < len(floating) and not floating[o]
+                       for o in loops[li][2]):
+                    continue
+                samples = list(pts)
+                n = len(pts)
+                for k in range(n):
+                    x1, y1 = pts[k]
+                    x2, y2 = pts[(k + 1) % n]
+                    samples.append(((x1 + x2) * 0.5, (y1 + y2) * 0.5))
+                covered = any(
+                    all(self._point_in_loops(px, py, fl)
+                        for px, py in samples)
+                    for fl in float_loops.values())
+                if covered:
+                    keep[li] = False
+        return [loop for loop, k in zip(loops, keep) if k]
 
     def has_polygon(self, sid: int) -> bool:
         """True when sector ``sid`` has at least one closed contour loop.
@@ -875,31 +956,6 @@ class SectorMap:
             if not s.floating:
                 return s.floor_h
         return 0
-
-    def _loops_overlap(self, loops_a, loops_b) -> bool:
-        """True when two sector polygon sets share plan-view area."""
-        for points_a, bbox_a, _ in loops_a:
-            for points_b, bbox_b, _ in loops_b:
-                if (bbox_a[0] > bbox_b[2] or bbox_b[0] > bbox_a[2]
-                        or bbox_a[1] > bbox_b[3] or bbox_b[1] > bbox_a[3]):
-                    continue
-                if self._point_in_loop(points_a[0][0], points_a[0][1],
-                                       points_b):
-                    return True
-                if self._point_in_loop(points_b[0][0], points_b[0][1],
-                                       points_a):
-                    return True
-                na = len(points_a)
-                nb = len(points_b)
-                for i in range(na):
-                    ax, ay = points_a[i]
-                    bx, by = points_a[(i + 1) % na]
-                    for j in range(nb):
-                        cx, cy = points_b[j]
-                        dx, dy = points_b[(j + 1) % nb]
-                        if _segments_cross(ax, ay, bx, by, cx, cy, dx, dy):
-                            return True
-        return False
 
     def get_spawn_points(self) -> list[tuple[float, float]]:
         return [(t.x, t.y) for t in self.things if t.type == "player1"]

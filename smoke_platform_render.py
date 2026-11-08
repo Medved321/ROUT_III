@@ -625,6 +625,37 @@ def test_enemy_behind_plate_not_drawn():
     print("  enemy behind plate OK")
 
 
+def _bridge_shared_bands(level_change=False):
+    """Bands of the face two plates share, seen from one fixed camera."""
+    from engine import platform_render
+    from smoke_sector_model import make_plate_bridge
+
+    sm = make_plate_bridge()
+    if level_change:
+        sm.sectors[2].floor_h = 88
+        sm.sectors[2].ceil_h = 72
+        sm.invalidate()
+    assert sm.validate() == [], sm.validate()
+    scene = _scene(sm)
+    iw = 64
+    bands = platform_render._side_bands(
+        scene, 2, 64.0, 256.0, 0.0, 72, 750.0, 350.0, iw, 700,
+        [0] * iw, [700] * iw, [900.0] * iw, 900)
+    shared = {(256.0, 128.0), (256.0, 384.0)}
+    return [b for b in bands
+            if {(b[6], b[7]), (b[8], b[9])} == shared]
+
+
+def test_bridge_seam():
+    """Two equal plates sharing a side are one slab, not two with a seam."""
+    # Same top and underside: the shared face is interior to one continuous
+    # slab.  Drawing it would put a vertical wall down the middle of a bridge.
+    assert _bridge_shared_bands() == [], "the shared face must not be drawn"
+    # A level change is a real riser, and that one has to stay visible.
+    assert _bridge_shared_bands(level_change=True), "the step must be drawn"
+    print("  bridge seam       OK")
+
+
 def main():
     _init()
     test_scene_marks_slab()
@@ -637,6 +668,7 @@ def main():
     test_side_uses_slab_texture()
     test_near_wall_keeps_column()
     test_two_plates_depth_order()
+    test_bridge_seam()
     test_player_z_raises_camera()
     test_floor_z_moves_only_vertical()
     test_sprite_occlusion_rules()

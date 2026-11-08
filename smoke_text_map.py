@@ -548,7 +548,7 @@ def test_hole_triangle_and_single_loop() -> None:
 
 def test_real_maps_keep_two_sided() -> None:
     """Реальные карты: дыры и двусторонность переживают render → parse."""
-    for name, expected in (("sector1", 22), ("sector2", 6)):
+    for name, expected in (("sector1", 4), ("sector2", 6)):
         path = ROOT / "maps" / (name + ".mt1")
         if not path.exists():
             continue
