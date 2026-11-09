@@ -230,12 +230,22 @@ pygame 2.1.0, а проект — Python 3.12 и pygame ≥ 2.5:
 - `pygame` — 2.6.1 (тот же рецепт, что у p4a, с поднятой версией);
 - `python3` и `hostpython3` — **оба** 3.12.14 (p4a сравнивает их и отказывается
   собирать при расхождении). Патчи p4a подключаются по абсолютному пути в
-  каталог его собственного рецепта: имена в локальном каталоге p4a ищет
-  относительно локального рецепта, а своего `patches/` у нас нет. Все четыре
-  патча (`pyconfig_detection`, `reproducible-buildinfo`,
-  `cpython-311-ctypes-find-library`, `fix_ensurepip`) проверены на CPython
-  3.12.14; `py3.8.1_fix_cortex_a8` подключается только при наличии `lld` и для
-  arm64 не нужен.
+  каталог его собственного рецепта: имена p4a ищет относительно локального
+  рецепта. Все четыре патча p4a (`pyconfig_detection`,
+  `reproducible-buildinfo`, `cpython-311-ctypes-find-library`,
+  `fix_ensurepip`) проверены на CPython 3.12.14; `py3.8.1_fix_cortex_a8`
+  подключается только при наличии `lld` и для arm64 не нужен.
+
+  Один патч — **наш**, `tools/android/recipes/python3/patches/
+  grp-no-group-enumeration.patch`: `Modules/grpmodule.c` в 3.12 зовёт
+  `setgrent()`/`getgrent()`/`endgrent()` безусловно, а configure эту функцию
+  даже не проверяет. bionic объявляет их только с API 26, а сборка идёт под
+  `ndk_api = 24`, поэтому модуль падал с `call to undeclared function
+  'setgrent'`. Патч возвращает пустой список из `grp.getgrall()` ниже API 26
+  (обходить в Android нечего), а `getgrgid()`/`getgrnam()` продолжают
+  работать через bionic-вызовы API 24. `Modules/pwdmodule.c` патча не требует:
+  его `getpwall()` уже закрыт `HAVE_GETPWENT`, который configure на API 24 не
+  находит.
 
 Точка входа `main.py` в корне — тонкий двойник `run_client.py`: ставит
 `SDL_TOUCH_MOUSE_EVENTS=0` до импорта pygame, `os.chdir` к распакованному

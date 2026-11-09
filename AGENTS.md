@@ -1164,7 +1164,15 @@ pygame 2.1.0, а проект — Python 3.12 и pygame ≥ 2.5:
 - `python3` и `hostpython3` — **оба** 3.12.14 (p4a сравнивает версии и
   отказывается собирать при расхождении). Патчи p4a подключаются абсолютным
   путём в его собственный каталог рецепта: относительные имена p4a ищет в
-  локальном каталоге, где своего `patches/` нет.
+  локальном каталоге.
+
+Свой патч у рецепта один — `patches/grp-no-group-enumeration.patch`. В CPython
+3.12 `Modules/grpmodule.c` зовёт `setgrent()`/`getgrent()`/`endgrent()`
+безусловно, configure их не проверяет, а bionic объявляет эти функции только с
+API 26 — при `ndk_api = 24` сборка падала на `call to undeclared function
+'setgrent'`. Патч отдаёт пустой список из `grp.getgrall()` ниже API 26;
+`getgrgid()`/`getgrnam()` остаются рабочими. `pwdmodule.c` не патчится: его
+`getpwall()` уже закрыт `HAVE_GETPWENT`.
 
 Три правила платформы, которые нельзя нарушать молча:
 

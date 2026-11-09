@@ -137,6 +137,21 @@ def section_recipes():
     pg_text = (base / "pygame" / "__init__.py").read_text(encoding="utf-8")
     check("files.pythonhosted.org" in pg_text,
           "pygame recipe must use the sdist (the tag tarball has no generated C)")
+
+    # CPython 3.12's grpmodule.c calls setgrent()/getgrent()/endgrent()
+    # unconditionally; bionic only declares them from API 26 while the APK is
+    # built against API 24, so the module fails with "call to undeclared
+    # function".  A project patch must exist and be wired into the recipe.
+    patch = base / "python3" / "patches" / "grp-no-group-enumeration.patch"
+    check(patch.is_file(), "CPython grpmodule build patch is missing")
+    ptext = patch.read_text(encoding="utf-8")
+    check("--- a/Modules/grpmodule.c" in ptext
+          and "+++ b/Modules/grpmodule.c" in ptext,
+          "grp patch must be a -p1 diff of Modules/grpmodule.c")
+    check("__ANDROID_API__ < 26" in ptext and "setgrent" in ptext,
+          "grp patch must gate the group enumeration on the API level")
+    check("_LOCAL_PATCHES" in text and "join(here, name)" in text,
+          "python3 recipe must apply the project patch from its own directory")
     print("recipes: pygame 2.6.1 (sdist), python/hostpython 3.12 agree OK")
 
 
