@@ -289,6 +289,10 @@ def section_workflow():
     check("tee buildozer.log" in flow, "a failed build must leave a log to read")
     check("report_build_log.py" in flow, "the log must reach the check annotations")
     check("rout3-buildozer-log" in flow, "the raw log must be downloadable")
+    # A change to the reporter itself must rebuild too; otherwise the next
+    # failure is still diagnosed by the previous script.
+    check('".github/scripts/**"' in flow,
+          "editing the failure reporter must trigger a build")
     print("CI workflow builds and uploads the debug APK OK")
 
 

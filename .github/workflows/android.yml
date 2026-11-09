@@ -24,6 +24,9 @@ on:
       - "buildozer.spec"
       - "tools/android/**"
       - ".github/workflows/android.yml"
+      # The reporter only runs inside this workflow, so a change to it must
+      # rebuild: otherwise the next failure is diagnosed by the old script.
+      - ".github/scripts/**"
   workflow_dispatch:
 
 concurrency:
