@@ -301,21 +301,26 @@ def section_failure_log():
     script = ROOT / ".github/scripts/report_build_log.py"
     check(script.is_file(), "the failure reporter is missing")
 
-    log = "\n".join([
-        "Running 'make'",
-        "  CC  Modules/posixmodule.c",
-        "patch: **** Only garbage was found in the patch input.",
-        "Error: one of the patches failed to apply",
-        *(f"line {i} of ordinary build chatter" for i in range(200)),
-        "Exception in thread background thread for pid 42:",
-        "Traceback (most recent call last):",
-        '  File "toolchain.py", line 1, in <module>',
-        "BuildInterruptingException: python3 failed",
+    # ``[DEBUG]`` lines are long.  With a tail window of 150 lines that is far
+    # more than four annotations hold, so the chunks must be taken from the
+    # *end* of the window; otherwise the verdict below is never reached.
+    chatter = "".join(f"[DEBUG]   [arm64-v8a] Compile : thing{i}.c" + " " * 400
+                      + "x\n" for i in range(400))
+    log = "".join([
+        "Running 'make'\n",
+        "  CC  Modules/posixmodule.c\n",
+        "patch: **** Only garbage was found in the patch input.\n",
+        "Error: one of the patches failed to apply\n",
+        chatter,
+        "Exception in thread background thread for pid 42:\n",
+        "Traceback (most recent call last):\n",
+        '  File "toolchain.py", line 1, in <module>\n',
+        "BuildInterruptingException: python3 failed\n",
         # The marker sits past the old 300-char cut, so the annotation only
         # reaches it when long lines keep enough of themselves.
-        ("E" * 650) + "TAIL_MARKER",
+        ("E" * 650) + "TAIL_MARKER\n",
         # buildozer dumps its environment on failure; all of it is noise.
-        *(f"#     ENV_VAR_{i} = 'value'" for i in range(150)),
+        "".join(f"#     ENV_VAR_{i} = 'value'\n" for i in range(150)),
         "# Command failed: buildozer -v android debug",
     ])
     with tempfile.TemporaryDirectory() as tmp:
@@ -346,8 +351,14 @@ def section_failure_log():
               "the environment dump must not push the traceback out")
         check("# Command failed: buildozer" in out,
               "the final verdict must survive the tail window")
+        tail_cmds = [line for line in out.splitlines()
+                     if line.startswith("::error title=buildozer tail::")]
+        check(any("Command failed: buildozer" in line for line in tail_cmds),
+              "the tail must reach the verdict, not stop in the middle of the log")
         check("%0A" in out,
               "a multiline annotation must be escaped, not dropped")
+        check(len(out.splitlines()) <= 10,
+              "GitHub stores ten annotations per step; emitting more loses the tail")
         check(all(line.startswith("::error") for line in out.splitlines()),
               "every emitted line must be a workflow command")
         summary_text = summary.read_text(encoding="utf-8") if summary.is_file() else ""

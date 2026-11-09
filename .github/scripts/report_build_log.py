@@ -109,8 +109,15 @@ def _strip_environment(lines: list[str]) -> list[str]:
     return out
 
 
-def _chunks(title: str, lines: list[str], limit: int) -> list[str]:
-    """Split ``lines`` into annotation-sized workflow commands."""
+def _chunks(title: str, lines: list[str], limit: int,
+            keep: str = "first") -> list[str]:
+    """Split ``lines`` into annotation-sized workflow commands.
+
+    ``keep="last"`` returns the *newest* chunks instead of the oldest ones.
+    The tail of a build log is where the verdict is, and 150 buildozer
+    ``[DEBUG]`` lines are far more than four annotations hold, so keeping the
+    first chunks would publish the middle of the build and drop the exception.
+    """
     commands: list[str] = []
     buf: list[str] = []
     size = 0
@@ -122,7 +129,7 @@ def _chunks(title: str, lines: list[str], limit: int) -> list[str]:
         size += len(line) + 1
     if buf:
         commands.append(f"::error title={title}::{_escape(chr(10).join(buf))}")
-    return commands[:limit]
+    return commands[-limit:] if keep == "last" else commands[:limit]
 
 
 def _error_block(lines: list[str]) -> list[str]:
@@ -162,8 +169,13 @@ def main(argv: list[str]) -> int:
         return 0
 
     readable = _strip_environment(lines)
+    # The tail is the verdict: keep the *newest* chunks, or a window of long
+    # ``[DEBUG]`` lines publishes the middle of the build and loses the
+    # exception.  The keyword matches keep their earliest chunks on purpose --
+    # the root cause (a patch that no longer applies, a missing symbol) is often
+    # printed long before the traceback that unwinds to it.
     commands = _chunks(_TAIL_TITLE, [_short(l) for l in readable[-TAIL_LINES:]],
-                       TAIL_CHUNKS)
+                       TAIL_CHUNKS, keep="last")
     commands += _chunks(_ERROR_TITLE, _error_block(readable), ERROR_CHUNKS)
     for command in commands:
         print(command)
