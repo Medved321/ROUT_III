@@ -302,10 +302,17 @@ def section_failure_log():
         "  CC  Modules/posixmodule.c",
         "patch: **** Only garbage was found in the patch input.",
         "Error: one of the patches failed to apply",
+        *(f"line {i} of ordinary build chatter" for i in range(200)),
+        "Exception in thread background thread for pid 42:",
         "Traceback (most recent call last):",
         '  File "toolchain.py", line 1, in <module>',
         "BuildInterruptingException: python3 failed",
-        *(f"line {i} of ordinary build chatter" for i in range(400)),
+        # The marker sits past the old 300-char cut, so the annotation only
+        # reaches it when long lines keep enough of themselves.
+        ("E" * 650) + "TAIL_MARKER",
+        # buildozer dumps its environment on failure; all of it is noise.
+        *(f"#     ENV_VAR_{i} = 'value'" for i in range(150)),
+        "# Command failed: buildozer -v android debug",
     ])
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -329,13 +336,19 @@ def section_failure_log():
               "the annotation must quote the failure, not just say it failed")
         check("BuildInterruptingException: python3 failed" in out,
               "the tail of the traceback must survive")
+        check("TAIL_MARKER" in out,
+              "long lines must keep enough to hold the failing command")
+        check("ENV_VAR_0" not in out,
+              "the environment dump must not push the traceback out")
+        check("# Command failed: buildozer" in out,
+              "the final verdict must survive the tail window")
         check("%0A" in out,
               "a multiline annotation must be escaped, not dropped")
         check(all(line.startswith("::error") for line in out.splitlines()),
               "every emitted line must be a workflow command")
-        check(summary.is_file() and "line 399 of ordinary build chatter"
-              in summary.read_text(encoding="utf-8"),
-              "a human reading the run needs the tail in the step summary")
+        summary_text = summary.read_text(encoding="utf-8") if summary.is_file() else ""
+        check("BuildInterruptingException: python3 failed" in summary_text,
+              "a human reading the run needs the traceback in the step summary")
     print("a failed cloud build publishes its own diagnosis OK")
 
 
