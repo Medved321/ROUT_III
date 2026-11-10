@@ -14,6 +14,10 @@ still in this repository and can be wrong in ways that only show up after a
   (``music/``, tests, specs, the desktop updater);
 * ``main.py`` (the p4a entrypoint) disables SDL's synthetic touch mouse *before*
   pygame is imported, works without argv, and requires numpy;
+* a startup failure is never silent: the entry point logs a stage-by-stage
+  file next to the app (mirrored into its external files dir) and leaves the
+  traceback on screen, because p4a's ``start.c`` would otherwise just
+  ``exit()`` the activity;
 * on Android the settings file lives in the app-private directory (survives an
   APK update), while the program tree is replaced on update;
 * a fullscreen renderer ignores the saved window preset, and the client does not
@@ -170,7 +174,23 @@ def section_entrypoint():
     check("launch_config([])" in src, "Android has no CLI arguments")
     check("require_numpy()" in src, "the APK must refuse to run without numpy")
     check("asyncio.run(client.run())" in src, "the entrypoint must run the client")
-    print("main.py: env before pygame, no argv, numpy required OK")
+
+    # p4a's start.c ends with exit(ret): anything that escapes closes the app
+    # with no dialog.  A missing numpy used to ``raise SystemExit(1)``, which
+    # on a phone is indistinguishable from a native crash.
+    check("raise SystemExit" not in src, "nothing may exit on the way out")
+    check("except BaseException" in src,
+          "startup failures, SystemExit included, must be reported")
+    check("show_fatal(" in src, "a failure must leave its traceback on screen")
+    check("startup.stage(" in src, "stage markers are the only clue for a native crash")
+    check(src.index("def _startup(") < src.index("from client.client import"),
+          "the client import must sit inside the guarded startup")
+
+    fatal_src = (ROOT / "client/fatal.py").read_text(encoding="utf-8")
+    head = fatal_src.split("def show_fatal", 1)[0]
+    check(re.search(r"^import pygame", head, re.M) is None,
+          "the reporter must not import pygame at module level (that may be the bug)")
+    print("main.py: env before pygame, no argv, numpy required, failures visible OK")
 
 
 # ── 4. writable config location ──────────────────────────────────
@@ -367,10 +387,77 @@ def section_failure_log():
     print("a failed cloud build publishes its own diagnosis OK")
 
 
+# ── 4. on-device crash reporting ─────────────────────────────────
+CRASH_SCRIPT = r'''
+import os, sys
+from client import fatal
+
+# The external mirror is derived from ANDROID_PRIVATE, not asked of Java.
+assert fatal.external_files_dir("/data/user/0/org.rout3.rout3/files") == \
+    "/storage/emulated/0/Android/data/org.rout3.rout3/files"
+assert fatal.external_files_dir("") is None
+assert fatal.external_files_dir(None) is None
+
+log = fatal.StartupLog()
+assert log.path, "the startup log was not created anywhere"
+assert log.paths[0].startswith(os.environ["ANDROID_PRIVATE"]), log.paths
+log.stage("numpy import")
+try:
+    raise ImportError("boom-numpy")
+except ImportError as exc:
+    text = log.crash(exc)
+log.close()
+
+data = open(log.path, encoding="utf-8").read()
+assert "stage: numpy import" in data, data
+assert "ImportError: boom-numpy" in data, data
+assert "Этап: numpy import" in text, text
+
+# An unwritable candidate set must degrade to memory, never raise.
+ro = fatal.StartupLog(private="/proc/definitely-not-here", app_root="/proc/nope")
+ro.write("still fine")
+ro.close()
+
+# The screen itself must draw with whatever driver the device has.
+assert fatal.show_fatal(text, log=log, interactive=False) is True
+import pygame
+raw = pygame.image.tobytes(pygame.display.get_surface(), "RGB")
+total = len(raw) // 3
+ink = total - raw.count(b"\x08\x08\x0c")
+assert ink > 2000, f"the report screen is blank ({total} px, {ink} ink)"
+print("CRASH REPORTER OK")
+'''
+
+
+def section_crash_reporter():
+    with tempfile.TemporaryDirectory() as tmp:
+        private = os.path.join(tmp, "files")
+        app_root = os.path.join(private, "app")
+        os.makedirs(app_root)
+        env = dict(os.environ)
+        env.update({
+            "ANDROID_ARGUMENT": app_root,
+            "ANDROID_APP_PATH": app_root,
+            "ANDROID_UNPACK": app_root,
+            "ANDROID_PRIVATE": private,
+            "P4A_BOOTSTRAP": "sdl2",
+            "PYTHONPATH": str(ROOT),
+            "SDL_VIDEODRIVER": "dummy",
+            "SDL_AUDIODRIVER": "dummy",
+        })
+        proc = subprocess.run([sys.executable, "-c", CRASH_SCRIPT], cwd=tmp,
+                              env=env, capture_output=True, text=True, timeout=180)
+        check(proc.returncode == 0,
+              f"crash reporter failed:\n{proc.stdout}\n{proc.stderr}")
+        check("CRASH REPORTER OK" in proc.stdout, proc.stdout)
+    print("startup crash: log mirror, stage markers, on-screen traceback OK")
+
+
 def main():
     section_spec()
     section_recipes()
     section_entrypoint()
+    section_crash_reporter()
     section_writable_root()
     section_fullscreen()
     section_workflow()
