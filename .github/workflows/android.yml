@@ -33,6 +33,11 @@ concurrency:
   group: android-${{ github.ref }}
   cancel-in-progress: true
 
+# The commit step below publishes the built APK into ``releases/``; that push
+# needs write access to the repository.
+permissions:
+  contents: write
+
 jobs:
   apk:
     # Pin the image instead of following ``ubuntu-latest``: the label moved to
@@ -127,3 +132,25 @@ jobs:
           path: bin/*.apk
           if-no-files-found: error
           retention-days: 30
+
+      # Artifacts expire after 30 days, and the APK is a release like the
+      # desktop ``.pyz`` files already kept in ``releases/``.  Only one APK per
+      # version is committed: a rebuild of the same version produces the same
+      # file name and is skipped, so the history does not grow by ~26 MB on
+      # every CI run.  A new ``version`` in buildozer.spec commits a new file.
+      - name: Commit APK to releases
+        run: |
+          set -euo pipefail
+          apk=$(ls -1 bin/*.apk | head -n 1)
+          name=$(basename "$apk")
+          target="releases/$name"
+          if [ -f "$target" ]; then
+            echo "$target is already tracked; keeping it"
+            exit 0
+          fi
+          cp "$apk" "$target"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$target"
+          git commit -m "APK: $name"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

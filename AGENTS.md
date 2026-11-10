@@ -1141,8 +1141,12 @@ APK собирается **только на x86_64-хосте**: Android NDK н
 host-тулчейн под linux-aarch64, а машина разработки — Jetson (aarch64), где нет
 ни amd64-эмуляции, ни root. Канонический путь — облачный CI
 (`.github/workflows/android.yml`): workflow ставит buildozer, выполняет
-`buildozer -v android debug` и выкладывает `bin/*.apk` артефактом
-`rout3-android-apk` (30 дней, `workflow_dispatch` для ручного запуска).
+`buildozer -v android debug`, выкладывает `bin/*.apk` артефактом
+`rout3-android-apk` (30 дней, `workflow_dispatch` для ручного запуска) и
+коммитит его в `releases/` — артефакт истекает, а релиз должен остаться в
+истории рядом с десктопными `.pyz`. Коммитится один APK на версию: повторная
+сборка той же версии даёт то же имя файла и пропускается, поэтому история не
+растёт на ~26 МБ на каждый прогон.
 
 ```
 gh run download -n rout3-android-apk      # или со страницы Actions
