@@ -35,7 +35,13 @@ concurrency:
 
 jobs:
   apk:
-    runs-on: ubuntu-latest
+    # Pin the image instead of following ``ubuntu-latest``: the label moved to
+    # Ubuntu 26, whose default JDK is 25.  p4a's Gradle 8.14 wrapper does not
+    # support a JDK that new, so the build died in gradlew after ~9 s with no
+    # useful verdict in the log.  24.04 is the image the toolchain was
+    # verified on; setup-java below still pins the JDK explicitly, so a future
+    # image bump cannot silently change it again.
+    runs-on: ubuntu-24.04
     # A cold cache compiles CPython, OpenSSL, SDL2 and numpy from source on a
     # 2-core runner; the first run is the slow one.
     timeout-minutes: 240
@@ -46,15 +52,24 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Buildozer needs the host build tools plus a JDK for Gradle.  The SDK
-      # platform/build-tools and the NDK are downloaded by buildozer itself.
-      # `libncurses-dev` rather than `libncurses5-dev`: the -5 package does not
-      # exist on ubuntu-24.04 and a missing package fails the whole apt step.
+      # Gradle 8.14 (p4a's wrapper) and AGP 8.11 require a JDK they support.
+      # The runner image's default JAVA_HOME is not part of this contract, so
+      # it is set here rather than inherited: on Ubuntu 26 it points at JDK 25,
+      # and gradlew fails before it can print a Gradle error block.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Buildozer needs the host build tools.  The SDK platform/build-tools and
+      # the NDK are downloaded by buildozer itself.  `libncurses-dev` rather
+      # than `libncurses5-dev`: the -5 package does not exist on ubuntu-24.04
+      # and a missing package fails the whole apt step.
       - name: Install host dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            git zip unzip openjdk-17-jdk-headless \
+            git zip unzip \
             autoconf libtool pkg-config \
             zlib1g-dev libncurses-dev \
             cmake libffi-dev libssl-dev libltdl-dev

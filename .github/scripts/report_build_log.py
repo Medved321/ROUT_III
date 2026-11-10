@@ -60,8 +60,16 @@ MAX_ERRORS = 30
 # "# Command failed" verdict.  Those lines ("#     ANDROIDNDK = '...'") carry no
 # diagnosis and used to fill three of the four tail chunks, pushing the actual
 # exception out of the annotation entirely.
+#
+# The same dump is echoed a second time by the Gradle wrapper as ``export
+# NAME='...'``; only the first form used to be collapsed, so that copy still
+# filled the tail window and pushed Gradle's own "What went wrong" block out of
+# the annotations -- the one line that names the cause.
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
-_ENV_LINE = re.compile(r"^\s*#\s{2,}[A-Za-z_][A-Za-z0-9_]*\s*=\s")
+_ENV_LINE = re.compile(
+    r"^\s*(?:#\s{2,}[A-Za-z_][A-Za-z0-9_]*\s*=\s"
+    r"|export\s+[A-Za-z_][A-Za-z0-9_]*=)"
+)
 
 # Keyword matches use whole words, so ``-Werror=implicit-function-declaration``
 # in a compiler command line is not "an interesting error": it matched every
