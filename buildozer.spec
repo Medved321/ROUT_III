@@ -49,6 +49,24 @@ p4a.branch = v2026.05.09
 orientation = landscape
 fullscreen = 1
 
+# Startup reporting that survives a failure *before* Python exists.
+#
+# A crash inside PythonActivity.onCreate (native library load, SDL surface)
+# closes the window before the presplash is shown: no splash, no dialog, and
+# client/fatal.py never runs, so the boot marker does not exist either.
+# tools/android/java/org/rout3/DiagActivity.java wraps that window, records the
+# device/ABI/native-lib facts to Android/data/<package>/files/rout3-java.log and
+# keeps the traceback on screen.  p4a documents --android-entrypoint as
+# "usually a subclass of PythonActivity"; the sources are compiled into the APK
+# and never travel as files.
+android.entrypoint = org.rout3.DiagActivity
+android.add_src = tools/android/java
+# ... and the same journal starts in Application.onCreate, before the launcher
+# activity is even instantiated, so a failure while the framework loads or
+# verifies that class is recorded too.  The value is an ``<application>`` tag
+# attribute, not XML: buildozer splices the file's *contents* into the tag.
+android.extra_manifest_application_arguments = tools/android/manifest_application.xml
+
 # numpy's recipe needs NDK API 24; the phone target is Android 12+ anyway.
 android.archs = arm64-v8a
 android.api = 36

@@ -334,6 +334,30 @@ and app-private storage is not reachable from a file manager on Android 11+.
   pulls logcat (including the separate `crash` buffer) and the app-private files
   over `adb`, and names an APK/device ABI mismatch -- the one failure that
   installs fine and closes before Python starts, leaving no marker at all.
+- **The window before Python is Java, so the first reporter is Java.** p4a's
+  `PythonActivity.onCreate` builds its resource manager, then calls
+  `super.onCreate`, which loads every native library and builds the SDL surface,
+  and only then shows the presplash. A failure in that sequence closes the window
+  with no splash, no dialog and no boot marker -- Python has not run yet. The
+  launcher is therefore `org.rout3.DiagActivity` (`android.entrypoint`), a
+  `PythonActivity` subclass that runs `super.onCreate` inside `Throwable`, names
+  the failing library when SDL reports `mBrokenLibraries`, and keeps the traceback
+  on screen as selectable white-on-black text. Libraries are also loaded one at a
+  time *before* `super.onCreate`, with the name written to the journal before each
+  load: a `SIGSEGV` inside `JNI_OnLoad` is not an exception, it kills the process
+  between two statements, and then the last line is the only thing that names the
+  culprit. `org.rout3.DiagApp`
+  (`android:name` on `<application>`, spliced from
+  `tools/android/manifest_application.xml`) opens the same journal before any
+  activity exists, and its uncaught-exception handler covers the one thing the
+  `try` cannot: a failure while the framework loads or verifies the launcher
+  class. The journal is
+  `Android/data/<package>/files/rout3-java.log` -- readable over USB/MTP without
+  adb or any permission -- mirrored to app-private storage and logcat, and every
+  line is flushed and `fsync`ed because the process may die on the next statement.
+  `smoke_android_build.py` holds the wiring (entrypoint, source dir, application
+  attribute, import whitelist, both sinks); the sources are compiled into the APK
+  and never shipped as files.
 
 ## Migration Plan
 

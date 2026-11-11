@@ -1278,3 +1278,52 @@ pygame на уровне модуля.
 `ANDROID_PRIVATE` в свежем интерпретаторе, полноэкранность и отказ перезаписи
 пресета, наличие APK-артефакта в workflow), плюс `smoke_numpy_bootstrap.py`
 (сценарий «д» — Android без pip).
+
+### Окно до Python: журнал на Java
+
+Питоновский маркер не может помочь в самом начале: `PythonActivity.onCreate`
+сначала строит менеджер ресурсов, потом вызывает `super.onCreate`, который
+**грузит все нативные библиотеки и создаёт SDL-поверхность**, и только затем
+показывает presplash. Падение в этом месте закрывает окно без всплеска, без
+диалога и без маркера — Python ещё не выполнялся. Поэтому точка входа APK — не
+`PythonActivity`, а наш слой на Java (`tools/android/java`, `android.add_src`):
+
+- **`DiagActivity`** (`android.entrypoint`) наследует `PythonActivity` и вызывает
+  `super.onCreate` под `catch (Throwable)`; ловятся и `Error`
+  (`UnsatisfiedLinkError`, `ExceptionInInitializerError`), которые не являются
+  `Exception`. При `mBrokenLibraries` перебирает библиотеки через
+  `System.loadLibrary`, чтобы назвать виновника (диалог SDL несёт только сырое
+  сообщение линкера), а traceback оставляет на экране **выделяемым**
+  белым-по-чёрному тексту. До `super.onCreate` он грузит библиотеки **по одной**,
+  записывая имя перед загрузкой: нативный `SIGSEGV` в `JNI_OnLoad` — не
+  исключение, процесс умирает между двумя строками, и последняя строка журнала —
+  единственное, что называет виновника. Флаг отказа не даёт полупостроенному SDL
+  пройти `onStart`/`onResume`/`onPause`/`onStop`, а повторный запуск из Recents
+  показывает тот же отчёт, не вызывая сломанный `super.onCreate` снова.
+- **`DiagApp`** (`android:name` на `<application>`, значение вставляется из
+  `tools/android/manifest_application.xml` через
+  `android.extra_manifest_application_arguments`) — самый ранний Java-код: журнал
+  открыт и `UncaughtExceptionHandler` поставлен **до** создания активности,
+  поэтому сбой загрузки/проверки самого класса активности, до `onCreate` не
+  доходящий, тоже попадает в журнал. Обработчик **цепляется** к платформенному
+  (`previous.uncaughtException`), а не заменяет его: процесс обязан умереть
+  штатно; плюс Toast с путём к журналу, потому что экран может не нарисоваться.
+- **`DiagLog`** — единственный писатель. Два приёмника:
+  `Android/data/<пакет>/files/rout3-java.log` (`getExternalFilesDir`, читается по
+  USB/MTP **без adb и без разрешений**) и приватный `getFilesDir()`; каждый
+  маркер дополнительно уходит в logcat. Строка пишется с `flush` **и**
+  `getFD().sync()`: смысл журнала в том, что процесс умрёт на следующей строке, и
+  буферизованный последний маркер равен его отсутствию. Файл обрезается по 96 КБ
+  раз за запуск, любая ошибка файловой системы глушится — диагностика не имеет
+  права ломать то, что диагностирует.
+
+`smoke_android_build.py` (секция `section_java_reporter`) держит обвязку, которую
+иначе проверяет только 40-минутная сборка: `android.entrypoint` и
+`android.add_src` в `buildozer.spec`, файл класса по имени entrypoint,
+`extends org.kivy.android.PythonActivity`, `catch (Throwable)` вокруг
+`super.onCreate`, оба приёмника и `fsync`, цепочку обработчика, атрибут
+`android:name` в `manifest_application.xml` и белый список импортов
+(`android.*`, `java.*`, `org.kivy.android.*`). Сами классы компилируются `javac`
+против заглушек Android API — это ловит несовпадение сигнатур (например,
+`ScrollView.LayoutParams` не существует: `ScrollView` наследует
+`FrameLayout.LayoutParams`).

@@ -18,6 +18,10 @@ still in this repository and can be wrong in ways that only show up after a
   file next to the app (mirrored into its external files dir) and leaves the
   traceback on screen, because p4a's ``start.c`` would otherwise just
   ``exit()`` the activity;
+* the window *before* Python -- native library load, SDL surface, even the
+  activity's own class loading -- is covered by ``tools/android/java``, whose
+  wiring (``android.entrypoint``, ``android.add_src``, the ``<application>``
+  hook) only the APK build exercises;
 * on Android the settings file lives in the app-private directory (survives an
   APK update), while the program tree is replaced on update;
 * a fullscreen renderer ignores the saved window preset, and the client does not
@@ -317,6 +321,12 @@ def section_workflow():
     # failure is still diagnosed by the previous script.
     check('".github/scripts/**"' in flow,
           "editing the failure reporter must trigger a build")
+    # An apt mirror hiccup is runner noise, and without a token the job log
+    # cannot be read afterwards: retrying is the only way to keep the APK from
+    # going unbuilt for a reason nobody can see -- and the final failure must
+    # publish its own tail as annotations, which *are* readable.
+    check("for attempt in 1 2 3" in flow and "tail -n 40 /tmp/apt.log" in flow,
+          "the host-dependency step must retry and publish its own failure")
     print("CI workflow builds and uploads the debug APK OK")
 
 
@@ -482,6 +492,87 @@ def section_crash_reporter():
     print("startup crash: log mirror, stage markers, on-screen traceback OK")
 
 
+# ── 4a. the Java reporter that covers the pre-Python window ──────
+def section_java_reporter():
+    """The first frames of an APK launch exist only in Java.
+
+    ``PythonActivity.onCreate`` loads the native libraries and builds the SDL
+    surface *before* the presplash is shown, so a failure there closes the
+    window with no splash -- and ``client/fatal.py`` has not started, so the
+    boot marker does not exist either.  ``tools/android/java`` wraps that window;
+    these assertions keep the wiring (which is invisible to a desktop run)
+    from rotting between CI builds.
+    """
+    cfg = read_spec()
+    app = cfg["app"]
+
+    # p4a's own documentation calls --android-entrypoint "usually a subclass of
+    # PythonActivity", so the wiring is supported rather than a hack.
+    entry = app["android.entrypoint"]
+    check(entry == "org.rout3.DiagActivity", entry)
+    cls_path = ROOT / "tools/android/java" / (entry.replace(".", "/") + ".java")
+    check(cls_path.is_file(), f"entrypoint class is missing: {cls_path}")
+
+    sources = {p.stem: p.read_text(encoding="utf-8")
+               for p in (ROOT / "tools/android/java").rglob("*.java")}
+    check({"DiagActivity", "DiagApp", "DiagLog"} <= set(sources), sorted(sources))
+
+    diag = sources["DiagActivity"]
+    check("extends org.kivy.android.PythonActivity" in diag,
+          "the launcher must keep PythonActivity's behaviour")
+    check(f"public class {cls_path.stem}" in diag,
+          "the public class name must match the file name")
+    # The failure this exists for is thrown by code we do not own, including
+    # Errors (UnsatisfiedLinkError, ExceptionInInitializerError).
+    check("catch (Throwable failure)" in diag, "a startup failure must be caught")
+    check("super.onCreate(state)" in diag, "the wrapped call is super.onCreate")
+    check("setTextIsSelectable(true)" in diag,
+          "the traceback must be copyable, not just readable")
+    check("mBrokenLibraries" in diag,
+          "SDL's own broken-library verdict must be reported by name")
+    check("System.loadLibrary" in diag,
+          "a broken library must be named, not left as a raw linker message")
+    check(diag.index("preloadLibraries();") < diag.index("super.onCreate(state)"),
+          "libs must be loaded before the activity so a native crash names one")
+    check('DiagLog.mark("native: loading " + name)' in diag,
+          "the library name must reach the disk before the library is loaded")
+
+    # Only platform and p4a APIs: the Java sources are compiled by the APK build
+    # alone, so a dependency on a jar that is not in the bootstrap is invisible
+    # until a 40-minute CI run fails.
+    for name, text in sources.items():
+        imports = re.findall(r"^import\s+([\w.]+);", text, re.M)
+        allowed = ("android.", "java.", "org.kivy.android.")
+        bad = [i for i in imports if not i.startswith(allowed)]
+        check(not bad, f"{name}.java imports outside the bootstrap: {bad}")
+
+    # The application class runs before any activity exists: that is the only
+    # place that can record a failure inside the activity's own class loading.
+    diag_app = sources["DiagApp"]
+    check("extends Application" in diag_app, "the earliest hook is an Application")
+    manifest_attr = app["android.extra_manifest_application_arguments"]
+    attr_path = ROOT / manifest_attr
+    check(attr_path.is_file(), f"application arguments file is missing: {attr_path}")
+    check('android:name="org.rout3.DiagApp"' in attr_path.read_text(encoding="utf-8"),
+          "the Application subclass must be selected in the manifest")
+    check("DiagLog.installHandler" in diag_app,
+          "class-loading failures need the handler installed before the activity")
+
+    # Both sinks and the durability of every line: the process may die on the
+    # next statement, so a buffered last marker is the same as no marker.
+    log = sources["DiagLog"]
+    check("getExternalFilesDir(null)" in log,
+          "the journal must be reachable over USB, without adb")
+    check("getFilesDir()" in log, "app-private storage is the fallback")
+    check("out.getFD().sync()" in log, "every marker must survive the next line")
+    check("setDefaultUncaughtExceptionHandler" in log,
+          "an uncaught exception must leave a trace")
+    check("previous.uncaughtException" in log,
+          "the platform handler must still run: the process has to die normally")
+
+    print("Java startup reporter: entrypoint, application hook, journal OK")
+
+
 # ── 4b. the desktop end of the same trail ────────────────────────
 def section_device_tool():
     import importlib.util
@@ -512,6 +603,8 @@ def section_device_tool():
     script = path.read_text(encoding="utf-8")
     check("run-as" in script and "rout3-startup.log" in script,
           "the tool must read the app-private startup log")
+    check("rout3-java.log" in script,
+          "the pre-Python journal is the only record of an early crash")
     check("-b\", \"crash\"" in script or "-b crash" in script,
           "the native crash buffer is separate from the main logcat buffer")
     check(module.summary("I/x: hello\nE/PythonActivity: boom\nI/y: ok") ==
@@ -529,6 +622,7 @@ def main():
     section_recipes()
     section_entrypoint()
     section_crash_reporter()
+    section_java_reporter()
     section_device_tool()
     section_writable_root()
     section_fullscreen()

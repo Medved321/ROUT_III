@@ -70,14 +70,40 @@ jobs:
       # the NDK are downloaded by buildozer itself.  `libncurses-dev` rather
       # than `libncurses5-dev`: the -5 package does not exist on ubuntu-24.04
       # and a missing package fails the whole apt step.
+      #
+      # ``apt-get`` also exits 100 when a mirror hiccups or a package is briefly
+      # uninstallable.  That is runner noise, not a verdict about the toolchain,
+      # and without a token the job log cannot be read afterwards -- so retry,
+      # and on the final failure publish the tail of the apt output as check
+      # annotations (public) instead of leaving the reason in an unreadable log.
       - name: Install host dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            git zip unzip \
-            autoconf libtool pkg-config \
-            zlib1g-dev libncurses-dev \
-            cmake libffi-dev libssl-dev libltdl-dev
+          set -o pipefail
+          ok=0
+          for attempt in 1 2 3; do
+            if sudo apt-get update 2>&1 | tee /tmp/apt.log; then
+              if sudo apt-get install -y --no-install-recommends \
+                git zip unzip \
+                autoconf libtool pkg-config \
+                zlib1g-dev libncurses-dev \
+                cmake libffi-dev libssl-dev libltdl-dev 2>&1 | tee -a /tmp/apt.log; then
+                ok=1
+                break
+              fi
+            fi
+            echo "::warning::apt attempt ${attempt} failed; retrying"
+            sudo apt-get install -y -f 2>&1 | tee -a /tmp/apt.log || true
+            sleep $((attempt * 15))
+          done
+          if [ "$ok" -ne 1 ]; then
+            tail -n 40 /tmp/apt.log | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            echo "::error::host dependencies could not be installed"
+            exit 1
+          fi
 
       - name: Install buildozer
         run: |

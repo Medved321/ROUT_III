@@ -21,8 +21,9 @@ What it does, in order:
    decide whether the APK can even run there;
 3. clears logcat, launches the app through ``monkey`` (no launcher guesswork)
    and records logcat for a few seconds, including the ``crash`` buffer;
-4. reads ``files/rout3-startup.log``, ``files/rout3-boot.json`` and the
-   external mirror through ``run-as`` / ``adb shell cat``;
+4. reads ``files/rout3-startup.log``, ``files/rout3-boot.json``,
+   ``files/rout3-java.log`` (the pre-Python journal) and their external mirrors
+   through ``run-as`` / ``adb shell cat``;
 5. writes everything to one text file and prints the lines that name the app,
    Python, SDL, the native linker or the system crash handler.
 
@@ -176,13 +177,13 @@ def pull_app_files(adb: str, serial: str | None, package: str) -> str:
     private = f"/data/data/{package}/files"
     external = f"/storage/emulated/0/Android/data/{package}/files"
 
-    for name in ("rout3-boot.json", "rout3-startup.log"):
+    for name in ("rout3-boot.json", "rout3-startup.log", "rout3-java.log"):
         code, text = run(adb, *base, "shell", "run-as", package,
                          "cat", f"files/{name}")
         sections.append(f"$ adb shell run-as {package} cat files/{name} -> {code}\n{text}")
     code, text = shell(adb, f"ls -la {private}")
     sections.append(f"$ adb shell ls -la {private} -> {code}\n{text}")
-    for name in ("rout3-boot.json", "rout3-startup.log"):
+    for name in ("rout3-boot.json", "rout3-startup.log", "rout3-java.log"):
         code, text = shell(adb, f"cat {external}/{name}")
         sections.append(f"$ adb shell cat {external}/{name} -> {code}\n{text}")
     return "\n\n".join(sections)
@@ -275,7 +276,8 @@ def main(argv: list[str]) -> int:
         print("adb не найден.", file=sys.stderr)
         print("Установите platform-tools или укажите ANDROID_HOME. "
               "Без adb журнал можно достать только на телефоне: "
-              "Android/data/<пакет>/files/rout3-startup.log", file=sys.stderr)
+              "Android/data/<пакет>/files/rout3-java.log "
+              "и rout3-startup.log", file=sys.stderr)
         return 2
 
     attached = devices(adb)
