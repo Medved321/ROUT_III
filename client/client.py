@@ -18,19 +18,20 @@ from shared.protocol import INPUT_FLAG_DASH, INPUT_FLAG_USE
 from client.raycaster import SCREEN_WIDTH, SCREEN_HEIGHT
 from client.renderer import Renderer
 from client.bridge import RenderBridge
-from client.input_handler import InputHandler
+from client.input_handler import InputHandler, FINGERDOWN, FINGERMOTION, FINGERUP
 from client.network_client import NetworkClient
 from client.assets import AssetManager
 from client.lobby_screen import LobbyScreen
 from client.connect_screen import ConnectScreen
 from client.settings import (
-    Settings, control_hints, is_tractor, save_server_settings, size_text)
+    Settings, control_hints, save_server_settings, size_text)
 from client.settings_screen import SettingsScreen
 from client.pause_screen import PauseScreen
 from client.end_screen import EndScreen
 from client.editor_screen import MapEditorScreen
 from engine.constants import WPN, INPUT_SEND_INTERVAL
 from client.performance import AdaptiveQuality, input_send_loop
+from client.mobile import UPDATER_ENABLED
 from client.updater import (
     UpdateError, apply_update, default_releases_dir, restart, validate_offer)
 from client import music, sfx
@@ -106,6 +107,13 @@ class GameClient:
         )
         self._input_task: asyncio.Task | None = None
         self._ui = "lobby"  # 'lobby' | 'editor' | 'settings'
+        # Touch gestures over the menus: finger id -> {start, last, moved}.
+        # Menus are mouse-driven, and Android's synthetic mouse would either
+        # double every tap or, if disabled, leave them dead; translating the
+        # fingers here keeps menus working and lets a swipe scroll the list
+        # (a tap is a press, a drag is a wheel).
+        self._menu_touch: dict[int, dict] = {}
+        self._menu_touch_step = 44  # window px per wheel notch (ui-sized below)
         self._paused = False
         self.game_map: GameMap | None = None
         self.sector_map: SectorMap | None = None
@@ -116,6 +124,10 @@ class GameClient:
         self.player_id: int | None = None
         self.local_x: float = 96.0
         self.local_y: float = 96.0
+        # Support height under the local player, straight from the snapshot.
+        # None until the first snapshot of a sector party, and always None on
+        # a tile map, where the world is flat by construction.
+        self.local_z: float | None = None
         self.local_angle: float = 0.0
         self.local_health: int = 200
         self.local_weapon: int = 1
@@ -216,6 +228,13 @@ class GameClient:
         even dimensions) is written back, so the file and the window agree.
         """
         size = self.settings.resolution()
+        if self.renderer.fullscreen:
+            # Phone: the display decides the size. The saved preset is left
+            # untouched so the same config still means something on a desktop,
+            # and no window smaller than the screen is created.
+            applied = self.renderer.publish_size()
+            logger.info(f"Экран устройства: {applied[0]}×{applied[1]}")
+            return
         if size is None:
             size = (SCREEN_WIDTH, SCREEN_HEIGHT)
             logger.warning(
@@ -250,9 +269,17 @@ class GameClient:
         must not activate one. ``InputHandler`` deliberately does *not* go
         through this -- mouse-look happens in the 3D scene, which lives in
         window pixels.
+
+        Fingers are translated here because the menus speak mouse: a tap becomes
+        a click at the *press* point, and a drag becomes wheel notches instead
+        of a click, so a list can be scrolled by swiping without activating the
+        row under the thumb.
         """
         out = []
         for event in events:
+            if event.type in (FINGERDOWN, FINGERMOTION, FINGERUP):
+                out.extend(self._menu_finger_events(event))
+                continue
             pos = getattr(event, "pos", None)
             if pos is None:
                 out.append(event)
@@ -264,6 +291,48 @@ class GameClient:
             attrs["pos"] = (int(mapped[0]), int(mapped[1]))
             out.append(pygame.event.Event(event.type, attrs))
         return out
+
+    def _menu_finger_events(self, event) -> list:
+        """One finger -> menu events: tap = click, vertical drag = wheel."""
+        from engine import constants as const
+        from engine import viewport
+
+        finger = getattr(event, "finger_id", 0)
+        raw = (int(event.x * const.W), int(event.y * const.H))
+        if event.type == FINGERDOWN:
+            self._menu_touch[finger] = {"x": raw[0], "y": raw[1],
+                                        "acc": 0.0, "moved": False}
+            return []
+        track = self._menu_touch.get(finger)
+        if track is None:
+            return []
+        if event.type == FINGERMOTION:
+            track["acc"] += raw[1] - track["y"]
+            track["x"], track["y"] = raw
+            step = max(8, int(self._menu_touch_step * viewport.ui_scale()))
+            out = []
+            while track["acc"] >= step:
+                track["acc"] -= step
+                track["moved"] = True
+                # Swipe down = go back up the list (same sign as a wheel).
+                out.append(pygame.event.Event(pygame.MOUSEWHEEL, x=0, y=1))
+            while track["acc"] <= -step:
+                track["acc"] += step
+                track["moved"] = True
+                out.append(pygame.event.Event(pygame.MOUSEWHEEL, x=0, y=-1))
+            return out
+        # FINGERUP: a tap activates what is under the press point.
+        self._menu_touch.pop(finger, None)
+        if track["moved"]:
+            return []
+        mapped = self.renderer.to_canvas_pos((track["x"], track["y"]))
+        if mapped is None:
+            return []
+        pos = (int(mapped[0]), int(mapped[1]))
+        return [
+            pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=pos),
+            pygame.event.Event(pygame.MOUSEBUTTONUP, button=1, pos=pos),
+        ]
 
     def _sync_control_hints(self) -> None:
         mode = self.settings.get("control_mode")
@@ -409,6 +478,15 @@ class GameClient:
         return True
 
     async def _maybe_update(self) -> bool:
+        if not UPDATER_ENABLED:
+            # Inside an APK there is no versioned artifact to swap and no
+            # launcher to restart: an update is a new APK, installed by the
+            # player. Say so once instead of downloading a file nothing uses.
+            logger.info(
+                "Клиент запущен из APK: обновление устанавливается новым APK, "
+                "автообновление пропущено"
+            )
+            return False
         offer = self.network.update_offer
         if offer.version == self.settings.get("skipped_update_version"):
             logger.info(
@@ -660,6 +738,9 @@ class GameClient:
         # leak from the party we just left.
         from engine import game_state as gs
         gs.reset_transient_state()
+        # A tile world is flat: no support height, so the camera and sprites
+        # keep the old sector-floor path even if the previous party had one.
+        self.local_z = None
         if self.network.map_format == MAP_FORMAT_SECTOR:
             self.game_map = None
             self.sector_map = SectorMap.from_bytes(self.network.map_data)
@@ -684,6 +765,8 @@ class GameClient:
             target_fps=self.fps_cap,
         )
         self._apply_quality()
+        self.input_handler.reset_touch()
+        self._menu_touch.clear()
         self.input_handler.lock_mouse()
         self.input_handler.reset_mouse_position()
         if self.game_map is not None:
@@ -753,13 +836,9 @@ class GameClient:
         )
 
     async def _game_loop(self) -> None:
-        tractor = is_tractor(self.settings.get("control_mode"))
-        logger.info(
-            "Игра началась! "
-            + ("WASD — движение, стрелки — обзор, Пробел — огонь, "
-               "Левый Shift — дэш" if tractor else
-               "WASD — движение, мышь — обзор, ЛКМ — огонь, Пробел — дэш")
-        )
+        # One source for the layout hint: the lobby and the start log must not
+        # disagree with the handler about what the keys/buttons do.
+        logger.info("Игра началась! " + control_hints(self.settings.get("control_mode")))
         # Network input runs on its own fixed-rate timer so its frequency is
         # independent of how fast frames are rendered.
         self._input_task = asyncio.create_task(
@@ -814,6 +893,11 @@ class GameClient:
         self._paused = True
         self.pause_screen._selected = 0
         self.input_handler.unlock_mouse()
+        # The finger that pressed Esc-equivalent (or was holding a stick) never
+        # gets its FINGERUP once the queue is cleared below, so the overlay is
+        # reset first: otherwise the player walks on behind the menu.
+        self.input_handler.reset_touch()
+        self._menu_touch.clear()
         # Snapshot the frame once, already scaled to the menu canvas: at 4K a
         # fresh capture is a 33 Mpixel scale, and a paused frame only needs to
         # blit a 1000x700 surface back under the overlay.
@@ -824,6 +908,8 @@ class GameClient:
         self._paused = False
         self._pause_bg = None
         self._dash_pending = False
+        self.input_handler.reset_touch()
+        self._menu_touch.clear()
         self.input_handler.lock_mouse()
         self.input_handler.reset_mouse_position()
         pygame.event.clear()
@@ -862,12 +948,16 @@ class GameClient:
         self._pause_bg = None
         self.end_screen._selected = 0
         self.input_handler.unlock_mouse()
+        self.input_handler.reset_touch()
+        self._menu_touch.clear()
         self._end_bg = self.renderer.capture_menu_frame()
         pygame.event.clear()
 
     def _exit_end(self) -> None:
         self._end_bg = None
         self._dash_pending = False
+        self.input_handler.reset_touch()
+        self._menu_touch.clear()
         self.input_handler.lock_mouse()
         self.input_handler.reset_mouse_position()
         pygame.event.clear()
@@ -999,6 +1089,7 @@ class GameClient:
         self.network.send_leave_party()
         self.bridge = None
         self.game_map = None
+        self.local_z = None
         self.other_players = []
         self.enemies = []
         self.bullets = []
@@ -1030,6 +1121,8 @@ class GameClient:
         # arrive, so they must not be carried into the next one.
         self._fire_pending.clear()
         self._dash_pending = False
+        self.input_handler.reset_touch()
+        self._menu_touch.clear()
         self.input_handler.unlock_mouse()
         logger.info("Выход в меню")
 
@@ -1315,6 +1408,10 @@ class GameClient:
                 self._server_angle = p["angle"]
                 self.local_x = p["x"]
                 self.local_y = p["y"]
+                # Tile maps are flat: the server still sends z=0, but the
+                # camera must keep the "no vertical" path there.
+                self.local_z = (p.get("z")
+                                if self.sector_map is not None else None)
                 self.local_health = p["health"]
                 self.local_weapon = p["wpn"]
                 self.local_ammo = p.get("ammo", self.local_ammo)
@@ -1456,8 +1553,15 @@ class GameClient:
             doors=self.doors, keys=self.local_keys,
             use_hint=(self.local_use_reason == USE_REASON_LOCKED
                       and time.monotonic() < self._use_hint_until),
+            player_z=self.local_z,
         )
         self.bridge.render()
+        # The overlay is drawn on the window surface after the world and the
+        # HUD: it is interface, not world, and it must never be scaled with the
+        # render buffer (a 4K window would turn the sticks into pancakes).
+        # Nothing is constructed here -- ``draw_touch`` is a no-op outside the
+        # touch mode and blits cached surfaces inside it.
+        self.input_handler.draw_touch(self.renderer.screen)
         pygame.display.flip()
         # clock.tick returns the wall-clock frame period in ms, i.e. exactly
         # the frame budget we need to measure for adaptive quality.

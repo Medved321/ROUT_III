@@ -10,7 +10,9 @@ as the task's verification requires:
       invoking pip or the bundled extraction;
   (г) a real ``tools/build_client.py`` artifact contains ``vendor/numpy`` and
       starts without any external install (extracted cache + ``import numpy``
-      in an isolated ``-S`` interpreter subprocess).
+      in an isolated ``-S`` interpreter subprocess);
+  (д) on Android the bootstrap never invokes pip and prints the APK-specific
+      message instead (the APK must carry numpy).
 
 The (б) scenario additionally asserts the bootstrap prints the install
 announcement and the failure message to stderr, and that the zipapp
@@ -122,11 +124,52 @@ def test_gates_true():
     print("bootstrap gates sane                          OK")
 
 
+def test_android_never_pip_installs():
+    """On Android there is no pip and a read-only program tree.
+
+    The only supported numpy is the one compiled into the APK, so the
+    bootstrap must stop at the bundled-import gate instead of spending the
+    start of the game on a doomed ``pip install`` -- and the message must name
+    the actual remedy (rebuild the APK), not tell the player to run pip.
+    """
+    import contextlib
+    import io
+
+    original = (nb.IS_ANDROID, nb._numpy_importable, nb._load_bundled,
+                nb._pip_install)
+    calls = []
+
+    def forbidden_pip():
+        calls.append("pip")
+        raise AssertionError("Android must never call pip")
+
+    nb.IS_ANDROID = True
+    nb._numpy_importable = lambda: False
+    nb._load_bundled = lambda: False
+    nb._pip_install = forbidden_pip
+    try:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            assert nb.ensure_numpy() is False
+            assert nb.require_numpy() is False
+        assert calls == [], f"pip must not run on Android, got {calls}"
+        assert out.getvalue().strip() == "", out.getvalue()
+        message = err.getvalue()
+        assert nb.ANDROID_FAILED_MESSAGE.strip() in message, message
+        assert "pip install" not in message, message
+        assert "APK" in message, message
+    finally:
+        (nb.IS_ANDROID, nb._numpy_importable, nb._load_bundled,
+         nb._pip_install) = original
+    print("(д) Android: no pip, APK-specific message         OK")
+
+
 def main():
     test_gates_true()
     test_installed_no_install_initiated()
     test_install_success_path()
     test_install_failure_explicit()
+    test_android_never_pip_installs()
     test_artifactual_bundle_and_offline_run()
     print("smoke_numpy_bootstrap: ALL OK")
 

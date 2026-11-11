@@ -336,6 +336,43 @@ def _initial_segs(sm: SectorMap) -> list:
     return segs
 
 
+def _floating_lines(sm: SectorMap) -> set[int]:
+    """Linedefs that border a floating slab (design §2).
+
+    The BSP is the flat world of *host* sectors.  A slab's border is not a
+    partition: splitting the plane along it would hand the area under the slab
+    to the slab's own subsector, and the host's floor — which by
+    ``_ensure_polys`` still spans the footprint — would have nothing left to
+    draw it.  The slab is painted as an overlay by ``engine.platform_render``
+    from its polygon instead.  Maps without slabs get an empty set, so their
+    tree is bit-for-bit the one they had before this change.
+    """
+    from shared.sector_map import SPECIAL_DOORS
+
+    sectors = sm.sectors
+    floating = [bool(getattr(s, "floating", False)) for s in sectors]
+    if not any(floating):
+        return set()
+    side_sec = [sd.sector for sd in sm.sidedefs]
+
+    def _is_float(side: int) -> bool:
+        s = side_sec[side] if 0 <= side < len(side_sec) else -1
+        return 0 <= s < len(floating) and floating[s]
+
+    out = set()
+    for li, ld in enumerate(sm.linedefs):
+        if _is_float(ld.front) or _is_float(ld.back):
+            # Allow doors between floating sectors to be partitioned
+            fs_sec = side_sec[ld.front] if 0 <= ld.front < len(side_sec) else -1
+            bs_sec = side_sec[ld.back] if ld.back >= 0 and ld.back < len(side_sec) else -1
+            both_floating = (0 <= fs_sec < len(floating) and floating[fs_sec] and
+                            0 <= bs_sec < len(floating) and floating[bs_sec])
+            if both_floating and getattr(ld, "special", 0) == SPECIAL_DOORS:
+                continue
+            out.add(li)
+    return out
+
+
 def _score_partition(segs: list, cand: Seg):
     """Lower-is-better candidate score (None if it cannot separate the set).
 
@@ -366,11 +403,15 @@ def _score_partition(segs: list, cand: Seg):
     return splits, abs(len_fr - len_bk), -cand.length()
 
 
-def _pick_partition(segs: list):
+def _pick_partition(segs: list, skip_lines=frozenset()):
     best_score = None
     best = None
     seen = set()
     for s in segs:
+        if skip_lines and s.linedef in skip_lines:
+            # A slab border may still shape a subsector's seg list, it just
+            # may not split the plane.
+            continue
         key = (round(s.x1, 4), round(s.y1, 4), round(s.x2, 4),
                round(s.y2, 4), s.linedef, s.side)
         if key in seen:
@@ -447,18 +488,18 @@ def _partition(segs: list, cand: Seg):
     return front, back
 
 
-def _build(segs: list, depth: int):
+def _build(segs: list, depth: int, skip_lines=frozenset()):
     if depth > MAX_DEPTH:
         return Sub(segs)
-    cand = _pick_partition(segs)
+    cand = _pick_partition(segs, skip_lines)
     if cand is None:
         # No partition can split this set: it is convex or degenerate.
         return Sub(segs)
     front, back = _partition(segs, cand)
     if not front or not back:
         return Sub(segs)
-    nf = _build(front, depth + 1)
-    nb = _build(back, depth + 1)
+    nf = _build(front, depth + 1, skip_lines)
+    nb = _build(back, depth + 1, skip_lines)
     return Node(cand.x1, cand.y1, cand.dx, cand.dy, nf, nb)
 
 
@@ -467,4 +508,4 @@ def build_bsp(sm: SectorMap) -> BspTree:
     segs = _initial_segs(sm)
     if not segs:
         return BspTree(Sub([]))
-    return BspTree(_build(segs, 0))
+    return BspTree(_build(segs, 0, _floating_lines(sm)))

@@ -11,7 +11,8 @@ import math
 
 from shared.sector_map import (
     DOOR_LOCK_BY_TEXTURE, DOOR_TEXTURE_BY_LOCK, DOOR_TEXTURE_NONE,
-    MAX_SECTOR_HEIGHT, MIN_SECTOR_HEIGHT, SPECIAL_DOORS, STEP_HEIGHT,
+    MAX_SECTOR_HEIGHT, MIN_PLATFORM_THICKNESS, MIN_SECTOR_HEIGHT,
+    SPECIAL_DOORS, STEP_HEIGHT,
     LineDef, Sector, SectorMap, SideDef, Thing, Vertex,
 )
 
@@ -58,20 +59,46 @@ STAIR_MAX_STEPS = 64
 STAIR_FACE_TEX = "wall"
 
 
-def clamp_sector_heights(floor_h, ceil_h) -> tuple[int, int]:
-    """Normalize a floor/ceiling pair: integral, in range, ``floor <= ceil``.
+def clamp_sector_heights(floor_h, ceil_h, floating: bool = False,
+                         driver: str = "floor") -> tuple[int, int]:
+    """Normalize a floor/ceiling pair: integral, in range, ordered.
 
     Single clamp for the whole editor — the ``пол ▲/▼`` buttons and the numeric
     fields both go through it, so the map never goes invalid mid-edit and a
     rejected value is visible in the panel as the applied one.
+
+    The order is **reversed for a floating sector** (``floating=True``): its
+    ``floor_h`` is the plate top and its ``ceil_h`` the underside, so the pair
+    must keep ``floor_h >= ceil_h + MIN_PLATFORM_THICKNESS`` instead of
+    ``floor_h <= ceil_h``.  ``driver`` names the surface the caller just edited
+    (``"floor"`` or ``"ceil"``); when the thickness is too small that one keeps
+    its value and the other gives way — typing a top below the underside drops
+    the underside, typing an underside above the top raises the top.  A clamp
+    that always moved the same side would silently discard half the typed
+    values.
     """
     fl = int(round(float(floor_h)))
     ce = int(round(float(ceil_h)))
     fl = max(MIN_SECTOR_HEIGHT, min(MAX_SECTOR_HEIGHT, fl))
     ce = max(MIN_SECTOR_HEIGHT, min(MAX_SECTOR_HEIGHT, ce))
-    if fl > ce:
-        # the ceiling wins when the floor is pushed through it
-        fl = ce
+    if not floating:
+        if fl > ce:
+            # the ceiling wins when the floor is pushed through it
+            fl = ce
+        return fl, ce
+    need = MIN_PLATFORM_THICKNESS
+    if fl - ce >= need:
+        return fl, ce
+    if driver == "ceil":
+        ce = fl - need
+        if ce < MIN_SECTOR_HEIGHT:
+            ce = MIN_SECTOR_HEIGHT
+            fl = ce + need
+    else:
+        fl = ce + need
+        if fl > MAX_SECTOR_HEIGHT:
+            fl = MAX_SECTOR_HEIGHT
+            ce = fl - need
     return fl, ce
 
 
@@ -114,7 +141,8 @@ def _item_from_json(kind: str, item) -> object:
                        int(item[4]), int(item[5]))
     if kind == "sectors":
         return Sector(int(item[0]), int(item[1]), str(item[2]), str(item[3]),
-                      int(item[4]), int(item[5]), int(item[6]))
+                      int(item[4]), int(item[5]), int(item[6]),
+                      bool(item[7]) if len(item) > 7 else False)
     return Thing(float(item[0]), float(item[1]), str(item[2]), int(item[3]),
                  float(item[4]))
 
@@ -248,6 +276,8 @@ def _apply_item(obj, kind: str, item) -> None:
          obj.special, obj.tag) = (
             int(item[0]), int(item[1]), str(item[2]), str(item[3]),
             int(item[4]), int(item[5]), int(item[6]))
+        if hasattr(obj, 'floating') and len(item) > 7:
+            obj.floating = bool(item[7])
     else:
         obj.x, obj.y, obj.type, obj.angle, obj.z = (
             float(item[0]), float(item[1]), str(item[2]), int(item[3]),
@@ -639,7 +669,7 @@ class SectorEditor:
                     return px, py
         return None
 
-    def _merge_loop_lines(self, idx: int) -> list[int]:
+    def _merge_loop_lines(self, idx: int, only: int | None = None) -> list[int]:
         """The surrounding sector's loop around ``idx``, for dissolving it.
 
         A thick room's outer face is a hole in the surrounding sector, not one
@@ -647,6 +677,10 @@ class SectorEditor:
         the wall body as a void, so the enclosing hole loop goes with it — and
         only when the surrounding sector keeps another loop (the old
         ``_polygon_alive`` protection).
+
+        ``only`` restricts the search to one surrounding sector, so a room
+        ringed by several hosts collects one hole loop per host instead of the
+        single smallest one.
         """
         point = self._interior_point(idx)
         if point is None:
@@ -654,7 +688,7 @@ class SectorEditor:
         sm = self.sm
         best = None
         for sid in range(len(sm.sectors)):
-            if sid == idx:
+            if sid == idx or (only is not None and sid != only):
                 continue
             for pts, area, lids in self._sector_loops_with_lines(sid):
                 if area <= 0 or not sm._point_in_loop(point[0], point[1], pts):
@@ -779,6 +813,196 @@ class SectorEditor:
         if stranded:
             notes.append("вещи вне секторов: " +
                          ", ".join(str(i) for i in stranded))
+        return notes
+
+    # ── floating plates ───────────────────────────────────────────────
+    def _line_sides(self, ld) -> tuple[int, int]:
+        """Sector indices on the front/back side of ``ld`` (-1 when absent)."""
+        sm = self.sm
+        front = (sm.sidedefs[ld.front].sector
+                 if 0 <= ld.front < len(sm.sidedefs) else -1)
+        back = (sm.sidedefs[ld.back].sector
+                if 0 <= ld.back < len(sm.sidedefs) else -1)
+        return front, back
+
+    def _ring_is_void(self, idx: int, lines: list[int]) -> bool:
+        """True when the band just outside ``lines`` is void, not a sector.
+
+        The wall body of a thick room is empty space between the room and its
+        host (``find_sector_at`` reports ``-1``).  That band is what makes the
+        room a *ring* — a sector that merely shares a two-sided border with a
+        neighbour has its neighbour there instead, which is the case the
+        height swap alone handles.
+        """
+        sm = self.sm
+        for li in lines:
+            ld = sm.linedefs[li]
+            a, b = sm.verts[ld.v1], sm.verts[ld.v2]
+            dx, dy = b.x - a.x, b.y - a.y
+            length = math.hypot(dx, dy)
+            if length <= 1e-9:
+                return False
+            mx, my = (a.x + b.x) * 0.5, (a.y + b.y) * 0.5
+            nx, ny = -dy / length, dx / length
+            for sign in (1.0, -1.0):
+                px = mx + sign * nx * 0.5
+                py = my + sign * ny * 0.5
+                sid = sm.find_sector_at(px, py)
+                if sid == idx:
+                    continue
+                if sid != -1:
+                    return False       # a neighbour, not a ring
+        return True
+
+    def _host_outside(self, idx: int, li: int) -> int | None:
+        """Nearest non-void sector just outside wall ``li`` of ``idx``.
+
+        The wall body of a thick room is a band of void ``WALL_THICKNESS``
+        wide; the host is the first sector the outward normal reaches after
+        crossing it.  Looking at a few distances instead of one tolerates a
+        band that is slightly wider at a corner.  ``None`` means there is no
+        host on that side (a real map edge, not a ring).
+        """
+        sm = self.sm
+        ld = sm.linedefs[li]
+        a, b = sm.verts[ld.v1], sm.verts[ld.v2]
+        dx, dy = b.x - a.x, b.y - a.y
+        ln = math.hypot(dx, dy)
+        if ln <= 1e-9:
+            return None
+        mx, my = (a.x + b.x) * 0.5, (a.y + b.y) * 0.5
+        for sign in (1.0, -1.0):
+            nx, ny = -dy / ln * sign, dx / ln * sign
+            if sm.find_sector_at(mx + nx * 0.5, my + ny * 0.5) == idx:
+                continue
+            for k in range(1, 512):
+                sid = sm.find_sector_at(mx + nx * k, my + ny * k)
+                if sid == idx:
+                    break
+                if sid >= 0:
+                    return sid
+            break
+        return None
+
+    def _swap_plate_heights(self, idx: int) -> None:
+        """Heights of a room become the plate's: old ceiling on top.
+
+        The plate top is ``floor_h`` and the underside ``ceil_h``, so the pair
+        swaps, and the thickness clamp runs the *floating* way with the new
+        underside as the driver: a room thinner than
+        ``MIN_PLATFORM_THICKNESS`` grows upwards, keeping its underside on the
+        sector's own floor as the spec requires.
+        """
+        s = self.sectors[idx]
+        top, under = s.ceil_h, s.floor_h
+        s.floor_h, s.ceil_h = clamp_sector_heights(top, under, True,
+                                                   driver="ceil")
+        s.floating = True
+
+    def set_sector_floating(self, idx: int, on: bool) -> list[str]:
+        """Mark sector ``idx`` as a floating plate, or take the mark away.
+
+        A plate is a volume you walk *under*, so a room with its own walls has
+        to lose them: the ring of emptiness around it (the wall body of
+        ``sector_from_contour``) goes away, its inner contour becomes a
+        two-sided border with the one hosting sector, and the heights swap so
+        the old ceiling is the walkable top.  Everything is one undo step.
+
+        A sector that already has shared borders only swaps heights: several
+        hosts and a neighbouring plate are fine, and the neighbours' heights
+        are never adjusted silently.  A ringed room loses its wall body: every
+        inner line is bound to the nearest non-void sector outside the band,
+        and the surrounding hole loop(s) go with it.  Everything is one undo
+        step; a refusal leaves the map untouched.
+        """
+        if not (0 <= idx < len(self.sectors)):
+            return ["сектор не выделен"]
+        s = self.sectors[idx]
+        sm = self.sm
+        if not on:
+            if not s.floating:
+                return []
+            self._record()
+            s.floating = False
+            # back to a room: the top becomes the ceiling again and the
+            # ordinary clamp (ceiling wins) decides the pair
+            s.floor_h, s.ceil_h = clamp_sector_heights(s.ceil_h, s.floor_h)
+            self._after_mutate()
+            return [f"сектор {idx}: снова привязан к полу"]
+        if s.floating:
+            return []
+        own: list[int] = []       # walls of this sector alone
+        shared: list[int] = []    # borders it shares with another sector
+        for li, ld in enumerate(sm.linedefs):
+            f, b = self._line_sides(ld)
+            if idx not in (f, b):
+                continue
+            other = b if f == idx else f
+            (shared if other >= 0 else own).append(li)
+        if not own and not shared:
+            return [f"сектор {idx}: у него нет границы — плиту не из чего "
+                    f"сделать"]
+
+        if shared:
+            # Already a portal to the world: only the heights swap.  Several
+            # hosts and a floating neighbour are supported; no host is
+            # adjusted behind the author's back.
+            self._record()
+            self._swap_plate_heights(idx)
+            self._after_mutate()
+            return [f"сектор {idx}: парит (высоты обменяны)"]
+
+        if not self._ring_is_void(idx, own):
+            return [f"сектор {idx}: вокруг стены не пустота — плиту не "
+                    f"сделать"]
+
+        host_by_line: dict[int, int] = {}
+        for li in own:
+            host = self._host_outside(idx, li)
+            if host is None:
+                return [f"сектор {idx}: за стеной нет несущего сектора — "
+                        f"плиту не сделать"]
+            host_by_line[li] = host
+        hosts = set(host_by_line.values())
+
+        outer: set[int] = set()
+        for host in hosts:
+            loop = self._merge_loop_lines(idx, only=host)
+            if not loop:
+                return [f"сектор {idx}: несущий сектор {host} не образует "
+                        f"кольца — плиту не сделать"]
+            outer.update(loop)
+        if not outer or set(outer) & set(own):
+            return [f"сектор {idx}: нет стены-кольца с несущим сектором — "
+                    f"плиту не сделать"]
+
+        self._record()
+        # The inner contour becomes the plate's border: its own side keeps the
+        # plate's texture, the cloned side belongs to the nearest host and
+        # closes that host's hole in the opposite direction (a back side runs
+        # v2->v1).
+        for li in own:
+            host = host_by_line[li]
+            ld = sm.linedefs[li]
+            if 0 <= ld.back < len(sm.sidedefs) and \
+                    sm.sidedefs[ld.back].sector == idx:
+                ld.front = self._clone_side(ld.back, host)
+            else:
+                ld.back = self._clone_side(ld.front, host)
+        self._swap_plate_heights(idx)
+        # last, so its single diff flush covers the whole operation
+        self._drop(lines=set(outer),
+                   sides={li_side for li in outer
+                          for li_side in (sm.linedefs[li].front,
+                                          sm.linedefs[li].back)
+                          if li_side >= 0},
+                   prune_orphan_verts=True, record=False)
+        notes = [f"сектор {idx}: парит, кольцо стены убрано"]
+        inside = [i for i, t in enumerate(self.things)
+                  if sm.find_sector_at(t.x, t.y) == idx]
+        if inside:
+            notes.append("вещи на плите: " +
+                         ", ".join(str(i) for i in inside))
         return notes
 
     # ── linedef operations ────────────────────────────────────────────
@@ -1093,7 +1317,11 @@ class SectorEditor:
         s = self.sectors[idx]
         want_floor = s.floor_h if floor_h is None else floor_h
         want_ceil = s.ceil_h if ceil_h is None else ceil_h
-        got_floor, got_ceil = clamp_sector_heights(want_floor, want_ceil)
+        # A floating sector keeps its thickness the other way round, and the
+        # field that was actually edited decides which surface gives way.
+        driver = "ceil" if (ceil_h is not None and floor_h is None) else "floor"
+        got_floor, got_ceil = clamp_sector_heights(
+            want_floor, want_ceil, floating=bool(s.floating), driver=driver)
         if (got_floor, got_ceil) == (s.floor_h, s.ceil_h):
             return got_floor, got_ceil
         self._record()
@@ -1146,15 +1374,18 @@ class SectorEditor:
                          ceil_tex: str | None = None,
                          light: int | None = None,
                          special: int | None = None,
-                         tag: int | None = None) -> None:
+                         tag: int | None = None) -> tuple[int, int] | None:
         if not (0 <= idx < len(self.sectors)):
-            return
-        self._record()
+            return None
         s = self.sectors[idx]
-        if floor_h is not None:
-            s.floor_h = int(floor_h)
-        if ceil_h is not None:
-            s.ceil_h = int(ceil_h)
+        self._record()
+        if floor_h is not None or ceil_h is not None:
+            want_floor = s.floor_h if floor_h is None else floor_h
+            want_ceil = s.ceil_h if ceil_h is None else ceil_h
+            driver = "ceil" if (ceil_h is not None and floor_h is None) else "floor"
+            got_floor, got_ceil = clamp_sector_heights(
+                want_floor, want_ceil, floating=bool(s.floating), driver=driver)
+            s.floor_h, s.ceil_h = got_floor, got_ceil
         if floor_tex is not None:
             s.floor_tex = floor_tex
         if ceil_tex is not None:
@@ -1166,6 +1397,9 @@ class SectorEditor:
         if tag is not None:
             s.tag = int(tag)
         self._after_mutate()
+        if floor_h is not None or ceil_h is not None:
+            return s.floor_h, s.ceil_h
+        return None
 
     def _contour_loop(
         self, line_ids: list[int]

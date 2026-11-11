@@ -13,8 +13,8 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from shared.sector_map import (  # noqa: E402
-    MAX_SECTOR_HEIGHT, MIN_SECTOR_HEIGHT, SPECIAL_DOORS, LineDef, Sector,
-    SectorMap, SideDef, Thing, Vertex,
+    MAX_SECTOR_HEIGHT, MIN_PLATFORM_THICKNESS, MIN_SECTOR_HEIGHT,
+    SPECIAL_DOORS, LineDef, Sector, SectorMap, SideDef, Thing, Vertex,
 )
 from client.sector_editor import (  # noqa: E402
     GRID_DEFAULT, WALL_THICKNESS, SectorEditor, clamp_sector_heights, new_room,
@@ -95,7 +95,7 @@ def test_wall_thickness_constant():
 def _inner_lines(ed, sid):
     return [i for i, ld in enumerate(ed.lines)
             if 0 <= ld.front < len(ed.sides)
-            and ed.sides[ld.front].sector == sid and ld.back < 0]
+            and ed.sides[ld.front].sector == sid]
 
 
 def test_sector_from_contour():
@@ -403,6 +403,19 @@ def test_height_clamp():
     assert clamp_sector_heights(5000, 6000) == (MAX_SECTOR_HEIGHT,) * 2
     assert clamp_sector_heights(-5000, -6000) == (MIN_SECTOR_HEIGHT,) * 2
     assert clamp_sector_heights(200, 100)[0] <= clamp_sector_heights(200, 100)[1]
+    # a floating sector keeps the thickness the other way round: top above
+    # underside by at least MIN_PLATFORM_THICKNESS, and the edited surface wins
+    assert clamp_sector_heights(88, 72, True) == (88, 72)
+    assert clamp_sector_heights(80, 72, True) == (72 + MIN_PLATFORM_THICKNESS, 72)
+    assert clamp_sector_heights(88, 84, True, driver="ceil") == (
+        88, 88 - MIN_PLATFORM_THICKNESS)
+    assert clamp_sector_heights(88, 88, True)[0] - 88 >= MIN_PLATFORM_THICKNESS
+    # both ends of the range keep a plate legal instead of collapsing it
+    top, under = clamp_sector_heights(MAX_SECTOR_HEIGHT, MAX_SECTOR_HEIGHT, True)
+    assert top == MAX_SECTOR_HEIGHT and top - under >= MIN_PLATFORM_THICKNESS
+    top, under = clamp_sector_heights(MIN_SECTOR_HEIGHT, MIN_SECTOR_HEIGHT, True,
+                                      driver="ceil")
+    assert under == MIN_SECTOR_HEIGHT and top - under >= MIN_PLATFORM_THICKNESS
 
     ed = SectorEditor(new_room(1600, 1600))
     assert ed.sectors[0].floor_h == 0
@@ -412,6 +425,9 @@ def test_height_clamp():
     # a floor above the ceiling is pulled back, and the applied pair is returned
     assert ed.set_sector_heights(0, floor_h=999) == (128, 128)
     assert ed.sectors[0].floor_h == 128 and ed.sectors[0].ceil_h == 128
+    # a zero-height room leaves no headroom for the thing standing in it, so
+    # open the ceiling back up before asking the map to validate
+    ed.set_sector_heights(0, ceil_h=192)
     assert not ed.validate(), ed.validate()
     # out-of-range input is clamped, not rejected
     assert ed.set_sector_heights(0, ceil_h=99999) == (128, MAX_SECTOR_HEIGHT)
@@ -1011,6 +1027,117 @@ def test_two_sided_predicate():
     print("  two-sided predicate disagrees with the shared one on purpose")
 
 
+def test_set_sector_floating():
+    """«парит» turns a ringed room into a plate: one undo step, or a refusal."""
+    ed = SectorEditor(new_room(1600, 1600))
+    box = _contour_box(ed, 400, 400, 800, 800)
+    sid, errs = ed.sector_from_contour(box, floor_h=-64, ceil_h=128, light=120)
+    assert sid == 1 and not errs, errs
+    inner = _inner_lines(ed, 1)
+    assert len(inner) == 4, inner
+    # the ring is a wall body: void between the room and its host
+    assert ed.sm.find_sector_at(408, 600) == -1
+    before = ed.sm.to_json()
+    hist = len(ed._history)
+    n_lines = len(ed.lines)
+    assert ed.set_sector_floating(1, True)
+    s = ed.sectors[1]
+    assert s.floating, "the plate flag must be set"
+    # heights swapped: the old ceiling is the walkable top, the old floor the
+    # underside, and the pair is a legal plate
+    assert (s.floor_h, s.ceil_h) == (128, -64), (s.floor_h, s.ceil_h)
+    # the ring is gone: the band between the loops is host floor now
+    assert ed.sm.find_sector_at(408, 600) == 0
+    assert ed.sm.find_sector_at(600, 600) == 1
+    assert ed.sm.find_sector_at(200, 200) == 0
+    # ... and the inner contour is a portal to that one host
+    assert len(ed.lines) == n_lines - 4, (len(ed.lines), n_lines)
+    for li in _inner_lines(ed, 1):
+        ld = ed.lines[li]
+        assert ld.front >= 0 and ld.back >= 0, (li, ld)
+        assert ed.sides[ld.back].sector == 0, (li, ed.sides[ld.back].sector)
+        assert ed.sides[ld.front].sector == 1
+    assert not ed.sm.line_blocks(_inner_lines(ed, 1)[0]), \
+        "a plate border is not a wall"
+    assert not ed.validate(), ed.validate()
+    # the plate is one undo step: geometry and the mark come back together
+    assert len(ed._history) == hist + 1
+    ed.undo()
+    assert not ed.sectors[1].floating
+    assert (ed.sectors[1].floor_h, ed.sectors[1].ceil_h) == (-64, 128)
+    assert ed.sm.find_sector_at(408, 600) == -1, "the ring must come back"
+    assert ed.sm.to_json() == before, "undo must restore the drawing exactly"
+    ed.redo()
+    assert ed.sectors[1].floating
+    # disabling puts the room back: heights in ordinary order, still legal
+    assert ed.set_sector_floating(1, False)
+    assert not ed.sectors[1].floating
+    assert (ed.sectors[1].floor_h, ed.sectors[1].ceil_h) == (-64, 128)
+    assert not ed.validate(), ed.validate()
+
+    # a room that already has ONE host portal only swaps heights
+    ed = SectorEditor(new_room(1600, 1600))
+    box = _contour_box(ed, 400, 400, 800, 800)
+    sid, errs = ed.sector_from_contour(box, floor_h=16, ceil_h=96)
+    assert sid == 1 and not errs, errs
+    for li in _inner_lines(ed, 1):
+        assert ed.set_two_sided(li, True, back_sector=0) is not None
+    assert not ed.validate(), ed.validate()
+    n_lines = len(ed.lines)
+    assert ed.set_sector_floating(1, True)
+    assert ed.sectors[1].floating
+    assert (ed.sectors[1].floor_h, ed.sectors[1].ceil_h) == (96, 16)
+    assert len(ed.lines) == n_lines, "no geometry may be touched here"
+    assert not ed.validate(), ed.validate()
+
+    # several hosts plus a ring are allowed now: the shared-border path only
+    # swaps heights and never touches the drawing
+    ed = SectorEditor(new_room(1600, 1600))
+    sid, errs = ed.sector_from_contour(_contour_box(ed, 400, 400, 800, 800),
+                                       floor_h=0, ceil_h=128)
+    assert sid == 1 and not errs, errs
+    inner = _inner_lines(ed, 1)
+    assert ed.set_two_sided(inner[0], True, back_sector=0) is not None
+    n_lines = len(ed.lines)
+    hist = len(ed._history)
+    assert ed.set_sector_floating(1, True)
+    assert ed.sectors[1].floating
+    assert (ed.sectors[1].floor_h, ed.sectors[1].ceil_h) == (128, 0)
+    assert len(ed.lines) == n_lines, "shared-border path must not touch geometry"
+    assert len(ed._history) == hist + 1
+    assert not ed.validate(), ed.validate()
+
+    # refusals never touch the map
+    def unchanged(fn):
+        snap = ed.sm.to_json()
+        hist0 = len(ed._history)
+        notes = fn()
+        assert notes, "a refusal must say why"
+        assert ed.sm.to_json() == snap, notes
+        assert len(ed._history) == hist0, notes
+        return notes
+
+    # a sector with no walls at all cannot become a plate
+    ed = SectorEditor(new_room(1600, 1600))
+    sid = ed.add_sector(floor_h=0, ceil_h=128)
+    notes = unchanged(lambda: ed.set_sector_floating(sid, True))
+    assert "нет границы" in notes[0], notes
+
+    # a plate sharing a border with another plate is allowed: the shared
+    # path swaps heights only, so a bridge/two-plate layout round-trips
+    from smoke_sector_model import make_plate_bridge
+    ed = SectorEditor(make_plate_bridge())
+    assert [s.floating for s in ed.sectors] == [False, True, True]
+    assert ed.set_sector_floating(2, False)
+    assert not ed.sectors[2].floating
+    assert not ed.validate(), ed.validate()
+    assert ed.set_sector_floating(2, True)
+    assert ed.sectors[2].floating
+    assert (ed.sectors[2].floor_h, ed.sectors[2].ceil_h) == (80, 64)
+    assert not ed.validate(), ed.validate()
+    print("  set floating     OK")
+
+
 def main():
     test_vertex_ops()
     test_line_ops()
@@ -1027,6 +1154,7 @@ def main():
     test_sector_from_contour_rejects_bad_loops()
     test_wall_thickness_constant()
     test_height_clamp()
+    test_set_sector_floating()
     test_solid_flag_and_step_textures()
     test_solid_cleared_when_line_becomes_one_sided()
     test_things_roundtrip()

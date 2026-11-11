@@ -29,9 +29,9 @@ pygame.display.set_mode((1000, 700))
 
 import client.settings as settings_mod
 from client.settings import (
-    CONTROL_MODE_MOUSE, CONTROL_MODE_TRACTOR, DEFAULTS, MAX_WINDOW,
-    MIN_WINDOW, SPEC, Settings, WINDOW_SIZE_PRESETS, control_hints,
-    control_mode, is_tractor, size_text, validate_size,
+    CONTROL_MODE_MOUSE, CONTROL_MODE_TRACTOR, CONTROL_MODE_TOUCH, DEFAULTS,
+    MAX_WINDOW, MIN_WINDOW, SPEC, Settings, WINDOW_SIZE_PRESETS, control_hints,
+    control_mode, is_touch, is_tractor, parse_address, size_text, validate_size,
 )
 
 tmpdir = tempfile.mkdtemp()
@@ -114,8 +114,8 @@ s = Settings()
 assert s.get('window_size') == DEFAULTS['window_size']
 assert s.resolution() == (1000, 700)
 
-first = SPEC[4]
-assert first['key'] == 'window_size' and first.get('custom') is True
+first = next(s for s in SPEC if s['key'] == 'window_size')
+assert first['kind'] == 'list' and first.get('custom') is True
 assert '3840\u00d72160' in WINDOW_SIZE_PRESETS, '4K must be a preset'
 
 # Arrows cycle the presets and never fall off either end. The default sits in
@@ -172,7 +172,34 @@ assert control_mode('garbage') == CONTROL_MODE_MOUSE
 assert is_tractor('Трактор') and not is_tractor('Мышь')
 assert '\u2190' in control_hints('Трактор') and 'Пробел' in control_hints('Трактор')
 assert 'ЛКМ' in control_hints('Мышь')
+# Third mode: the touch label must not be swallowed by the generic "known
+# label -> mouse" branch, and it must survive both a label and an index.
+assert control_mode('Телефон') == CONTROL_MODE_TOUCH
+assert control_mode('touch') == CONTROL_MODE_TOUCH
+assert control_mode(2) == CONTROL_MODE_TOUCH
+assert is_touch('Телефон') and not is_touch('Мышь')
+assert 'стик' in control_hints('Телефон').lower()
+assert 'ЛКМ' not in control_hints('Телефон')
 print("control_mode parsing + per-mode hints OK")
+
+# ── server address: typed as host or host:port ───────────────────
+assert parse_address('192.168.1.120') == ('192.168.1.120', None, '')
+assert parse_address('192.168.1.120:7788') == ('192.168.1.120', 7788, '')
+assert parse_address('  host  ') == ('host', None, '')
+host, port, error = parse_address('')
+assert error and port is None, (host, port, error)
+assert parse_address('host:abc')[2]
+assert parse_address('host:0')[2]
+assert parse_address('host:70000')[2]
+assert parse_address('two words')[2]
+addr = Settings()
+assert addr.address_text == f"{addr.get('server_host')}:{addr.get('server_port')}"
+ok, error = addr.set_address('10.0.0.5:7001')
+assert ok and not error and addr.get('server_host') == '10.0.0.5'
+assert int(addr.get('server_port')) == 7001
+ok, error = addr.set_address('bad host')
+assert not ok and error and addr.get('server_host') == '10.0.0.5', 'refused address must not apply'
+print("server address parsing + refusal OK")
 
 # ── input handler: tractor mode ───────────────────────────────────
 from client.input_handler import InputHandler
@@ -373,9 +400,10 @@ scr._select(len(SPEC) - 1)
 scr._ensure_visible()
 assert scr._scroll > 0, 'the option list must scroll once it outgrows the canvas'
 scr.draw(r.ui, s)
-scr._select(4)
+size_row = next(i for i, s in enumerate(SPEC) if s['key'] == 'window_size')
+scr._select(size_row)
 scr._ensure_visible()
-assert scr._row_rect(4).bottom <= scr._rows_rect.bottom, 'selection must be visible'
+assert scr._row_rect(size_row).bottom <= scr._rows_rect.bottom, 'selection must be visible'
 
 typed = Settings()
 typed.set('window_size', '1600\u00d7900')

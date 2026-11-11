@@ -28,3 +28,7 @@ out_dash.txt
 # OS
 Thumbs.db
 .DS_Store
+
+# Buildozer / Android build output
+.buildozer/
+bin/

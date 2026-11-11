@@ -121,6 +121,10 @@ class SectorEditorScreen:
         self._tex_target = "lower"
         self._tex_rects: dict[str, pygame.Rect] = {}
         self._tex_chips: dict[str, pygame.Rect] = {}
+        # flat texture palette target
+        self._flat_target = "floor"  # floor or ceil
+        self._flat_rects: dict[str, pygame.Rect] = {}
+        self._flat_chips: dict[str, pygame.Rect] = {}
         self._last_mouse_canvas: tuple[float, float] | None = (500.0, 350.0)
 
         self.zoom = 0.35
@@ -672,21 +676,42 @@ class SectorEditorScreen:
         for key, rect in self._height_fields.items():
             if rect.collidepoint(pos):
                 self._height_edit = key
-                s = self.editor.sectors[self.sel_sector]
-                self._height_buffer = str(s.floor_h if key == "floor"
-                                          else s.ceil_h)
+                if self.sel_sector is not None and 0 <= self.sel_sector < len(self.editor.sectors):
+                    s = self.editor.sectors[self.sel_sector]
+                    self._height_buffer = str(s.floor_h if key == "floor"
+                                              else s.ceil_h)
                 return None
-        for key, rect in self._tex_chips.items():
-            if rect.collidepoint(pos):
-                if key in ("front", "back"):
-                    self._tex_side = key
-                else:
-                    self._tex_target = key
-                return None
-        for name, rect in self._tex_rects.items():
-            if rect.collidepoint(pos):
-                self._assign_tex(name)
-                return None
+        # flat palette target chips
+        if hasattr(self, '_flat_chips'):
+            for key, rect in self._flat_chips.items():
+                if rect.collidepoint(pos):
+                    self._flat_target = key
+                    return None
+        # flat palette samples
+        if hasattr(self, '_flat_rects'):
+            for name, rect in self._flat_rects.items():
+                if rect.collidepoint(pos):
+                    if self.sel_sector is not None and 0 <= self.sel_sector < len(self.editor.sectors):
+                        if self._flat_target == "floor":
+                            self.editor.set_sector_props(self.sel_sector, floor_tex=name)
+                        else:
+                            self.editor.set_sector_props(self.sel_sector, ceil_tex=name)
+                        self._dirty()
+                    return None
+        # hit-test wall palette only when drawn
+        side_idx = self._tex_side_idx()
+        if side_idx is not None:
+            for key, rect in self._tex_chips.items():
+                if rect.collidepoint(pos):
+                    if key in ("front", "back"):
+                        self._tex_side = key
+                    else:
+                        self._tex_target = key
+                    return None
+            for name, rect in self._tex_rects.items():
+                if rect.collidepoint(pos):
+                    self._assign_tex(name)
+                    return None
         return None
 
     def _toolbar_changed(self) -> None:
@@ -836,6 +861,7 @@ class SectorEditorScreen:
                                           (v1.x + v2.x) / 2, (v1.y + v2.y) / 2)
         elif self.sel_sector is not None and self.sel_sector >= 0:
             s = self.editor.sectors[self.sel_sector]
+            floating = bool(getattr(s, 'floating', False))
             if key == "floor_up":
                 got = self.editor.set_sector_heights(self.sel_sector,
                                                      floor_h=s.floor_h + 16)
@@ -852,6 +878,14 @@ class SectorEditorScreen:
                 got = None
                 self.editor.set_sector_props(self.sel_sector,
                                              light=(s.light + 48) % 256)
+            elif key == "float":
+                notes = self.editor.set_sector_floating(self.sel_sector, not floating)
+                if notes:
+                    self.status = "; ".join(notes)
+                else:
+                    self.status = "Сектор обновлён"
+                got = None
+                self._dirty()
             if got is not None:
                 self._height_status(got)
         elif self.sel_thing is not None:
@@ -1133,12 +1167,28 @@ class SectorEditorScreen:
 
         polys = self.editor.sm._ensure_polys()
         for si, loops in enumerate(polys):
-            light = self.editor.sectors[si].light if si < len(self.editor.sectors) else 128
+            if si >= len(self.editor.sectors):
+                continue
+            s = self.editor.sectors[si]
+            light = s.light if si < len(self.editor.sectors) else 128
             lv = 14 + int(light / 255 * 72)
             col = (lv, lv + 8, lv + 22)
             for points, _bbox, _area in loops:
                 scr = [local(px, py) for px, py in points]
                 pygame.draw.polygon(surf, col, scr)
+            if getattr(s, 'floating', False):
+                # draw diagonal hatching/marker in centroid
+                if loops:
+                    pts = loops[0][0]
+                    if pts:
+                        cxm = sum(p[0] for p in pts) / len(pts)
+                        cym = sum(p[1] for p in pts) / len(pts)
+                        sc = local(cxm, cym)
+                        # draw a small diagonal mark
+                        r = max(4, int(6 * z))
+                        pygame.draw.line(surf, (220, 200, 80), (sc[0]-r, sc[1]-r), (sc[0]+r, sc[1]+r), 1)
+                        pygame.draw.line(surf, (220, 200, 80), (sc[0]+r, sc[1]-r), (sc[0]-r, sc[1]+r), 1)
+                        pygame.draw.rect(surf, (220, 200, 80), (sc[0]-r-1, sc[1]-r-1, 2*r+2, 2*r+2), 1)
         for li, ld in enumerate(self.editor.lines):
             v1, v2 = self.editor.verts[ld.v1], self.editor.verts[ld.v2]
             kind = self.editor.line_wall_kind(li)
@@ -1239,10 +1289,19 @@ class SectorEditorScreen:
                                        else "дверь: без ключа")
         elif self.sel_sector is not None and self.sel_sector >= 0:
             s = self.editor.sectors[self.sel_sector]
-            self._prop_text = (f"пол {s.floor_h}  потол {s.ceil_h}  "
-                               f"свет {s.light}  пол:{s.floor_tex}  пот:{s.ceil_tex}")
-            chips = {"floor_up": "пол ▲", "floor_dn": "пол ▼",
-                     "ceil_up": "потол ▲", "ceil_dn": "потол ▼", "light": "свет +"}
+            floating = bool(getattr(s, 'floating', False))
+            if floating:
+                self._prop_text = (f"верх {s.floor_h}  подошва {s.ceil_h}  "
+                                   f"свет {s.light}  пол:{s.floor_tex}  пот:{s.ceil_tex}")
+            else:
+                self._prop_text = (f"пол {s.floor_h}  потол {s.ceil_h}  "
+                                   f"свет {s.light}  пол:{s.floor_tex}  пот:{s.ceil_tex}")
+            chips = {"floor_up": "пол ▲" if not floating else "верх ▲",
+                     "floor_dn": "пол ▼" if not floating else "верх ▼",
+                     "ceil_up": "потол ▲" if not floating else "подошва ▲",
+                     "ceil_dn": "потол ▼" if not floating else "подошва ▼",
+                     "light": "свет +",
+                     "float": "парит" if not floating else "привязан"}
         elif self.sel_thing is not None:
             t = self.editor.things[self.sel_thing]
             self._prop_text = f"{t.type} @ ({t.x:.0f},{t.y:.0f}) угол {t.angle}"
@@ -1259,9 +1318,12 @@ class SectorEditorScreen:
         # numeric floor/ceiling fields; they show the value actually applied
         if self.sel_sector is not None and self.sel_sector >= 0:
             s = self.editor.sectors[self.sel_sector]
+            floating = bool(getattr(s, 'floating', False))
             fy = cy + ((len(chips) + 1) // 2) * 22 + 6
+            floor_label = "верх" if floating else "пол"
+            ceil_label = "подошва" if floating else "потол"
             for i, (key, label, value) in enumerate(
-                    (("floor", "пол", s.floor_h), ("ceil", "потол", s.ceil_h))):
+                    (("floor", floor_label, s.floor_h), ("ceil", ceil_label, s.ceil_h))):
                 rect = pygame.Rect(x + i * (cw + 8), fy, cw, 20)
                 focused = self._height_edit == key
                 pygame.draw.rect(surface, SELECT if focused else (28, 31, 45),
@@ -1283,6 +1345,30 @@ class SectorEditorScreen:
             txt = self.tiny_font.render("Enter — создать сектор", True, GREEN)
             surface.blit(txt, (x, self._prop_rect.y + 134))
 
+    def _build_flat_palette(self) -> list[tuple[str, pygame.Rect]]:
+        x = self.panel.x + 6
+        w = self.panel.width - 12
+        self._flat_rects = {}
+        self._flat_chips = {}
+        y = self._context_y
+        # chips for target ПОЛ/ПОТОЛОК
+        keys = ("floor", "ceil")
+        n = len(keys)
+        cw = max(28, (w - (n - 1) * 4) // n)
+        labels = {"floor": "ПОЛ", "ceil": "ПОТОЛОК"}
+        for i, key in enumerate(keys):
+            rect = pygame.Rect(x + i * (cw + 4), y, cw, 18)
+            self._flat_chips[key] = rect
+        y += 22
+        items = []
+        cw3 = (w - (len(FLAT_PALETTE) - 1) * 4) // len(FLAT_PALETTE) if FLAT_PALETTE else w
+        for i, name in enumerate(FLAT_PALETTE):
+            rect = pygame.Rect(x + i * (cw3 + 4), y, cw3, 18)
+            self._flat_rects[name] = rect
+            items.append((name, rect))
+        self._flat_block_h = 22 + 18 + 4
+        return items
+
     def _draw_palette(self, surface) -> None:
         x = self.panel.x + 6
         hdr = self.tiny_font.render("ВЕЩИ — ВРАГИ / ПРЕДМЕТЫ / БАЗА", True, ACCENT)
@@ -1302,16 +1388,22 @@ class SectorEditorScreen:
             surface.blit(txt, (rect.x + 4, rect.y + 2))
         # contextual block: wall textures for a two-sided line, else flats
         if not self._draw_tex_palette(surface, x):
+            flat_items = self._build_flat_palette()
             flh = self.tiny_font.render("ФЛАТЫ (для сектора)", True, ACCENT)
-            surface.blit(flh, (x, self._context_y))
-            y = self._context_y + 16
-            cw3 = (self.panel.width - 12 - 8) // 3 - 4
-            for i, name in enumerate(FLAT_PALETTE):
-                rect = pygame.Rect(x + (i % 3) * (cw3 + 4),
-                                   y + (i // 3) * 20, cw3, 18)
+            surface.blit(flh, (x, self._context_y - 16))
+            # draw target chips
+            labels = {"floor": "ПОЛ", "ceil": "ПОТОЛОК"}
+            for key, rect in self._flat_chips.items():
+                bg = SELECT if self._flat_target == key else (40, 44, 62)
+                pygame.draw.rect(surface, bg, rect, border_radius=3)
+                pygame.draw.rect(surface, MUTED, rect, 1, border_radius=3)
+                txt = self.tiny_font.render(labels[key], True, TEXT)
+                surface.blit(txt, (rect.x + 4, rect.y + 2))
+            # draw flat samples
+            for name, rect in flat_items:
                 pygame.draw.rect(surface, (40, 44, 62), rect, border_radius=3)
-                txt = self.tiny_font.render(
-                    self._fit(name, rect.width - 4), True, TEXT)
+                pygame.draw.rect(surface, MUTED, rect, 1, border_radius=3)
+                txt = self.tiny_font.render(self._fit(name, rect.width - 4), True, TEXT)
                 surface.blit(txt, (rect.x + 2, rect.y + 1))
         hint = self.tiny_font.render(
             f"1-{len(TOOL_NAMES)} — инструменты | G — сетка | F — кадр | "

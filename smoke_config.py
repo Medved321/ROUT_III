@@ -66,6 +66,16 @@ assert gs.render_scale == 2, gs.render_scale
 assert const.SCALE == rendering.SCALE == gs.render_scale == 2
 print("RenderBridge keeps applied view_dist/render_scale OK")
 
+# ── the support height travels from the snapshot to gs ────────────
+b = RenderBridge(pygame.Surface((1000, 700)))
+b.update(10.0, 20.0, 0.0, 100, [], [], [], [], player_z=96)
+assert gs.player_z == 96.0, gs.player_z
+b.update(10.0, 20.0, 0.0, 100,
+         [{"id": 2, "x": 1.0, "y": 2.0, "angle": 0.0, "z": 88}])
+assert gs.player_z is None, "a tile/flat update must clear the height"
+assert gs.players[0]["z"] == 88, gs.players[0]
+print("bridge carries player_z and remote z OK")
+
 # ── successful connect persists address + name ────────────────────
 save_server_settings('game.example.net', 5555, 'Hero')
 with open(settings_mod.CONFIG_PATH, encoding='utf-8') as f:
@@ -168,6 +178,7 @@ try:
     gs.items = [{'id': 1}]
     gs.dwall_hp = {(0, 0): 3}
     gs.bridge_open = {(0, 0)}
+    gs.player_z = 42.0
     gc._init_from_server()
 finally:
     client_mod.GameMap = orig_gamemap
@@ -176,6 +187,7 @@ finally:
 assert gs.particles == [] and gs.decals == [] and gs.weather == []
 assert gs.enemies == [] and gs.corpses == [] and gs.items == []
 assert gs.dwall_hp == {} and gs.bridge_open == set()
+assert gs.player_z is None, gs.player_z
 print("starting a party resets transient state OK")
 
 print("ALL CONFIG SMOKE TESTS PASSED")

@@ -43,6 +43,129 @@ def make_simple_map(floor_h: int = 0, ceil_h: int = 128) -> SectorMap:
     return sm
 
 
+def make_poly(sm: SectorMap, pts: list[tuple[float, float]],
+              sector_id: int) -> None:
+    """Append a closed one-sided contour through ``pts`` for ``sector_id``."""
+    side_id = len(sm.sidedefs)
+    sm.sidedefs.append(SideDef(sector=sector_id))
+    cx = sum(p[0] for p in pts) / len(pts)
+    cy = sum(p[1] for p in pts) / len(pts)
+
+    def vid(px: float, py: float) -> int:
+        for idx, v in enumerate(sm.verts):
+            if v.x == px and v.y == py:
+                return idx
+        sm.verts.append(Vertex(px, py))
+        return len(sm.verts) - 1
+
+    for i in range(len(pts)):
+        ax, ay = pts[i]
+        bx, by = pts[(i + 1) % len(pts)]
+        cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        if cross >= 0:
+            ax, ay, bx, by = bx, by, ax, ay
+        sm.linedefs.append(LineDef(vid(ax, ay), vid(bx, by), front=side_id))
+
+
+def attach_plate_backs(sm: SectorMap, sid: int) -> None:
+    """Give every one-sided plate border the ordinary sector just outside it."""
+    import math as _math
+    for ld in sm.linedefs:
+        if not (0 <= ld.front < len(sm.sidedefs)):
+            continue
+        if sm.sidedefs[ld.front].sector != sid or ld.back >= 0:
+            continue
+        a, b = sm.verts[ld.v1], sm.verts[ld.v2]
+        dx, dy = b.x - a.x, b.y - a.y
+        ln = _math.hypot(dx, dy)
+        if ln <= 1e-9:
+            continue
+        mx, my = (a.x + b.x) * 0.5, (a.y + b.y) * 0.5
+        for sign in (1.0, -1.0):
+            nx, ny = -dy / ln * sign, dx / ln * sign
+            host = sm.find_sector_at(mx + nx * 0.5, my + ny * 0.5)
+            if host >= 0 and host != sid:
+                sm.sidedefs.append(SideDef(sector=host))
+                ld.back = len(sm.sidedefs) - 1
+                break
+    sm.invalidate()
+
+
+def make_two_host_plate() -> SectorMap:
+    """A plate spanning two ordinary rooms and their shared portal."""
+    sm, _portal = two_room_map()
+    sm.sectors.append(Sector(floor_h=80, ceil_h=64, floating=True))
+    make_poly(sm, [(256, 128), (512, 128), (768, 128),
+                   (768, 384), (512, 384), (256, 384)], 2)
+    attach_plate_backs(sm, 2)
+    return sm
+
+
+def make_side_abut_plate() -> SectorMap:
+    """A plate whose left edge *is* the host's outer wall (side contact)."""
+    sm = SectorMap()
+    sm.sectors.append(Sector(floor_h=0, ceil_h=200))
+    sm.sectors.append(Sector(floor_h=80, ceil_h=64, floating=True))
+    # Host boundary, with the left wall split at the plate's two corners.
+    make_poly(sm, [(0, 0), (512, 0), (512, 512),
+                   (0, 512), (0, 384), (0, 128)], 0)
+    shared = next(i for i, ld in enumerate(sm.linedefs)
+                  if {(sm.verts[ld.v1].x, sm.verts[ld.v1].y),
+                      (sm.verts[ld.v2].x, sm.verts[ld.v2].y)}
+                  == {(0.0, 128.0), (0.0, 384.0)})
+
+    def vid(px: float, py: float) -> int:
+        for idx, v in enumerate(sm.verts):
+            if v.x == px and v.y == py:
+                return idx
+        sm.verts.append(Vertex(px, py))
+        return len(sm.verts) - 1
+
+    # The plate's other three edges chain with the shared wall's back edge.
+    for a, b in (((0, 128), (256, 128)), ((256, 128), (256, 384)),
+                 ((256, 384), (0, 384))):
+        side = len(sm.sidedefs)
+        sm.sidedefs.append(SideDef(sector=1))
+        sm.linedefs.append(LineDef(vid(float(a[0]), float(a[1])),
+                                   vid(float(b[0]), float(b[1])), front=side))
+    sm.sidedefs.append(SideDef(sector=1))
+    sm.linedefs[shared].back = len(sm.sidedefs) - 1
+    attach_plate_backs(sm, 1)
+    sm.things.append(Thing(64, 64))
+    return sm
+
+
+def make_plate_bridge() -> SectorMap:
+    """Two floating plates sharing a side, both inside one host."""
+    sm = SectorMap()
+    sm.sectors.append(Sector(floor_h=0, ceil_h=200))
+    sm.sectors.append(Sector(floor_h=80, ceil_h=64, floating=True))
+    sm.sectors.append(Sector(floor_h=80, ceil_h=64, floating=True))
+    make_rect(sm, 0, 0, 512, 512, 0)
+    make_rect(sm, 128, 128, 256, 384, 1)
+    make_rect(sm, 256, 128, 384, 384, 2)
+    # The two rectangles each grew their own x=256 wall.  One of them becomes
+    # the shared portal; the duplicate goes away so the border is a single
+    # two-sided linedef, not a pair of twin edges.
+    shared = [(li, sm.sidedefs[ld.front].sector)
+              for li, ld in enumerate(sm.linedefs)
+              if (0 <= ld.front < len(sm.sidedefs)
+                  and sm.sidedefs[ld.front].sector in (1, 2)
+                  and ld.back < 0
+                  and {(sm.verts[ld.v1].x, sm.verts[ld.v1].y),
+                       (sm.verts[ld.v2].x, sm.verts[ld.v2].y)}
+                  == {(256.0, 128.0), (256.0, 384.0)})]
+    keep = next(li for li, f in shared if f == 1)
+    drop = next(li for li, f in shared if f == 2)
+    sm.sidedefs.append(SideDef(sector=2))
+    sm.linedefs[keep].back = len(sm.sidedefs) - 1
+    del sm.linedefs[drop]
+    attach_plate_backs(sm, 1)
+    attach_plate_backs(sm, 2)
+    sm.things.append(Thing(64, 64))
+    return sm
+
+
 def test_roundtrip() -> None:
     sm = make_simple_map()
     js = sm.to_json()
@@ -475,6 +598,254 @@ def test_protocol_roundtrip() -> None:
     print("  protocol roundtrip OK")
 
 
+def make_platform_map(host_floor: int = 16, host_ceil: int = 200,
+                      slab_top: int = 88, slab_under: int = 72,
+                      two_sided: bool = True, solid: bool = False,
+                      floating: bool = True) -> SectorMap:
+    """Host room with a floating slab inside it.
+
+    The slab border is two-sided: the slab keeps its own closed loop from its
+    side, while the host's loop skips the edge so its floor survives.
+    """
+    sm = SectorMap()
+    sm.sectors.append(Sector(floor_h=host_floor, ceil_h=host_ceil))
+    sm.sectors.append(Sector(floor_h=slab_top, ceil_h=slab_under,
+                             floating=floating))
+    make_rect(sm, 0, 0, 512, 512, 0)
+    make_rect(sm, 128, 128, 384, 384, 1)
+    if two_sided:
+        host_side = len(sm.sidedefs)
+        sm.sidedefs.append(SideDef(sector=0))
+        for ld in sm.linedefs:
+            if sm.sidedefs[ld.front].sector == 1:
+                ld.back = host_side
+                ld.solid = solid
+    sm.things.append(Thing(64, 64))
+    return sm
+
+
+def test_platform_geometry() -> None:
+    """Slab keeps the host floor whole; sectors_at sees both sectors."""
+    from shared.sector_map import ACTOR_HEIGHT, MIN_PLATFORM_THICKNESS
+
+    assert MIN_PLATFORM_THICKNESS == 8, MIN_PLATFORM_THICKNESS
+    assert ACTOR_HEIGHT == 56, ACTOR_HEIGHT
+
+    sm = make_platform_map()
+    assert sm.validate() == [], sm.validate()
+
+    # The slab border does not carve a hole in the host: both sectors contain
+    # a point under the slab, innermost (smallest loop) first.
+    assert sm.find_sector_at(256, 256) == 1
+    assert sm.sectors_at(256, 256) == [1, 0], sm.sectors_at(256, 256)
+    assert sm.sectors_at(64, 64) == [0]
+    assert sm.sectors_at(-10, 64) == []
+    assert sm.floor_under(256, 256) == 16
+    assert sm.floor_under(64, 64) == 16
+    # getter parity for non-floating maps
+    assert make_simple_map().sectors_at(10, 10) == [0]
+
+    # Support: under the slab the host floor is the support; the top is too
+    # far above the feet to be stepped onto.
+    assert sm.support_at(256, 256, 16) == 16.0
+    # ... and the top is reachable when the feet are one step below it.
+    assert sm.support_at(256, 256, 80) == 88.0
+    # Fully under with a headroom of exactly ACTOR_HEIGHT is passable.
+    assert sm.support_at(256, 256, 16) is not None
+
+    # A low slab is a step: the top becomes the support and can be left.
+    low = make_platform_map(slab_top=32, slab_under=24)
+    assert low.support_at(256, 256, 16) == 32.0
+    assert low.support_at(64, 64, 32) == 16.0
+    # Too high above the feet → not a support, pass underneath instead.
+    high = make_platform_map(slab_top=100, slab_under=84)
+    assert high.support_at(256, 256, 16) == 16.0
+    # Too little clearance → not passable at all.
+    tight = make_platform_map(slab_top=100, slab_under=60)
+    assert tight.support_at(256, 256, 16) is None
+    # No support / no sector.
+    assert make_platform_map().support_at(-10, 64, 0) is None
+
+    # The slab border is not a wall: movement and sight cross both ways.
+    from shared import mt1 as _mt1
+    border = next(i for i, ld in enumerate(sm.linedefs)
+                  if sm.sidedefs[ld.front].sector == 1)
+    assert sm.line_blocks(border) is False
+    assert sm.can_move_px(256, 116, 16)
+    assert sm.can_move_px(256, 140, 16)
+    assert sm.has_los_px(64, 64, 256, 256)
+    assert sm.has_los_px(256, 256, 64, 64)
+    assert not _mt1.reject_test(sm.build_reject(), 2, 0, 1), \
+        "slab border must not make the host opaque"
+
+    # Ordinary walls and tall steps keep blocking.
+    plain = make_simple_map()
+    assert plain.line_blocks(0) is True
+    assert not plain.can_move_px(8, 256, 16)
+    tall_step, portal = two_room_map(0, 32)
+    assert tall_step.line_blocks(portal) is True
+    assert not tall_step.can_move_px(512, 256, 16)
+    print("  platform geometry OK")
+
+
+def _add_nested(sm: SectorMap, x0: float, y0: float,
+                x1: float, y1: float, floating: bool) -> int:
+    """Add a room (or plate) nested inside sector 0, portalled to it."""
+    sid = len(sm.sectors)
+    sm.sectors.append(Sector(floor_h=120, ceil_h=104, floating=True)
+                      if floating else Sector(floor_h=0, ceil_h=200))
+    make_rect(sm, x0, y0, x1, y1, sid)
+    if floating:
+        attach_plate_backs(sm, sid)
+    else:
+        host_side = len(sm.sidedefs)
+        sm.sidedefs.append(SideDef(sector=0))
+        for ld in sm.linedefs:
+            if (0 <= ld.front < len(sm.sidedefs)
+                    and sm.sidedefs[ld.front].sector == sid
+                    and ld.back < 0):
+                ld.back = host_side
+    sm.invalidate()
+    return sid
+
+
+def test_platform_validation() -> None:
+    """A plate's topology is free; thickness and the solid flag are not."""
+    # A map without floating sectors stays valid.
+    assert make_simple_map().validate() == []
+
+    thin = make_platform_map(slab_top=76, slab_under=72)
+    assert any("thinner than" in e for e in thin.validate()), thin.validate()
+
+    # A one-sided plate border is legal — the border is not a wall anyway.
+    assert make_platform_map(two_sided=False).validate() == []
+
+    solid = make_platform_map(solid=True)
+    assert any("solid flag on a floating sector border" in e
+               for e in solid.validate()), solid.validate()
+
+    # The plate may rise above the host ceiling: the topology is free.
+    tall = make_platform_map(host_ceil=80, slab_top=88)
+    assert tall.validate() == [], tall.validate()
+
+    # A thing under the plate stands on the ordinary floor, and exactly
+    # ACTOR_HEIGHT of headroom is enough.
+    under = make_platform_map()
+    under.things.clear()
+    under.things.append(Thing(256, 256))
+    assert under.validate() == [], under.validate()
+
+    # No ordinary floor under the point: a plate alone is not a floor.
+    only_plate = make_platform_map()
+    only_plate.things.clear()
+    only_plate.sectors.append(Sector(floor_h=88, ceil_h=72, floating=True))
+    make_rect(only_plate, 600, 600, 700, 700, 2)
+    only_plate.things.append(Thing(650, 650))
+    assert any("stands on floating sector 2" in e
+               for e in only_plate.validate()), only_plate.validate()
+
+    # An ordinary floor with too little headroom is not a floor either.
+    low = make_platform_map(host_ceil=80, slab_top=64, slab_under=56)
+    low.things.clear()
+    low.things.append(Thing(256, 256))
+    assert any("no floor with enough headroom" in e
+               for e in low.validate()), low.validate()
+
+    # Overlapping slabs are allowed: plates may contact each other.
+    nested = make_platform_map()
+    nested.sectors.append(Sector(floor_h=34, ceil_h=24, floating=True))
+    make_rect(nested, 160, 160, 200, 200, 2)
+    attach_plate_backs(nested, 2)
+    assert nested.validate() == [], nested.validate()
+    print("  platform validation OK")
+
+
+def test_platform_contact() -> None:
+    """A plate may touch another plate, several hosts, or a wall."""
+    # Spanning two rooms across their portal keeps both hosts' floors whole.
+    two = make_two_host_plate()
+    assert two.validate() == [], two.validate()
+    assert two.find_sector_at(256, 256) == 2
+    assert two.sectors_at(256, 256) == [2, 0]
+    assert two.sectors_at(640, 256) == [2, 1]
+    assert two.floor_under(256, 256) == 0
+    assert two.floor_under(640, 256) == 0
+    assert two.support_at(256, 256, 80) == 80.0
+    assert two.sectors_at(256, 64) == [0]
+    assert two.sectors_at(640, 64) == [1]
+
+    # A plate abutting the host wall from the side: no void, no hole.
+    side = make_side_abut_plate()
+    assert side.validate() == [], side.validate()
+    assert side.sectors_at(100, 256) == [1, 0]
+    assert side.floor_under(100, 256) == 0
+    assert len(side._ensure_polys()[0]) == 1, side._ensure_polys()[0]
+    assert side.sectors_at(300, 256) == [0]
+
+    # Two equal plates sharing a side are a bridge, not two walls.
+    bridge = make_plate_bridge()
+    assert bridge.validate() == [], bridge.validate()
+    assert bridge.sectors_at(200, 256) == [1, 0]
+    assert bridge.sectors_at(300, 256) == [2, 0]
+    assert bridge.support_at(200, 256, 80) == 80.0
+    assert bridge.support_at(300, 256, 80) == 80.0
+
+    # A plate nested in a host that also has a side-abutting plate: the hole
+    # the nested plate would carve is dropped, so the host floor survives.
+    covered = make_side_abut_plate()
+    _add_nested(covered, 300, 300, 400, 400, floating=True)
+    assert covered.validate() == [], covered.validate()
+    assert len(covered._ensure_polys()[0]) == 1
+    assert covered.sectors_at(350, 350) == [2, 0]
+
+    # A real room inside the host is a genuine hole and stays.
+    room = make_side_abut_plate()
+    _add_nested(room, 256, 256, 384, 384, floating=False)
+    assert room.validate() == [], room.validate()
+    assert len(room._ensure_polys()[0]) == 2
+    assert room.sectors_at(300, 300) == [2]
+    print("  platform contact OK")
+
+
+def test_platform_json() -> None:
+    """JSON v2 writes the flag, reads v1/7-field payloads, rejects v3."""
+    from shared.sector_map import SECTOR_FORMAT_VERSION
+
+    assert SECTOR_FORMAT_VERSION == 2, SECTOR_FORMAT_VERSION
+    sm = make_platform_map()
+    js = sm.to_json()
+    assert js["version"] == 2, js["version"]
+    assert len(js["sectors"][1]) == 8, js["sectors"][1]
+    assert js["sectors"][0][7] is False
+    assert js["sectors"][1][7] is True
+
+    again = SectorMap.from_json(js)
+    assert again.sectors[1].floating is True
+    assert (again.sectors[1].floor_h, again.sectors[1].ceil_h) == (88, 72)
+    assert again.to_json() == js
+
+    # A 7-element sector payload (version 1) reads as "anchored".
+    old = dict(js)
+    old["version"] = 1
+    old["sectors"] = [s[:7] for s in js["sectors"]]
+    old_map = SectorMap.from_json(old)
+    assert all(not s.floating for s in old_map.sectors)
+
+    # Version 2 with a 7-element record is also "anchored".
+    partial = dict(js)
+    partial["sectors"] = [s[:7] for s in js["sectors"]]
+    assert not SectorMap.from_json(partial).sectors[1].floating
+
+    bad = dict(js)
+    bad["version"] = 3
+    try:
+        SectorMap.from_json(bad)
+        raise AssertionError("v3 accepted")
+    except ValueError:
+        pass
+    print("  platform json OK")
+
+
 if __name__ == "__main__":
     test_roundtrip()
     test_validation()
@@ -483,4 +854,8 @@ if __name__ == "__main__":
     test_physics()
     test_passability()
     test_protocol_roundtrip()
+    test_platform_geometry()
+    test_platform_validation()
+    test_platform_contact()
+    test_platform_json()
     print("SECTOR MODEL TEST PASSED")
