@@ -179,6 +179,10 @@ def section_entrypoint():
     # with no dialog.  A missing numpy used to ``raise SystemExit(1)``, which
     # on a phone is indistinguishable from a native crash.
     check("raise SystemExit" not in src, "nothing may exit on the way out")
+    check("sys.exit(main())" not in src,
+          "SystemExit escaping the entrypoint is a silent close on the phone")
+    check(re.search(r"try:\s*\n\s*shown = show_fatal\(", src) is not None,
+          "the crash reporter itself must be guarded; it is the last line of defence")
     check("except BaseException" in src,
           "startup failures, SystemExit included, must be reported")
     check("show_fatal(" in src, "a failure must leave its traceback on screen")
@@ -413,9 +417,34 @@ assert "stage: numpy import" in data, data
 assert "ImportError: boom-numpy" in data, data
 assert "Этап: numpy import" in text, text
 
+# The failed run leaves a boot marker, and the next launch sees the stage even
+# when the traceback never reached the screen (a native crash closes the app
+# before any Python can draw).
+again = fatal.StartupLog()
+assert again.previous, "the next launch must see the failed run"
+assert again.previous["stage"] == "numpy import", again.previous
+assert again.previous["status"] == "failed", again.previous
+# The traceback travels with the marker: when the exception *is* the display,
+# the current run cannot draw it and only the next launch can.
+tail = "\n".join(again.previous.get("tail") or [])
+assert "ImportError: boom-numpy" in tail, again.previous
+assert again.previous.get("python"), "the marker names the interpreter that died"
+# Once startup completes, a later normal close is not a crash.
+again.mark_running()
+again.close()
+third = fatal.StartupLog()
+assert third.previous is None, third.previous
+third.clear_boot()
+third.close()
+fourth = fatal.StartupLog()
+assert fourth.previous is None, fourth.previous
+fourth.close()
+
 # An unwritable candidate set must degrade to memory, never raise.
 ro = fatal.StartupLog(private="/proc/definitely-not-here", app_root="/proc/nope")
 ro.write("still fine")
+ro.stage("numpy import")
+ro.clear_boot()
 ro.close()
 
 # The screen itself must draw with whatever driver the device has.
@@ -453,11 +482,54 @@ def section_crash_reporter():
     print("startup crash: log mirror, stage markers, on-screen traceback OK")
 
 
+# ── 4b. the desktop end of the same trail ────────────────────────
+def section_device_tool():
+    import importlib.util
+
+    path = ROOT / "tools" / "android_log.py"
+    spec = importlib.util.spec_from_file_location("android_log", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    # The one fact that makes an installed APK close before Python runs: its
+    # ABI is not on the device.  Naming it saves a whole build/test cycle.
+    arm64 = "ro.product.cpu.abi = arm64-v8a\nro.product.cpu.abilist = arm64-v8a,armeabi-v7a"
+    only32 = "ro.product.cpu.abi = armeabi-v7a\nro.product.cpu.abilist = armeabi-v7a"
+    check(module.arch_warning(["arm64-v8a"], arm64) is None,
+          "an arm64 APK on an arm64 phone must not warn")
+    warning = module.arch_warning(["arm64-v8a"], only32)
+    check(warning is not None and "arm64-v8a" in warning,
+          "a 64-bit-only APK on a 32-bit phone must be named as the cause")
+    check(module.arch_warning([], arm64) is None, "an unknown APK must stay quiet")
+
+    apk = ROOT / "releases" / "rout3-1.2.0-arm64-v8a-debug.apk"
+    if apk.is_file():
+        check(module.apk_archs(str(apk)) == ["arm64-v8a"],
+              "the shipped APK must declare exactly the arm64 ABI")
+
+    # The log lives in app-private storage and in the separate crash buffer;
+    # both are invisible to a file manager on Android 11+.
+    script = path.read_text(encoding="utf-8")
+    check("run-as" in script and "rout3-startup.log" in script,
+          "the tool must read the app-private startup log")
+    check("-b\", \"crash\"" in script or "-b crash" in script,
+          "the native crash buffer is separate from the main logcat buffer")
+    check(module.summary("I/x: hello\nE/PythonActivity: boom\nI/y: ok") ==
+          ["E/PythonActivity: boom"], "the summary must keep only relevant lines")
+
+    proc = subprocess.run([sys.executable, str(path), "--help"],
+                          capture_output=True, text=True, timeout=60)
+    check(proc.returncode == 0 and "--no-launch" in proc.stdout,
+          f"the tool must document its flags:\n{proc.stdout}\n{proc.stderr}")
+    print("device tool: ABI mismatch, crash buffer, app-private log OK")
+
+
 def main():
     section_spec()
     section_recipes()
     section_entrypoint()
     section_crash_reporter()
+    section_device_tool()
     section_writable_root()
     section_fullscreen()
     section_workflow()

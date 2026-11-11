@@ -25,6 +25,13 @@ Two rules shape this file:
     calling ``exit()``.  Imports are inside that function on purpose: an
     ``ImportError`` is the most likely Android-only failure, and a module-level
     import would run before the guard exists.
+
+``rout3-boot.json``
+    The screen above is drawn by Python, so it cannot report a death that
+    happens *before* Python can draw (a native crash in SDL/numpy, a display
+    that never comes up).  ``StartupLog`` therefore writes the current stage to
+    a marker file as it goes, and the next launch shows that marker on screen
+    before retrying.  That is the only trail a phone without ``adb`` leaves.
 """
 from __future__ import annotations
 
@@ -45,7 +52,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 # p4a already chdirs into the extracted app dir; do it anyway so a run from an
 # IDE with a different cwd still finds ``maps/`` and ``skins/`` the same way.
-os.chdir(ROOT)
+# Guarded because an exception here would escape before any diagnostics exist.
+try:
+    os.chdir(ROOT)
+except OSError:
+    pass
 
 from client.fatal import StartupLog, show_fatal  # noqa: E402
 
@@ -89,6 +100,9 @@ def _startup(startup: StartupLog) -> None:
     client = GameClient(host, port, name)
 
     startup.stage("event loop")
+    # From here on the app is running: being closed later (or killed by
+    # Android) is not a startup failure and must not raise an alarm next time.
+    startup.mark_running()
     use_udp_safe_event_loop()
     try:
         asyncio.run(client.run())
@@ -103,6 +117,32 @@ def main() -> int:
     startup = StartupLog()
     startup.attach_logging()
     startup.enable_faulthandler()
+    previous = startup.previous
+    if previous:
+        # A previous run died before it could draw anything (a native crash, a
+        # display that never came up, or the player dismissing a report).  The
+        # marker is the only record, and app-private files are unreachable from
+        # a phone's file manager, so the stage and the last log lines are shown
+        # on the next start.
+        tail = previous.get("tail") or []
+        details = "\n".join(str(line) for line in tail[-6:])
+        text = (
+            "Предыдущий запуск завершился аварийно.\n\n"
+            f"Этап: {previous.get('stage', '?')}\n"
+            f"Время: {previous.get('time', '?')}\n"
+            f"Python: {previous.get('python', '?')} ({previous.get('platform', '?')})\n"
+        )
+        if details:
+            text += "\nПоследние строки журнала:\n" + details + "\n"
+        text += "\nЖурнал: " + startup.report() + "\n\nтап / Esc — продолжить запуск"
+        try:
+            show_fatal(
+                text,
+                title="ROUT III — прошлый запуск прервался",
+                log=startup,
+            )
+        except BaseException:  # diagnostics must never stop the next try
+            pass
     try:
         _startup(startup)
     except BaseException as exc:  # noqa: BLE001 - nothing may escape to exit()
@@ -112,15 +152,33 @@ def main() -> int:
         except BaseException:
             pass
         # Keep the process alive with the traceback on screen: a phone with no
-        # adb can still show (and screenshot) what went wrong.
-        if not show_fatal(text, log=startup):
-            print(text, file=sys.stderr)
-            print("Журнал: " + ", ".join(startup.paths), file=sys.stderr)
+        # adb can still show (and screenshot) what went wrong.  The reporter
+        # itself is guarded too -- it is the last line of defence, and a
+        # failure inside it must not turn a readable crash into a silent close.
+        try:
+            shown = show_fatal(text, log=startup)
+        except BaseException:
+            shown = False
+        if shown:
+            # The player has seen this report; do not repeat it next launch.
+            startup.clear_boot()
+        else:
+            for stream in (sys.stderr, sys.stdout):
+                try:
+                    print(text, file=stream)
+                    print("Журнал: " + ", ".join(startup.paths), file=stream)
+                    stream.flush()
+                except BaseException:
+                    pass
         startup.close()
         return 1
+    startup.clear_boot()
     startup.close()
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # No ``sys.exit()``: ``SystemExit`` escaping the entry point is exactly the
+    # silent window close this module exists to prevent.  p4a ends the process
+    # on its own once the script returns.
+    main()

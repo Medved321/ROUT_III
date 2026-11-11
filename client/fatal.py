@@ -22,17 +22,27 @@ entry point the two things that make such a crash *readable on the device*:
     user dismisses it.  A crash the player can screenshot is a bug report; a
     window that disappears is not.
 
+The log path alone is not enough on a phone: ``ANDROID_PRIVATE`` is invisible
+without root and ``Android/data`` is hidden from most file managers on Android
+11.  So the last startup stage is *also* written to a small boot marker, and
+the next launch shows it on screen (``StartupLog.previous``).  A native crash that
+kills the process before an exception can be drawn therefore still names its
+stage on the following start.
+
 Only the standard library is imported at module level: the failure being
 reported may *be* the pygame import, so pygame is imported inside
 ``show_fatal()`` and a failure there still leaves the log behind.
 """
 from __future__ import annotations
 
+import json
 import os
+import sys
 import time
 import traceback
 
 LOG_NAME = "rout3-startup.log"
+BOOT_NAME = "rout3-boot.json"
 
 #: Where Android mounts app-specific external storage.  The package name is
 #: derived from ``ANDROID_PRIVATE`` (``/data/user/0/<package>/files``) instead
@@ -67,28 +77,35 @@ def external_files_dir(private: str | None) -> str | None:
     return os.path.join(EXTERNAL_ROOT, package, "files")
 
 
+def _log_dirs(private: str | None = None,
+              app_root: str | None = None) -> list[str]:
+    """Directories the diagnostics want to live in, most durable first.
+
+    No "current directory" candidate: p4a always exports both variables (and
+    ``main.py`` chdirs into the program tree anyway), so a cwd fallback would
+    only ever write a log into the source checkout during development.
+    """
+    private = private if private is not None else os.environ.get("ANDROID_PRIVATE", "")
+    app_root = app_root if app_root is not None else os.environ.get("ANDROID_APP_PATH", "")
+    out: list[str] = []
+    for directory in (private, app_root, external_files_dir(private)):
+        if directory and directory not in out:
+            out.append(directory)
+    return out
+
+
 def log_candidates(private: str | None = None,
                    app_root: str | None = None) -> list[str]:
     """Every place the log wants to live, most durable first, deduplicated."""
-    private = private if private is not None else os.environ.get("ANDROID_PRIVATE", "")
-    app_root = app_root if app_root is not None else os.environ.get("ANDROID_APP_PATH", "")
-    # No "current directory" candidate: p4a always exports both variables (and
-    # ``main.py`` chdirs into the program tree anyway), so a cwd fallback would
-    # only ever write a log into the source checkout during development.
-    out: list[str] = []
-    for directory in (private, app_root):
-        if directory:
-            out.append(os.path.join(directory, LOG_NAME))
-    external = external_files_dir(private)
-    if external:
-        out.append(os.path.join(external, LOG_NAME))
-    seen: set[str] = set()
-    unique: list[str] = []
-    for path in out:
-        if path not in seen:
-            seen.add(path)
-            unique.append(path)
-    return unique
+    return [os.path.join(directory, LOG_NAME)
+            for directory in _log_dirs(private, app_root)]
+
+
+def boot_candidates(private: str | None = None,
+                    app_root: str | None = None) -> list[str]:
+    """Every place the boot marker wants to live, same order as the log."""
+    return [os.path.join(directory, BOOT_NAME)
+            for directory in _log_dirs(private, app_root)]
 
 
 class StartupLog:
@@ -105,6 +122,10 @@ class StartupLog:
         self.path: str | None = None
         self.last_stage = "start"
         self._files: list = []
+        self._boot_paths = boot_candidates(private, app_root)
+        # Read before the first ``stage()`` overwrites the marker: this is the
+        # only record of a run that died natively after that marker was written.
+        self.previous = self._read_previous()
         for path in log_candidates(private, app_root):
             handle = self._open(path)
             if handle is None:
@@ -113,7 +134,16 @@ class StartupLog:
             self._files.append(handle)
             if self.path is None:
                 self.path = path
+        # Written into every boot marker: the phone may report a different
+        # interpreter or ABI than the build assumed, and that is the first thing
+        # to rule out when the app dies before anything can be drawn.
+        self._info = {
+            "python": sys.version.split()[0],
+            "platform": sys.platform,
+            "machine": os.environ.get("ANDROID_ABI", "") or "",
+        }
         self.stage("entrypoint loaded")
+
 
     # ── files ───────────────────────────────────────────────────────
     @staticmethod
@@ -142,10 +172,78 @@ class StartupLog:
                 except (OSError, ValueError):
                     pass
                 self._files.remove(handle)
+        # p4a redirects stderr to logcat, so the trail is readable there even
+        # when every file candidate is unwritable (or the user cannot reach
+        # app-private storage).  ``LogFile`` in start.c flushes per newline.
+        try:
+            sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def _write_boot(self, status: str) -> None:
+        """Best-effort record of the stage, for the next start's screen.
+
+        The last few log lines travel with the marker: when the exception was
+        the display itself, ``show_fatal()`` cannot draw it, and the next launch
+        is the only chance to put the traceback in front of the player.
+        """
+        payload = json.dumps(
+            {
+                "stage": self.last_stage,
+                "time": _stamp(),
+                "status": status,
+                **self._info,
+                "tail": [line[:200] for line in self.lines[-8:]],
+            },
+            ensure_ascii=False,
+        )
+        for path in self._boot_paths:
+            try:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                return
+            except OSError:
+                continue
+
+    def _read_previous(self) -> dict | None:
+        """The boot marker of the run before this one, if it ended badly.
+
+        Only a marker left *during startup* is a crash.  ``running`` means the
+        startup finished and the app was later closed by the player (or killed
+        by Android), which is not an error; ``shown`` means the traceback was
+        already on screen and the player dismissed it.
+        """
+        for path in self._boot_paths:
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except (OSError, ValueError, TypeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            if data.get("status") in ("startup", "failed"):
+                return data
+            return None
+        return None
+
+    def clear_boot(self) -> None:
+        """Forget the previous run's marker (startup finished cleanly)."""
+        self.flush()
+        for path in self._boot_paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def mark_running(self) -> None:
+        """Startup succeeded; a later exit is a normal close, not a crash."""
+        self._write_boot("running")
 
     def stage(self, name: str) -> None:
         self.last_stage = name
         self.write(f"stage: {name}")
+        self._write_boot("startup")
 
     def flush(self) -> None:
         for handle in list(self._files):
@@ -172,6 +270,7 @@ class StartupLog:
         for line in text.rstrip().splitlines():
             self.write("    " + line)
         self.flush()
+        self._write_boot("failed")
         return f"Этап: {self.last_stage}\n\n{text}".rstrip()
 
     def attach_logging(self) -> None:

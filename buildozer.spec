@@ -29,7 +29,7 @@ source.include_exts = py,png,jpg,jpeg,json,txt,mt1,mts,atlas
 source.exclude_dirs = .git,.github,.venv,.buildozer,__pycache__,bin,openspec,releases,tools,music
 source.exclude_patterns = smoke_*.py,config.json,*.pyc,*.pyo,*.bat,*.sh,README.md,SPEC.md,AGENTS.md,pyproject.toml,requirements.txt
 
-version = 1.2.0
+version = 1.2.1
 
 # Python, pygame and numpy are compiled into the APK; the client must never
 # need pip, the network or a system interpreter at startup.

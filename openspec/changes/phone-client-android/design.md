@@ -307,6 +307,34 @@ numpy.
   `FINGER*`; регрессию держат `smoke_touch_controls.py` (оверлей) и
   `smoke_android_build.py` (порядок установки флага до pygame, перевод пальца).
 
+## Startup failure visibility on the device
+
+p4a runs the entry point with `PyRun_SimpleFile` and finishes with `exit(ret)`:
+an escaping exception (including `SystemExit`) closes the window, and on a phone
+that is indistinguishable from a native crash. There is no dialog, no traceback,
+and app-private storage is not reachable from a file manager on Android 11+.
+
+- **One guarded function.** All startup work moved into `main.py: _startup()`
+  under a single `except BaseException`; imports live inside it because an
+  `ImportError` is the likeliest Android-only failure. `sys.exit(main())` was
+  removed for the same reason — returning from `main()` lets p4a end the process
+  itself.
+- **Two channels, because one is not enough.** The on-screen report covers a
+  Python-level failure; the `rout3-boot.json` marker (status `startup` /
+  `failed` / `running`, last stage, interpreter version, tail of the log) covers
+  the failures that cannot draw -- a native crash in SDL/numpy, or the display
+  never coming up. The next launch shows the marker before retrying, so the
+  phone itself becomes the report. The log also mirrors to `stderr`, which p4a
+  forwards to logcat.
+- **Markers are cleared deliberately.** `mark_running()` runs immediately before
+  `asyncio.run`, so being killed later is a normal close; `clear_boot()` runs
+  after a clean start and after the player dismisses a report, so the alarm is
+  shown once, not on every launch.
+- **`tools/android_log.py` is the fallback when the screen never appears.** It
+  pulls logcat (including the separate `crash` buffer) and the app-private files
+  over `adb`, and names an APK/device ABI mismatch -- the one failure that
+  installs fine and closes before Python starts, leaving no marker at all.
+
 ## Migration Plan
 
 - Миграции данных нет: новые ключи получают дефолты, старый `config.json` без
