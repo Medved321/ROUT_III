@@ -321,11 +321,13 @@ def section_workflow():
     # failure is still diagnosed by the previous script.
     check('".github/scripts/**"' in flow,
           "editing the failure reporter must trigger a build")
-    # An apt mirror hiccup is runner noise, and without a token the job log
-    # cannot be read afterwards: retrying is the only way to keep the APK from
-    # going unbuilt for a reason nobody can see -- and the final failure must
+    # An apt mirror can stall for tens of minutes on a hosted runner, and
+    # without a token the job log cannot be read afterwards: every apt call is
+    # bounded (``timeout`` + IPv4), retried once, and the final failure must
     # publish its own tail as annotations, which *are* readable.
-    check("for attempt in 1 2 3" in flow and "tail -n 40 /tmp/apt.log" in flow,
+    check("timeout -k 10" in flow and "Acquire::ForceIPv4=true" in flow,
+          "a stalled mirror must not consume the build window")
+    check("for attempt in 1 2" in flow and "tail -n 60 /tmp/apt.log" in flow,
           "the host-dependency step must retry and publish its own failure")
     print("CI workflow builds and uploads the debug APK OK")
 

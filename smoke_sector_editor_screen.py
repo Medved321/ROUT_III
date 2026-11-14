@@ -478,7 +478,10 @@ def _check_tex_palette(scr, surface) -> None:
     ids = [ed.add_line(*e) for e in ((a, b), (b, c), (c, d), (d, a))]
     sid, errs = ed.sector_from_contour(ids, floor_h=16, ceil_h=128)
     assert sid > 0 and not errs, errs
-    outer = ids[0]
+    # A genuinely one-sided wall: the surrounding room's outer map border.
+    # The contour itself became a shared portal, so it no longer exercises
+    # the one-sided palette branch.
+    outer = next(i for i, ld in enumerate(ed.lines) if ld.back < 0)
     assert not ed.lines[outer].two_sided
     scr.editor = ed
     scr.frame_around()
@@ -723,8 +726,9 @@ def _check_front_side_invariant(scr, surface) -> None:
 def _two_rooms_map():
     """Two rooms side by side, split by the one wall they share.
 
-    Built by hand: ``sector_from_contour`` now makes a thick room whose outer
-    face is one-sided, so a contour can no longer donate a portal edge.
+    Built by hand: the fixture wants a portal between two ordinary rooms with
+    a known line index, independent of how ``sector_from_contour`` shapes a
+    newly created room.
     """
     sm = SectorMap()
     sm.sectors.append(Sector(floor_h=0, ceil_h=128, light=90))
@@ -883,14 +887,12 @@ def _check_load_reports_a_repair(scr, surface) -> None:
 
 
 def _check_create_status(scr, surface) -> None:
-    """Creating through the screen builds a thick room and says so.
+    """Creating through the screen builds a zero-thickness room and says so.
 
-    The sector is born with its inner loop inset by ``WALL_THICKNESS``: the
-    surrounding sector keeps a hole where the old contour was, and the strip
-    between the two loops is the solid wall body.
+    The contour IS the border: all four edges become two-sided portals between
+    the surrounding sector and the new one, with no inset loop and no wall body
+    between them.
     """
-    from client.sector_editor import WALL_THICKNESS
-
     ed = scr.editor = SectorEditor(new_room(1600, 1600))
     n0 = len(ed.lines)
     scr.contour = []
@@ -905,17 +907,19 @@ def _check_create_status(scr, surface) -> None:
                 ((v1, v2), (v2, v3), (v3, v4), (v4, v1))]
 
     scr.contour = box(300, 300, 700, 700)
+    contour = list(scr.contour)
     scr._create_sector()
-    assert scr.status == "Сектор 1 создан (толщина стены 16)", scr.status
+    assert scr.status == "Сектор 1 создан (границы — общие проёмы)", scr.status
     n = len(ed.lines) - n0
-    assert n == 8, f"4 contour + 4 inner lines: {n}"
-    inner = [i for i, ld in enumerate(ed.lines)
-             if 0 <= ld.front < len(ed.sides)
-             and ed.sides[ld.front].sector == 1 and ld.back < 0]
-    assert len(inner) == 4, inner
+    assert n == 4, f"the contour is the whole border: {n}"
+    for li in contour:
+        ld = ed.lines[li]
+        assert ld.front >= 0 and ld.back >= 0, (li, "expected a portal")
+        assert ed.sides[ld.front].sector == 0
+        assert ed.sides[ld.back].sector == 1
     assert ed.sm.find_sector_at(500, 500) == 1, "the room interior"
-    assert ed.sm.find_sector_at(500, 300 + WALL_THICKNESS / 2) == -1, \
-        "the strip between the loops is the wall body"
+    assert ed.sm.find_sector_at(500, 308) == 1, "the room reaches its border"
+    assert ed.sm.find_sector_at(500, 292) == 0, "and the host starts there"
     assert not ed.validate(), ed.validate()
     assert ed.sm.has_polygon(0) and ed.sm.has_polygon(1), "both contours alive"
     scr.draw(surface)

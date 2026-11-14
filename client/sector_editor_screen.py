@@ -681,26 +681,32 @@ class SectorEditorScreen:
                     self._height_buffer = str(s.floor_h if key == "floor"
                                               else s.ceil_h)
                 return None
-        # flat palette target chips
-        if hasattr(self, '_flat_chips'):
-            for key, rect in self._flat_chips.items():
-                if rect.collidepoint(pos):
-                    self._flat_target = key
-                    return None
-        # flat palette samples
-        if hasattr(self, '_flat_rects'):
-            for name, rect in self._flat_rects.items():
-                if rect.collidepoint(pos):
-                    if self.sel_sector is not None and 0 <= self.sel_sector < len(self.editor.sectors):
-                        if self._flat_target == "floor":
-                            self.editor.set_sector_props(self.sel_sector, floor_tex=name)
-                        else:
-                            self.editor.set_sector_props(self.sel_sector, ceil_tex=name)
-                        self._dirty()
-                    return None
-        # hit-test wall palette only when drawn
+        # The contextual block shows EITHER the wall texture palette (a
+        # linedef is selected) or the sector flats.  The hidden palette's
+        # rects stay in memory, so hit-testing both would let a stale flat
+        # sample swallow a click meant for a wall slot: only the drawn block
+        # is clickable.
         side_idx = self._tex_side_idx()
-        if side_idx is not None:
+        if side_idx is None:
+            # flat palette target chips
+            if hasattr(self, '_flat_chips'):
+                for key, rect in self._flat_chips.items():
+                    if rect.collidepoint(pos):
+                        self._flat_target = key
+                        return None
+            # flat palette samples
+            if hasattr(self, '_flat_rects'):
+                for name, rect in self._flat_rects.items():
+                    if rect.collidepoint(pos):
+                        if self.sel_sector is not None and 0 <= self.sel_sector < len(self.editor.sectors):
+                            if self._flat_target == "floor":
+                                self.editor.set_sector_props(self.sel_sector, floor_tex=name)
+                            else:
+                                self.editor.set_sector_props(self.sel_sector, ceil_tex=name)
+                            self._dirty()
+                        return None
+        else:
+            # hit-test wall palette only when drawn
             for key, rect in self._tex_chips.items():
                 if rect.collidepoint(pos):
                     if key in ("front", "back"):
@@ -773,7 +779,7 @@ class SectorEditorScreen:
             return None
         self.contour = []
         self._set_sel(sector=sec)
-        self.status = f"Сектор {sec} создан (толщина стены 16)"
+        self.status = f"Сектор {sec} создан (границы — общие проёмы)"
         self._dirty()
         return None
 
