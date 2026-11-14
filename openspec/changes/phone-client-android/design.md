@@ -1,0 +1,376 @@
+# Design
+
+## Context
+
+Сейчас единственный владелец «устройство → снимок ввода» — `client/input_handler.py`:
+он же вычитывает `pygame.event.get()` в игре, он же держит `move_x`/`move_y`/
+`rotate_delta`/`shoot`/`dash`. `GameClient._process_input()` зовёт его раз в
+кадр, `_input_snapshot()` отдаёт результат в `input_send_loop` 25 Гц.
+
+Сеть и сервер ограничивают форму ввода: `encode_player_input` — `!bbfBBB`, то
+есть `move_x`/`move_y` это int8, `rotate_delta` уезжает абсолютным углом
+(`local_angle`), огонь и дэш — биты в байтовых флагах
+(`shared/protocol.py: INPUT_FLAG_*`). Сервер зажимает движение в `[-1, 1]`
+(`server/server.py: _apply_input`), а дэш принимает только при ненулевом
+векторе движения в том же пакете.
+
+Вывод кадра: `RenderBridge.render()` — это `rendering.render()` в
+`gs.screen` (сетка `const.W × const.H`) и один `blit` в поверхность дисплея;
+`GameClient._render()` сразу после этого зовёт `pygame.display.flip()`. Меню
+живут на отдельном холсте 1000×700 (`Renderer.ui`) и получают события через
+`GameClient._menu_events()`.
+
+Ограничение платформы: Android NDK не выпускает host-тулчейн под linux-aarch64,
+а на этой машине (Jetson, aarch64) нет amd64-эмуляции и нет root. Поэтому APK
+собирается на x86_64-хосте, а здесь готовится всё, что нужно для
+`buildozer android debug`.
+
+См. `proposal.md` — Why.
+
+## Goals / Non-Goals
+
+**Goals:**
+
+- Третий режим ввода без второго пути к сети и без правки протокола.
+- Оверлей, который стоит один булев тест на кадр, когда тач выключен, и не
+  выделяет память на кадр, когда включён.
+- Проверяемость без телефона: геометрия, мультитач, сброс удержаний и
+  цифровое движение покрыты headless-тестами с синтетическими `FINGER*`.
+- Сборка, которую можно повторить одной командой на любой x86_64-машине.
+
+**Non-Goals:**
+
+- Аналоговое движение, наклон камеры (его нет в движке), новые поля протокола.
+- Перетаскивание раскладки, «плавающие» стики, свайп-обзор.
+- Переписывание меню под тач: клиент переводит касание в клик и свайп в
+  прокрутку (`_menu_finger_events`), сама вёрстка меню не меняется.
+- Геймпад, iOS, виброотдача, вторая ориентация.
+
+## Decisions
+
+### D1. Тач-слой пишет в `InputHandler`, а не в сеть
+
+`client/touch_controls.py` держит только состояние касаний (кто какой палец
+захватил, где база, какое отклонение) и **не** знает про сеть. Поля снимка
+(`move_x`, `move_y`, `rotate_delta`, `shoot`, `dash`, `use`) по-прежнему
+выставляет `InputHandler.update()` — это уже единственный владелец «устройство →
+снимок», и `Shoot`/`Dash`-защёлки (`_process_input`, `_dash_pending`) остаются
+на месте.
+
+*Альтернатива:* отдельный `TouchInput`, который сам отдаёт снимок. Отвергнута:
+два владельца `rotate_delta` и два пути огня — ровно та конструкция, из-за
+которой в проекте уже появлялся «выстрел из ввода» (см. `fire-intent-single-path`).
+
+### D2. Геометрия — одна функция на отрисовку и хит-тест
+
+`TouchLayout` считает по габаритам поверхности словарь прямоугольников
+(`move_stick`, `look_stick`, `fire`, `dash`, `use`, `weapon_next`) и радиусы
+баз. И `draw()`, и `_hit(pos)` читают **один и тот же** результат: хитбокс —
+это нарисованный прямоугольник (и круг базы у стика).
+
+*Альтернатива:* рисовать в одном месте и считать hit-тест по числам в другом.
+Отвергнута: в палитре редактора ширина чипа уже считалась дважды, и пятый чип
+переставал нажиматься, потому что нарисованный прямоугольник не совпадал с
+зоной клика.
+
+### D3. Размеры — в единицах вёрстки, поверхности — в кэше
+
+Радиусы и кнопки считаются от `viewport.ui_px(...)` и от **короткой** стороны
+поверхности, поэтому на 2400×1080 и на 640×480 они занимают одну и ту же долю
+экрана. Кэш поверхностей живёт по ключу `(kind, size_px, alpha)`;
+пересобирается только на ресайзе или смене настроек.
+
+*Альтернатива:* один полноэкранный `SRCALPHA`-слой под оверлей. Отвергнута:
+на телефоне это 2400×1080 RGBA каждый кадр — те же 10 МБ и полный проход
+смешивания, что в проекте уже запрещено бюджетом эффектов.
+
+### D4. Оверлей рисуется в кадр между миром и `flip()`
+
+Вставка — в `GameClient._render()` сразу после `self.bridge.render()` и до
+`pygame.display.flip()`, в поверхность окна (`self.renderer.screen`). Так
+оверлей не попадает ни во внутренний буфер, ни в апскейл, и его координаты —
+экранные, как у HUD и прицела.
+
+*Альтернативы:* `engine/rendering.py` (движок не знает клиентских настроек и
+не должен знать) и `RenderBridge` (это адаптер данных, а не UI). Обе отвергнуты.
+
+### D5. Обзор пропорционален отклонению, без разгона
+
+`rotate_delta = clamp(dx / radius, -1, 1) * touch_look_speed * dt`, где `dt` —
+из `pygame.time.get_ticks()` с потолком `MAX_TURN_DT` (как у трактора): после
+паузы или сворачивания камера не «догоняет» пропущенное время.
+
+*Альтернативы:* разгон `turn_accel` (клавиша бинарная, у стика уже есть
+аналоговая ручка — разгон сделал бы отклик вязким); `mouse_sensitivity`
+(другая размерность: пиксели против доли радиуса).
+
+### D6. Мультитач по `finger_id`; синтетическая мышь Android выключена глобально
+
+`FINGERDOWN` внутри базы (или её увеличенного хитбокса) захватывает палец за
+этим стиком до `FINGERUP` с тем же `finger_id`. Второй палец захватывает
+второй стик, и стики не мешают друг другу, потому что состояние ключуется
+идентификатором, а не «текущим касанием».
+
+Android SDL2 по умолчанию превращает первый палец в пару press/motion, поэтому
+один тап по кнопке «Огонь» дал бы два интента: один из `FINGER*`, второй из
+синтетической мыши. Гасится это **глобально** в точке входа APK
+(`main.py`: `SDL_TOUCH_MOUSE_EVENTS=0` до импорта pygame — SDL читает флаг при
+инициализации), а не «только в игровом режиме».
+
+Причина, по которой режимный флаг не годится: синтетическая мышь ломает и
+меню, которые живут отдельным путём событий. Поэтому меню на Android получают
+тап сами, без платформенной эмуляции: `GameClient._menu_events()` переводит
+`FINGERDOWN`/`FINGERMOTION`/`FINGERUP` в `MOUSEBUTTONDOWN`/`MOUSEBUTTONUP`
+(тап) и `MOUSEWHEEL` (вертикальный свайп) в координатах холста 1000×700
+(`_menu_finger_events`). Один владелец перевода — клиент, а не платформа.
+
+`run_client.py`/`client/__main__.py` (десктоп) флаг не ставят: там мышь
+настоящая, `TOUCH_NO_MOUSE = IS_ANDROID` глушит её только в тач-режиме на
+телефоне, а на десктопе мышь по-прежнему нажимает оверлей — иначе режим нельзя
+было бы проверить руками без тачскрина.
+
+*Альтернатива:* режимный флаг `TOUCH_NO_MOUSE` вместо глобального (первая
+версия). Отвергнута: в меню синтетическая мышь продолжала бы существовать
+рядом с переведёнными касаниями, то есть тап срабатывал бы дважды, а перевод
+пальца в клик был бы вторым источником истины о том же событии.
+
+### D7. Движение цифровое, с гистерезисом октантов
+
+Отклонение раскладывается в те же восемь направлений, что `WASD`, с порогами
+0.35 радиуса на включение оси и 0.25 на выключение. Без гистерезиса палец на
+границе октанта дребезжит, и пакеты 25 Гц прыгают между `(1,0)` и `(1,1)`.
+
+*Почему цифровое:* `!bbf` и серверный зажим `[-1,1]`; аналог потребовал бы
+новой версии протокола, а `PROTOCOL_VERSION` трогать нельзя.
+
+*Альтернатива:* нормализовать диагональ на клиенте. Отвергнута: масштаб
+скорости — серверная величина, и клиентская нормализация тихо меняла бы баланс.
+
+### D8. Защёлка для `use`, оружие — без защёлки
+
+Кнопка «Использовать» ставит `_use_pending`; `_input_snapshot()` читает его,
+добавляет `INPUT_FLAG_USE` и гасит. Иначе тап короче 40 мс (интервал отправки
+25 Гц) пропадает целиком — с клавиатуры это незаметно, пальцем заметно сразу.
+Перебор оружия защёлки не требует: `weapon_id` — состояние, а не событие.
+
+*Альтернатива:* поднять частоту отправки. Отвергнута: это меняет сетевой
+трафик ради одного бита.
+
+### D9. Сброс удержаний — до `pygame.event.clear()`
+
+`_enter_pause`/`_exit_pause`/`_enter_end`/`_exit_end`/`_leave_to_lobby` уже
+чистят очередь событий, а вместе с ней улетает `FINGERUP`. Поэтому
+`input_handler.reset_touch()` зовётся рядом с `unlock_mouse()` **до** очистки:
+иначе палец, зажатый в момент Esc, останется «нажатым» навсегда и персонаж
+поедет сам. Туда же `WINDOWFOCUSLOST`.
+
+### D10. Третий режим и ловушка разбора
+
+`CONTROL_MODES = ["Мышь", "Трактор", "Телефон"]`, `CONTROL_MODE_TOUCH = 2`.
+В `control_mode()` строка «телефон» обязана разбираться **до** проверки
+`text in CONTROL_MODES`: сейчас эта ветка возвращает «Мышь», и новый режим молча
+превратился бы в мышиный.
+
+В режиме «Телефон» клавиши движения/огня/дэша не читаются (ровно одна кнопка на
+действие), а `Esc` и цифры оружия продолжают работать — Esc обязан открывать
+паузу на любой платформе.
+
+### D11. Настройки: ползунки тача и адрес сервера
+
+Новые ключи — **множители уже нарисованного размера**, а не доли короткой
+стороны:
+
+- `touch_stick_size` 0.6–1.6 — во сколько раз база стика больше/меньше
+  авторской;
+- `touch_button_size` 0.6–1.6 — то же для кнопок;
+- `touch_opacity` 0.15–0.90 — альфа виджетов;
+- `touch_look_speed` 1.0–6.0 — рад/с при полном отклонении стика.
+
+Множители, а не абсолютные доли, потому что авторский размер уже выбран под
+палец и выражен в единицах вёрстки (`viewport.ui_px`); доля короткой стороны
+переизобретала бы эту единицу в настройках и расходилась бы с ней на разных
+соотношениях сторон. Все четыре — обычные `float`-строки `SPEC`; экран
+настроек уже умеет прокрутку. Геометрия при этом остаётся чистой функцией
+окна: `TouchLayout` получает ширину/высоту и считает всё через
+`viewport.ui_px(units, width, height)`, поэтому одинаковые настройки дают
+одинаковую раскладку на любом экране.
+
+`server_host` сейчас задаётся только `config.json` или `--host`, а на Android
+ни того, ни другого в руках нет (CLI у APK нет). Поэтому адрес — **текстовая**
+строка настроек вида `host:port`: переиспользуется существующее поле ввода
+(как `Ш×В` у `window_size`), а вокруг него зовётся
+`pygame.key.start_text_input()` — без этого системная клавиатура не появится и
+поле останется мёртвым. Один парсер (`parse_address`) разбирает и `host:port`,
+и голый `host`, и молча оставляет прежний порт; ошибка ввода показывается
+строкой под полем, а не подменяется молча.
+
+*Альтернатива:* запекать адрес в APK при сборке. Отвергнута: адрес Jetson
+выдаётся по DHCP (`192.168.1.120` сегодня), и игрок застрял бы без пересборки.
+
+### D12. Сборка: python-for-android + buildozer, bootstrap `sdl2`
+
+Сборка — **облачный CI** (`.github/workflows/android.yml`, x86_64
+`ubuntu-latest`), потому что NDK не выпускает host-тулчейн под linux-aarch64, а
+на этой машине (Jetson) нет amd64-эмуляции и root. Workflow ставит buildozer,
+собирает `buildozer -v android debug` и выкладывает `bin/*.apk` артефактом
+`rout3-android-apk` (30 дней). Тот же `buildozer.spec` работает и на любой
+локальной x86_64-машине с SDK/NDK.
+
+`p4a.bootstrap = sdl2` — нативная SDL2-активность без Kivy, именно она отдаёт
+`FINGER*` и мультитач. `android.archs = arm64-v8a` (одна архитектура: сборка
+вдвое короче, телефон всё равно 64-битный), `android.api = 36`,
+`android.minapi = 24` (требование рецепта numpy), `android.ndk_api = 24`,
+`android.ndk = 28c` (рекомендация p4a), `android.permissions = INTERNET`,
+`orientation = landscape`, `fullscreen = 1`, `android.private_storage = True`.
+
+Версии фиксируются **локальными рецептами** `tools/android/recipes/`
+(`p4a.local_recipes`), потому что p4a v2026.05.09 собирает Python 3.14.2 и
+pygame 2.1.0, а проект — Python 3.12 и pygame ≥ 2.5:
+
+- `pygame` — 2.6.1 (тот же рецепт, что у p4a, с поднятой версией);
+- `python3` и `hostpython3` — **оба** 3.12.14 (p4a сравнивает их и отказывается
+  собирать при расхождении). Патчи p4a подключаются по абсолютному пути в
+  каталог его собственного рецепта: имена p4a ищет относительно локального
+  рецепта. Все четыре патча p4a (`pyconfig_detection`,
+  `reproducible-buildinfo`, `cpython-311-ctypes-find-library`,
+  `fix_ensurepip`) проверены на CPython 3.12.14; `py3.8.1_fix_cortex_a8`
+  подключается только при наличии `lld` и для arm64 не нужен.
+
+  Один патч — **наш**, `tools/android/recipes/python3/patches/
+  grp-no-group-enumeration.patch`: `Modules/grpmodule.c` в 3.12 зовёт
+  `setgrent()`/`getgrent()`/`endgrent()` безусловно, а configure эту функцию
+  даже не проверяет. bionic объявляет их только с API 26, а сборка идёт под
+  `ndk_api = 24`, поэтому модуль падал с `call to undeclared function
+  'setgrent'`. Патч возвращает пустой список из `grp.getgrall()` ниже API 26
+  (обходить в Android нечего), а `getgrgid()`/`getgrnam()` продолжают
+  работать через bionic-вызовы API 24. `Modules/pwdmodule.c` патча не требует:
+  его `getpwall()` уже закрыт `HAVE_GETPWENT`, который configure на API 24 не
+  находит.
+
+Точка входа `main.py` в корне — тонкий двойник `run_client.py`: ставит
+`SDL_TOUCH_MOUSE_EVENTS=0` до импорта pygame, `os.chdir` к распакованному
+дереву (p4a уже это делает, но запуск из IDE должен вести себя так же),
+`launch_config([])` без argv (адрес — в настройках), `require_numpy()` и
+`asyncio.run(client.run())`.
+
+Конфиг на Android пишется в `ANDROID_PRIVATE` (родитель `files/app`), а не в
+дерево программы: p4a распаковывает `files/app` заново при смене версии APK
+(`unpackAsset(..., cleanup_on_version_update=True)`), и настройки в нём
+обнулялись бы при каждом обновлении. На десктопе остаётся корень проекта.
+По той же причине окно всегда полноэкранное по размеру устройства, а
+сохранённый пресет `window_size` игнорируется и **не перезаписывается** —
+иначе запуск на телефоне уничтожил бы десктопный выбор окна.
+
+Обновление: на Android `GameClient.run()` не зовёт `_maybe_update()` и не
+строит `update_offer` (`UPDATER_ENABLED = not IS_ANDROID`); версия клиента —
+версия APK, собранная из `shared/version.py`.
+
+`numpy` — обязательное требование APK: `client/numpy_bootstrap.py` на Android
+не пытается `pip install` (его там нет), а сразу сообщает, что APK собран без
+numpy.
+
+### D13. Тесты без устройства
+
+`smoke_touch_controls.py` работает headless (`SDL_VIDEODRIVER=dummy`) и
+синтезирует `FINGERDOWN`/`FINGERMOTION`/`FINGERUP` в `InputHandler.update()`:
+геометрия и хитбоксы, два пальца одновременно, «обзор только стиком», раздельные
+огонь/дэш, кламп радиуса, сброс на паузе, защёлка `use`, цифровое движение с
+гистерезисом, отсутствие второго огня при `TOUCH_NO_MOUSE`.
+
+## Risks / Trade-offs
+
+- **p4a по умолчанию собирает Python 3.14.2 и pygame 2.1.0, а проект — Python
+  3.12 / pygame ≥ 2.5** → версии фиксируются локальными рецептами (pygame
+  2.6.1, python3 и hostpython3 3.12.14), а не адаптацией кода к старой
+  библиотеке; патчи p4a проверены на CPython 3.12.14. Если комбинация всё же не
+  соберётся, это выясняется на CI до правок в игре, и лечится следующим пином
+  версии, а не изменениями механик.
+- **Сборка требует x86_64-хоста** → канонический путь — облачный CI
+  (`.github/workflows/android.yml`): ветка/PR, затем артефакт
+  `rout3-android-apk`. Локально APK не соберётся (NDK без linux-aarch64
+  host-тулчейна), и `adb install` на телефон выполняет владелец устройства:
+  ни ADB-устройства, ни `gh` CLI в этом окружении нет.
+- **Стоимость оверлея на 2400×1080** → кэш поверхностей, никакого полноэкранного
+  `SRCALPHA`, база стика — `pygame.draw.circle` прямо в кадр.
+- **Читаемость HUD на телефоне**: `ui_scale` даёт 1.54 на 2400×1080, и шрифт HUD
+  физически мельче, чем на мониторе → проверить на устройстве; если мелко, это
+  отдельная правка `engine/viewport.py` (второй коэффициент читаемости), а не
+  часть этого change'а.
+- **Задержка касаний** (SDL2 отдаёт тач пачкой на кадр) → поворот считается по
+  `dt`, а не «шаг на событие», поэтому задержка не превращается в рывки.
+- **Шрифты на Android**: `pygame.font.SysFont("monospace", ...)` не найдёт
+  системного шрифта, но pygame откатывается на встроенный `freesansbold.ttf`,
+  поэтому текст HUD и меню остаётся читаемым.
+- **Диагональ быстрее по осям** (как и на клавиатуре) → поведение не меняется
+  относительно десктопа; серверный зажим остаётся единственным арбитром.
+- **Отключённая синтетическая мышь** → весь тач-путь меню и оверлея теперь на
+  `FINGER*`; регрессию держат `smoke_touch_controls.py` (оверлей) и
+  `smoke_android_build.py` (порядок установки флага до pygame, перевод пальца).
+
+## Startup failure visibility on the device
+
+p4a runs the entry point with `PyRun_SimpleFile` and finishes with `exit(ret)`:
+an escaping exception (including `SystemExit`) closes the window, and on a phone
+that is indistinguishable from a native crash. There is no dialog, no traceback,
+and app-private storage is not reachable from a file manager on Android 11+.
+
+- **One guarded function.** All startup work moved into `main.py: _startup()`
+  under a single `except BaseException`; imports live inside it because an
+  `ImportError` is the likeliest Android-only failure. `sys.exit(main())` was
+  removed for the same reason — returning from `main()` lets p4a end the process
+  itself.
+- **Two channels, because one is not enough.** The on-screen report covers a
+  Python-level failure; the `rout3-boot.json` marker (status `startup` /
+  `failed` / `running`, last stage, interpreter version, tail of the log) covers
+  the failures that cannot draw -- a native crash in SDL/numpy, or the display
+  never coming up. The next launch shows the marker before retrying, so the
+  phone itself becomes the report. The log also mirrors to `stderr`, which p4a
+  forwards to logcat.
+- **Markers are cleared deliberately.** `mark_running()` runs immediately before
+  `asyncio.run`, so being killed later is a normal close; `clear_boot()` runs
+  after a clean start and after the player dismisses a report, so the alarm is
+  shown once, not on every launch.
+- **`tools/android_log.py` is the fallback when the screen never appears.** It
+  pulls logcat (including the separate `crash` buffer) and the app-private files
+  over `adb`, and names an APK/device ABI mismatch -- the one failure that
+  installs fine and closes before Python starts, leaving no marker at all.
+- **The window before Python is Java, so the first reporter is Java.** p4a's
+  `PythonActivity.onCreate` builds its resource manager, then calls
+  `super.onCreate`, which loads every native library and builds the SDL surface,
+  and only then shows the presplash. A failure in that sequence closes the window
+  with no splash, no dialog and no boot marker -- Python has not run yet. The
+  launcher is therefore `org.rout3.DiagActivity` (`android.entrypoint`), a
+  `PythonActivity` subclass that runs `super.onCreate` inside `Throwable`, names
+  the failing library when SDL reports `mBrokenLibraries`, and keeps the traceback
+  on screen as selectable white-on-black text. Libraries are also loaded one at a
+  time *before* `super.onCreate`, with the name written to the journal before each
+  load: a `SIGSEGV` inside `JNI_OnLoad` is not an exception, it kills the process
+  between two statements, and then the last line is the only thing that names the
+  culprit. `org.rout3.DiagApp`
+  (`android:name` on `<application>`, spliced from
+  `tools/android/manifest_application.xml`) opens the same journal before any
+  activity exists, and its uncaught-exception handler covers the one thing the
+  `try` cannot: a failure while the framework loads or verifies the launcher
+  class. The journal is
+  `Android/data/<package>/files/rout3-java.log` -- readable over USB/MTP without
+  adb or any permission -- mirrored to app-private storage and logcat, and every
+  line is flushed and `fsync`ed because the process may die on the next statement.
+  `smoke_android_build.py` holds the wiring (entrypoint, source dir, application
+  attribute, import whitelist, both sinks); the sources are compiled into the APK
+  and never shipped as files.
+
+## Migration Plan
+
+- Миграции данных нет: новые ключи получают дефолты, старый `config.json` без
+  них читается (`Settings.load` перебирает `DEFAULTS`).
+- Протокол не меняется (`PROTOCOL_VERSION` остаётся 14), поэтому старый клиент,
+  новый клиент и сервер совместимы в любую сторону.
+- Откат: `control_mode = "Мышь"` возвращает прежнее поведение; удаление
+  `buildozer.spec`/`main.py`/`tools/android/` не влияет на десктопный запуск.
+
+## Open Questions
+
+- Соберётся ли связка python3/hostpython3 3.12.14 + pygame 2.6.1 под p4a
+  v2026.05.09 с первого прогона CI. На спек и на подход это не влияет: версии
+  фиксируются локальными рецептами, и следующая правка — пин версии, а не
+  изменение игры.

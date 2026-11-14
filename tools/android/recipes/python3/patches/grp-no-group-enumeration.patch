@@ -1,0 +1,30 @@
+--- a/Modules/grpmodule.c
++++ b/Modules/grpmodule.c
+@@ -274,10 +274,18 @@
+ /*[clinic end generated code: output=585dad35e2e763d7 input=d7df76c825c367df]*/
+ {
+     PyObject *d;
+-    struct group *p;
+ 
+     if ((d = PyList_New(0)) == NULL)
+         return NULL;
++#if defined(__ANDROID__) && __ANDROID_API__ < 26
++    /* bionic declares setgrent()/getgrent()/endgrent() only from API 26, and
++       the APK is built against API 24.  Android keeps no group database to
++       walk: the list is legitimately empty, while getgrgid()/getgrnam() still
++       work through the reentrant bionic calls. */
++    return d;
++#else
++    struct group *p;
++
+     setgrent();
+     while ((p = getgrent()) != NULL) {
+         PyObject *v = mkgrent(module, p);
+@@ -290,6 +298,7 @@
+         Py_DECREF(v);
+     }
+     endgrent();
++#endif
+     return d;
+ }
+ 

@@ -145,7 +145,8 @@ class GameWorld:
         eid = self.entities.create()
         sx, sy = _spawn_px(self.spawn_points)
 
-        self.entities.add_component(eid, Position(sx, sy))
+        self.entities.add_component(
+            eid, Position(sx, sy, self._ground_z(sx, sy)))
         self.entities.add_component(eid, Velocity(0.0, 0.0))
         self.entities.add_component(eid, Rotation(random.uniform(0, 2 * math.pi)))
         self.entities.add_component(eid, Health(PLAYER_MAX_HP, PLAYER_MAX_HP))
@@ -380,6 +381,11 @@ class GameWorld:
             'spawn_x': x,
             'spawn_y': y,
             'spawn_pa': angle,
+            # Support height (host floor; enemies never stand on a slab).
+            # Internal only: the enemy wire record has no vertical, and the
+            # renderer derives an enemy's floor from the map.
+            'z': self._ground_z(x, y),
+            'spawn_z': self._ground_z(x, y),
             'attack_from': None,
             'attack_ticks': 0,
         })
@@ -690,6 +696,26 @@ class GameWorld:
             vel.dx = 0.0
             vel.dy = 0.0
 
+    def _step_free(self, pos: Position, nxt: float, r: float,
+                   axis: int) -> float | None:
+        """Destination's support height, or ``None`` when the step is blocked.
+
+        ``can_move_px`` answers the plan-view question (walls, doors); the
+        support query answers the vertical one — a slab border is not a wall,
+        so an actor may pass under it or step onto it only when ``support_at``
+        finds a surface within ``STEP_HEIGHT`` with ``ACTOR_HEIGHT`` of
+        clearance.  Tile maps have no heights, so they keep their old answer
+        and a constant ground of 0.
+        """
+        x = nxt if axis == 0 else pos.x
+        y = pos.y if axis == 0 else nxt
+        if not self.can_move_px(x, y, r):
+            return None
+        support_at = getattr(self.game_map, "support_at", None)
+        if support_at is None:
+            return 0.0
+        return support_at(x, y, pos.z)
+
     def _advance_axis(self, pos: Position, step: float, r: float,
                       axis: int) -> None:
         """Advance ``pos`` along one axis by ``step``, stopping at the first
@@ -698,23 +724,40 @@ class GameWorld:
         cur = pos.x if axis == 0 else pos.y
         a = abs(step)
         if a <= MAX_MOVE_STEP_PX:
-            if self._step_free(pos, cur + step, r, axis):
+            z = self._step_free(pos, cur + step, r, axis)
+            if z is not None:
                 self._set_axis(pos, cur + step, axis)
+                pos.z = z
             return
         n = int(math.ceil(a / MAX_MOVE_STEP_PX))
         sub = step / n
         start = cur
         for i in range(1, n + 1):
             nxt = start + sub * i
-            if not self._step_free(pos, nxt, r, axis):
+            z = self._step_free(pos, nxt, r, axis)
+            if z is None:
                 break
             self._set_axis(pos, nxt, axis)
+            pos.z = z
             cur = nxt
 
-    def _step_free(self, pos: Position, nxt: float, r: float, axis: int) -> bool:
-        if axis == 0:
-            return self.can_move_px(nxt, pos.y, r)
-        return self.can_move_px(pos.x, nxt, r)
+    def _ground_z(self, x: float, y: float) -> float:
+        """Host floor under a point: camera, spawn and item heights."""
+        floor_under = getattr(self.game_map, "floor_under", None)
+        return float(floor_under(x, y)) if floor_under is not None else 0.0
+
+    def _enemy_step_ok(self, en: dict, nx: float, ny: float) -> float | None:
+        """Enemy move: same plan-view test, but the slab top is not a support.
+
+        Enemies do not plan a climb and must not end up on a slab they cannot
+        be reached on; they still walk under it when the clearance fits.
+        """
+        if not self.can_move_px(nx, ny, ENEMY_RADIUS):
+            return None
+        support_at = getattr(self.game_map, "support_at", None)
+        if support_at is None:
+            return 0.0
+        return support_at(nx, ny, en.get('z', 0.0), allow_platforms=False)
 
     @staticmethod
     def _set_axis(pos: Position, value: float, axis: int) -> None:
@@ -875,9 +918,11 @@ class GameWorld:
             if sx or sy:
                 nx = ex + sx * 0.8
                 ny = ey + sy * 0.8
-                if self.can_move_px(nx, ny, ENEMY_RADIUS):
+                z = self._enemy_step_ok(en, nx, ny)
+                if z is not None:
                     en['x'] = nx
                     en['y'] = ny
+                    en['z'] = z
 
             # --- movement toward target / wander --------------------------
             # Pathing keeps its own (unlimited) heading, so slowing the turn
@@ -892,10 +937,14 @@ class GameWorld:
 
             new_x = en['x'] + move_x
             new_y = en['y'] + move_y
-            if self.can_move_px(new_x, en['y'], ENEMY_RADIUS):
+            z = self._enemy_step_ok(en, new_x, en['y'])
+            if z is not None:
                 en['x'] = new_x
-            if self.can_move_px(en['x'], new_y, ENEMY_RADIUS):
+                en['z'] = z
+            z = self._enemy_step_ok(en, en['x'], new_y)
+            if z is not None:
                 en['y'] = new_y
+                en['z'] = z
 
             # --- visible facing turns at a bounded rate -------------------
             # ``pa`` drives the rendered model, and snapping it to the exact
@@ -1377,6 +1426,9 @@ class GameWorld:
         if start is None:
             start = (pos.x, pos.y)
         pos.x, pos.y = start
+        # The entry point's support, not the height the player died at: a
+        # death on a slab must not respawn the player in mid-air.
+        pos.z = self._ground_z(start[0], start[1])
         hp.value = PLAYER_MAX_HP
         pl.state = 0
         # A player killed mid-dash would keep dashing out of the respawn point,
@@ -1471,6 +1523,7 @@ class GameWorld:
     def _reset_enemy(en: dict) -> None:
         en['x'] = en['spawn_x']
         en['y'] = en['spawn_y']
+        en['z'] = en.get('spawn_z', en.get('z', 0.0))
         en['pa'] = en.get('spawn_pa', en['pa'])
         en['hp'] = en['max_hp']
         en['a'] = True
@@ -1501,6 +1554,9 @@ class GameWorld:
                 "id": player_id,
                 "x": pos.x,
                 "y": pos.y,
+                # Support height (slab top or host floor).  The client only
+                # displays it; movement authority stays on the server.
+                "z": pos.z,
                 "angle": rot.angle,
                 "health": hp.value,
                 "state": pl.state,

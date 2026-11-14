@@ -13,12 +13,11 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from shared.sector_map import (  # noqa: E402
-    MAX_SECTOR_HEIGHT, MIN_SECTOR_HEIGHT, SPECIAL_DOORS, LineDef, Sector,
-    SectorMap, SideDef, Thing, Vertex,
+    MAX_SECTOR_HEIGHT, MIN_PLATFORM_THICKNESS, MIN_SECTOR_HEIGHT,
+    SPECIAL_DOORS, LineDef, Sector, SectorMap, SideDef, Thing, Vertex,
 )
 from client.sector_editor import (  # noqa: E402
-    GRID_DEFAULT, WALL_THICKNESS, SectorEditor, clamp_sector_heights, new_room,
-    save_mt1_with_bsp,
+    SectorEditor, clamp_sector_heights, new_room, save_mt1_with_bsp,
 )
 
 
@@ -87,15 +86,14 @@ def test_line_ops():
     print("  line ops         OK")
 
 
-def test_wall_thickness_constant():
-    assert WALL_THICKNESS == GRID_DEFAULT == 16.0
-    print("  wall thickness   OK")
-
-
-def _inner_lines(ed, sid):
-    return [i for i, ld in enumerate(ed.lines)
-            if 0 <= ld.front < len(ed.sides)
-            and ed.sides[ld.front].sector == sid and ld.back < 0]
+def _sector_lines(ed, sid):
+    """Every linedef that bounds ``sid``, whichever face names it."""
+    out = []
+    for i, ld in enumerate(ed.lines):
+        sides = [s for s in (ld.front, ld.back) if 0 <= s < len(ed.sides)]
+        if any(ed.sides[s].sector == sid for s in sides):
+            out.append(i)
+    return out
 
 
 def test_sector_from_contour():
@@ -117,30 +115,23 @@ def test_sector_from_contour():
     assert ed.sm.find_sector_at(600, 600) == 1
     assert ed.sm.find_sector_at(200, 200) == 0
     assert ed.sm.find_sector_at(600, 1200) == 0
-    # the contour is the OUTER face: one-sided, looking back at the room
+    # The contour IS the border: both faces exist, no inner loop, no body.
     for li in (l1, l2, l3, l4):
         ld = ed.lines[li]
-        assert ld.back < 0, (li, ld)
+        assert ld.front >= 0 and ld.back >= 0, (li, ld)
         assert ed.sides[ld.front].sector == 0, (li, ed.sides[ld.front].sector)
-    # the inner loop is A's own wall, one-sided as well
-    inner = _inner_lines(ed, 1)
-    assert len(inner) == 4, inner
-    assert all(ed.lines[li].back < 0 for li in inner)
-    # the 16px strip between the loops is the wall body: void, and blocking
-    assert ed.sm.find_sector_at(408, 600) == -1
+        assert ed.sides[ld.back].sector == 1, (li, ed.sides[ld.back].sector)
+    assert set(_sector_lines(ed, 1)) == {l1, l2, l3, l4}
+    assert len(ed.lines) == 8, "four contour lines, four room border lines"
+    # the contour is zero-thickness: the new room reaches the line itself
+    assert ed.sm.find_sector_at(408, 600) == 1
     assert ed.sm.find_sector_at(392, 600) == 0
-    for li in list((l1, l2, l3, l4)) + inner:
-        assert ed.sm.line_blocks(li), li
     assert ed.sm.has_polygon(0) and ed.sm.has_polygon(1)
-    # inner walls inherit the contour texture
-    assert all(ed.sides[ed.lines[li].front].mid == "wall" for li in inner)
-    # a 400x400 contour inset by 16 is 368x368
-    pts = set()
-    for li in inner:
-        pts.add((ed.verts[ed.lines[li].v1].x, ed.verts[ed.lines[li].v1].y))
-        pts.add((ed.verts[ed.lines[li].v2].x, ed.verts[ed.lines[li].v2].y))
-    assert pts == {(416.0, 416.0), (784.0, 416.0),
-                   (784.0, 784.0), (416.0, 784.0)}, pts
+    # the new face inherits the author's contour texture and lips
+    assert all(ed.sides[ed.lines[li].front].mid == "wall" for li in
+               (l1, l2, l3, l4))
+    assert all(ed.sides[ed.lines[li].back].mid == "wall" for li in
+               (l1, l2, l3, l4))
     # props
     ed.set_sector_props(1, floor_tex="lava", light=200)
     assert ed.sectors[1].floor_tex == "lava" and ed.sectors[1].light == 200
@@ -168,15 +159,16 @@ def test_sector_from_contour_clockwise():
     sid, errs = ed.sector_from_contour(ids, floor_h=0)
     assert sid == 1 and not errs, errs
     assert ed.sm.find_sector_at(632, 632) == 1
-    assert ed.sm.find_sector_at(632, 608) == -1
+    assert ed.sm.find_sector_at(632, 608) == 1, "the border has no thickness"
     assert ed.sm.find_sector_at(580, 580) == 0
     for li in ids:
         ld = ed.lines[li]
-        assert ld.back < 0 and ed.sides[ld.front].sector == 0
+        assert ld.front >= 0 and ld.back >= 0
+        assert ed.sides[ld.front].sector == 0
+        assert ed.sides[ld.back].sector == 1
         assert ed.sides[ld.front].mid == "brick"
-    inner = _inner_lines(ed, 1)
-    assert len(inner) == 4
-    assert all(ed.sides[ed.lines[li].front].mid == "brick" for li in inner)
+        assert ed.sides[ld.back].mid == "brick", "the other face is painted too"
+    assert set(_sector_lines(ed, 1)) == set(ids)
     assert not ed.validate(), ed.validate()
     print("  contour CW       OK")
 
@@ -215,18 +207,17 @@ def test_sector_from_contour_portal():
     assert ed.sides[door.back].mid == "door_D"
     assert not door.solid
     assert not sm.line_blocks(ids[0]), "a door is not a solid wall"
-    # only the three solid edges get inner walls; the portal is shared
-    inner = _inner_lines(ed, 2)
-    assert len(inner) == 3, inner
+    # all four edges are the border itself: portal or not, no body is added
+    assert set(_sector_lines(ed, 2)) == set(ids)
     assert sm.find_sector_at(632, 632) == 2
     assert sm.find_sector_at(632, 610) == 2, "A reaches the door line"
-    assert sm.find_sector_at(632, 655) == -1, "the solid edge keeps its body"
+    assert sm.find_sector_at(632, 655) == 2, "the far edge has no body either"
     assert sm.find_sector_at(590, 600) == 0
     print("  contour portal   OK")
 
 
-def test_sector_from_contour_tent():
-    """A lone solid edge between two portals keeps its body as a 'tent'."""
+def test_sector_from_contour_mixed_edges():
+    """Portals and plain edges mix freely: every edge stays zero-thickness."""
     sm = new_room(1600, 1600)
     ed = SectorEditor(sm)
     ed.sectors.append(Sector())
@@ -251,35 +242,42 @@ def test_sector_from_contour_tent():
     sid, errs = ed.sector_from_contour(ids, floor_h=0)
     assert sid == 2 and not errs, errs
     assert not ed.validate(), ed.validate()
-    inner = _inner_lines(ed, 2)
-    assert len(inner) == 4, "two segments per lone solid edge"
-    # the tent points sit in the middle of the solid edges, WALL_THICKNESS in
-    mids = {(ed.verts[ed.lines[li].v1].x, ed.verts[ed.lines[li].v1].y)
-            for li in inner}
-    mids |= {(ed.verts[ed.lines[li].v2].x, ed.verts[ed.lines[li].v2].y)
-             for li in inner}
-    assert (616.0, 632.0) in mids and (648.0, 632.0) in mids, mids
+    # no "tent" and no inset: four edges, four vertices, nothing added
+    assert set(_sector_lines(ed, 2)) == set(ids)
     assert sm.find_sector_at(632, 632) == 2
-    assert sm.find_sector_at(610, 632) == -1
-    assert sm.find_sector_at(655, 632) == -1
+    assert sm.find_sector_at(610, 632) == 2, "the left edge has no body"
+    assert sm.find_sector_at(655, 632) == 2, "nor the right one"
     assert sm.find_sector_at(632, 600) == 2
     assert sm.find_sector_at(632, 650) == 2
-    print("  contour tent     OK")
+    print("  contour mixed    OK")
 
 
 def test_sector_from_contour_rejects_bad_loops():
-    """A too-small room and a bad contour are refused before any mutation."""
-    for pts in (((400, 400), (432, 400), (432, 432), (400, 432)),
-                ((400, 400), (800, 800), (400, 800), (800, 400))):
+    """A self-intersecting or open contour is refused before any mutation."""
+    for pts, edges, expect in (
+            (((400, 400), (800, 800), (400, 800), (800, 400)),
+             ((0, 1), (1, 2), (2, 3), (3, 0)), "самопересекается"),
+            (((400, 400), (800, 400), (800, 800), (400, 800)),
+             ((0, 1), (1, 2), (2, 3)), "не замкнут")):
         ed = SectorEditor(new_room(1600, 1600))
         vs = [ed.add_vertex(x, y) for x, y in pts]
-        ids = [ed.add_line(vs[i], vs[(i + 1) % 4]) for i in range(4)]
+        ids = [ed.add_line(vs[a], vs[b]) for a, b in edges]
         before = ed.sm.to_json()
         hist = len(ed._history)
         sid, errs = ed.sector_from_contour(ids)
         assert sid == -1 and errs, (pts, sid, errs)
+        assert any(expect in e for e in errs), (pts, errs)
         assert ed.sm.to_json() == before, "a failed create mutated the map"
         assert len(ed._history) == hist, "a failed create left an undo entry"
+    # a tiny contour is legal now: thickness is no longer carved out of it
+    ed = SectorEditor(new_room(1600, 1600))
+    pts = ((400, 400), (432, 400), (432, 432), (400, 432))
+    vs = [ed.add_vertex(x, y) for x, y in pts]
+    ids = [ed.add_line(vs[i], vs[(i + 1) % 4]) for i in range(4)]
+    sid, errs = ed.sector_from_contour(ids)
+    assert sid == 1 and not errs, errs
+    assert ed.sm.find_sector_at(416, 416) == 1
+    assert not ed.validate(), ed.validate()
     print("  contour refused  OK")
 
 
@@ -403,6 +401,19 @@ def test_height_clamp():
     assert clamp_sector_heights(5000, 6000) == (MAX_SECTOR_HEIGHT,) * 2
     assert clamp_sector_heights(-5000, -6000) == (MIN_SECTOR_HEIGHT,) * 2
     assert clamp_sector_heights(200, 100)[0] <= clamp_sector_heights(200, 100)[1]
+    # a floating sector keeps the thickness the other way round: top above
+    # underside by at least MIN_PLATFORM_THICKNESS, and the edited surface wins
+    assert clamp_sector_heights(88, 72, True) == (88, 72)
+    assert clamp_sector_heights(80, 72, True) == (72 + MIN_PLATFORM_THICKNESS, 72)
+    assert clamp_sector_heights(88, 84, True, driver="ceil") == (
+        88, 88 - MIN_PLATFORM_THICKNESS)
+    assert clamp_sector_heights(88, 88, True)[0] - 88 >= MIN_PLATFORM_THICKNESS
+    # both ends of the range keep a plate legal instead of collapsing it
+    top, under = clamp_sector_heights(MAX_SECTOR_HEIGHT, MAX_SECTOR_HEIGHT, True)
+    assert top == MAX_SECTOR_HEIGHT and top - under >= MIN_PLATFORM_THICKNESS
+    top, under = clamp_sector_heights(MIN_SECTOR_HEIGHT, MIN_SECTOR_HEIGHT, True,
+                                      driver="ceil")
+    assert under == MIN_SECTOR_HEIGHT and top - under >= MIN_PLATFORM_THICKNESS
 
     ed = SectorEditor(new_room(1600, 1600))
     assert ed.sectors[0].floor_h == 0
@@ -412,6 +423,9 @@ def test_height_clamp():
     # a floor above the ceiling is pulled back, and the applied pair is returned
     assert ed.set_sector_heights(0, floor_h=999) == (128, 128)
     assert ed.sectors[0].floor_h == 128 and ed.sectors[0].ceil_h == 128
+    # a zero-height room leaves no headroom for the thing standing in it, so
+    # open the ceiling back up before asking the map to validate
+    ed.set_sector_heights(0, ceil_h=192)
     assert not ed.validate(), ed.validate()
     # out-of-range input is clamped, not rejected
     assert ed.set_sector_heights(0, ceil_h=99999) == (128, MAX_SECTOR_HEIGHT)
@@ -431,10 +445,16 @@ def test_solid_flag_and_step_textures():
     sid, errs = ed.sector_from_contour(box, floor_h=16, ceil_h=128)
     assert sid == 1 and not errs, errs
 
-    # thick walls are one-sided on both faces: the flag is meaningless there
-    for li in box + _inner_lines(ed, sid):
-        assert ed.set_line_solid(li, True) is False, li
-        assert not ed.lines[li].solid
+    # The contour is a real two-sided portal, so it carries the flag.
+    for li in box:
+        assert ed.lines[li].two_sided
+        assert ed.set_line_solid(li, True) is True, li
+        assert ed.lines[li].solid
+        ed.set_line_solid(li, False)
+    # A one-sided map border still has nowhere to put the flag.
+    outer = next(i for i, ld in enumerate(ed.lines) if ld.back < 0)
+    assert ed.set_line_solid(outer, True) is False
+    assert not ed.lines[outer].solid
 
     # a two-sided linedef between two sectors carries the flag
     two = SectorEditor(new_room(1600, 1600))
@@ -518,22 +538,23 @@ def test_solid_cleared_when_line_becomes_one_sided():
 
 
 def test_delete_line_breaks_the_contour():
-    """Cutting a wall drops that sector's polygon — and only that one.
+    """Cutting a border drops that sector's polygon — and only that one.
 
-    The room's inner loop is one-sided, so cutting it leaves A with an open
-    path and the hole in the surrounding sector is still there: nothing covers
-    the point any more. The two-room case below shows the same on a shared wall.
+    The contour is shared, so the cut sector loses its only loop while the
+    host keeps its outer border and its floor reaches the former room again.
+    The two-room case below shows a wall both rooms close on.
     """
     ed = SectorEditor(new_room(1600, 1600))
     box = _contour_box(ed, 400, 400, 800, 800)
     ed.sector_from_contour(box, floor_h=-64)
-    wall = _inner_lines(ed, 1)[0]
+    wall = _sector_lines(ed, 1)[0]
     assert ed.sm.has_polygon(1)
     notes = ed.delete_line(wall)
     assert not ed.validate(), ed.validate()
     assert not ed.sm.has_polygon(1), "the cut sector must lose its polygon"
-    assert ed.sm.find_sector_at(600, 600) == -1, \
-        "the wall body still keeps the room outside"
+    assert ed.sm.has_polygon(0)
+    assert ed.sm.find_sector_at(600, 600) == 0, \
+        "the host floor reaches the open room again"
     assert any("без замкнутого контура" in n for n in notes), notes
 
     # the same cut on a shared portal where both rooms close on it
@@ -560,12 +581,12 @@ def test_delete_line_keeps_loop_corners():
     d2 = ed.add_vertex(400, 200)
     dangle = ed.add_line(d1, d2)
     n_verts, n_lines, n_sides = len(ed.verts), len(ed.lines), len(ed.sides)
-    wall = _inner_lines(ed, 1)[0]
+    wall = _sector_lines(ed, 1)[0]
 
     ed.delete_line(wall)
     assert not ed.validate(), ed.validate()
     assert len(ed.lines) == n_lines - 1
-    assert len(ed.sides) == n_sides - 1, "the inner line has one side"
+    assert len(ed.sides) == n_sides - 2, "the border line has both faces"
     # a closed loop shares every corner with another edge, so cutting one of
     # its lines orphans nothing: the room corners all still have two users
     assert len(ed.verts) == n_verts, len(ed.verts)
@@ -603,17 +624,14 @@ def test_polygon_alive():
     ed = SectorEditor(new_room(1600, 1600))
     box = _contour_box(ed, 400, 400, 800, 800)
     ed.sector_from_contour(box, floor_h=-64)
-    inner = _inner_lines(ed, 1)
+    inner = _sector_lines(ed, 1)
     assert len(inner) == 4
     for i in inner:
         assert ed._polygon_alive(1, {i}) is False, \
-            "the room dies with any one of its inner walls"
+            "the room dies with any one of its border lines"
         assert ed._polygon_alive(0, {i}) is True, \
-            "the outer room does not use the inner loop"
-    # the outer contour is sector 0's hole; the map border keeps it alive
-    for i in box:
-        assert ed._polygon_alive(0, {i}) is True
-        assert ed._polygon_alive(1, {i}) is True
+            "the host keeps its own outer border"
+    assert ed._polygon_alive(0, set()) is True
     assert ed._polygon_alive(1, set()) is True
     print("  polygon alive    OK")
 
@@ -636,8 +654,9 @@ def test_delete_sector_merges():
     assert not ed.validate(), ed.validate()
     assert len(ed.sectors) == 1, len(ed.sectors)
     assert len(ed.lines) == 4, "only the room border must be left"
-    # new_room gives the whole border one shared sidedef, so the pit's eight
-    # sides go and that single one is all the room ever had
+    # new_room gives the whole outer border one shared sidedef; the dissolved
+    # room's four shared border sides go with their lines and only that single
+    # host side is left
     assert len(ed.sides) == 1, len(ed.sides)
     assert len(ed.verts) == 4, len(ed.verts)
     assert ed.sm.find_sector_at(600, 600) == 0, \
@@ -1011,6 +1030,142 @@ def test_two_sided_predicate():
     print("  two-sided predicate disagrees with the shared one on purpose")
 
 
+def test_set_sector_floating():
+    """«парит» swaps heights and never needs a particular border topology.
+
+    A zero-thickness room already shares every wall, so the mark is a pure
+    height swap.  Three older geometries still have to behave: a legacy
+    thick-wall ring (its wall body must not become a permanent void), an
+    isolated room whose border is one-sided (a plate may border nothing), and
+    a plate that shares a border with another plate.
+    """
+    # A contour room has no wall body to dissolve: marking it floating only
+    # swaps the heights, one undo step, and the drawing is untouched.
+    ed = SectorEditor(new_room(1600, 1600))
+    box = _contour_box(ed, 400, 400, 800, 800)
+    sid, errs = ed.sector_from_contour(box, floor_h=-64, ceil_h=128, light=120)
+    assert sid == 1 and not errs, errs
+    assert set(_sector_lines(ed, 1)) == set(box)
+    assert ed.sm.find_sector_at(408, 600) == 1, "the contour is the border"
+    assert ed.sm.find_sector_at(600, 600) == 1
+    assert ed.sm.find_sector_at(200, 200) == 0
+    before = ed.sm.to_json()
+    hist = len(ed._history)
+    n_lines = len(ed.lines)
+    assert ed.set_sector_floating(1, True)
+    s = ed.sectors[1]
+    assert s.floating, "the plate flag must be set"
+    # heights swapped: the old ceiling is the walkable top, the old floor the
+    # underside, and the pair is a legal plate
+    assert (s.floor_h, s.ceil_h) == (128, -64), (s.floor_h, s.ceil_h)
+    # ... and nothing else moved: the room already shares its border
+    assert len(ed.lines) == n_lines, (len(ed.lines), n_lines)
+    assert ed.sm.find_sector_at(408, 600) == 1
+    assert ed.sm.find_sector_at(600, 600) == 1
+    assert not ed.sm.line_blocks(box[0]), "a plate border is not a wall"
+    assert not ed.validate(), ed.validate()
+    # the plate is one undo step: geometry and the mark come back together
+    assert len(ed._history) == hist + 1
+    ed.undo()
+    assert not ed.sectors[1].floating
+    assert (ed.sectors[1].floor_h, ed.sectors[1].ceil_h) == (-64, 128)
+    assert ed.sm.to_json() == before, "undo must restore the drawing exactly"
+    ed.redo()
+    assert ed.sectors[1].floating
+    # disabling puts the room back: heights in ordinary order, still legal
+    assert ed.set_sector_floating(1, False)
+    assert not ed.sectors[1].floating
+    assert (ed.sectors[1].floor_h, ed.sectors[1].ceil_h) == (-64, 128)
+    assert not ed.validate(), ed.validate()
+
+    # A legacy thick room is ringed by a void band.  Marking it floating binds
+    # its own walls to the host and drops the host's hole loop, so the band
+    # becomes host floor instead of staying a hole with a floating room over it.
+    ed = SectorEditor(new_room(1600, 1600))
+    ed.sectors.append(Sector(floor_h=-64, ceil_h=128, light=120))
+    _contour_box(ed, 400, 400, 800, 800)            # host's hole loop
+    ed.cur_sector = 1
+    inner = _contour_box(ed, 416, 416, 784, 784)    # the room's own walls
+    ed.cur_sector = 0
+    ed.sm.invalidate()
+    assert ed.sm.find_sector_at(408, 600) == -1, "precondition: wall body"
+    assert set(_sector_lines(ed, 1)) == set(inner)
+    before = ed.sm.to_json()
+    hist = len(ed._history)
+    n_lines = len(ed.lines)
+    assert ed.set_sector_floating(1, True)
+    assert ed.sectors[1].floating
+    assert (ed.sectors[1].floor_h, ed.sectors[1].ceil_h) == (128, -64)
+    assert ed.sm.find_sector_at(408, 600) == 0, \
+        "the old wall body is host floor now"
+    assert ed.sm.find_sector_at(600, 600) == 1
+    assert ed.sm.find_sector_at(200, 200) == 0
+    assert len(ed.lines) == n_lines - 4, (len(ed.lines), n_lines)
+    for li in _sector_lines(ed, 1):
+        ld = ed.lines[li]
+        assert ld.front >= 0 and ld.back >= 0, (li, ld)
+        assert ed.sides[ld.front].sector == 1
+        assert ed.sides[ld.back].sector == 0, (li, ed.sides[ld.back].sector)
+    assert not ed.sm.line_blocks(_sector_lines(ed, 1)[0]), \
+        "a plate border is not a wall"
+    assert not ed.validate(), ed.validate()
+    assert len(ed._history) == hist + 1
+    ed.undo()
+    assert not ed.sectors[1].floating
+    assert (ed.sectors[1].floor_h, ed.sectors[1].ceil_h) == (-64, 128)
+    assert ed.sm.find_sector_at(408, 600) == -1, "the ring must come back"
+    assert ed.sm.to_json() == before, "undo must restore the drawing exactly"
+
+    # A room with no host across its walls may still become a plate: a real
+    # map edge is free contact, not a refusal.  Its one-sided border stays.
+    ed = SectorEditor(new_room(1600, 1600))
+    sid = ed.add_sector(floor_h=16, ceil_h=96, light=90)
+    ed.cur_sector = sid
+    own = _contour_box(ed, 2000, 2000, 2200, 2200)
+    ed.cur_sector = 0
+    ed.sm.invalidate()
+    assert set(_sector_lines(ed, sid)) == set(own)
+    n_lines = len(ed.lines)
+    hist = len(ed._history)
+    assert ed.set_sector_floating(sid, True)
+    assert ed.sectors[sid].floating
+    assert (ed.sectors[sid].floor_h, ed.sectors[sid].ceil_h) == (96, 16)
+    assert len(ed.lines) == n_lines, "an isolated border has nothing to drop"
+    assert not ed.sm.line_blocks(own[0]), "a plate border is not a wall"
+    assert not ed.validate(), ed.validate()
+    assert len(ed._history) == hist + 1
+
+    # refusals never touch the map
+    def unchanged(fn):
+        snap = ed.sm.to_json()
+        hist0 = len(ed._history)
+        notes = fn()
+        assert notes, "a refusal must say why"
+        assert ed.sm.to_json() == snap, notes
+        assert len(ed._history) == hist0, notes
+        return notes
+
+    # a sector with no walls at all cannot become a plate
+    fresh = SectorEditor(new_room(1600, 1600))
+    bare = fresh.add_sector(floor_h=0, ceil_h=128)
+    notes = unchanged(lambda: fresh.set_sector_floating(bare, True))
+    assert "нет границы" in notes[0], notes
+
+    # a plate sharing a border with another plate is allowed: the shared
+    # path swaps heights only, so a bridge/two-plate layout round-trips
+    from smoke_sector_model import make_plate_bridge
+    ed = SectorEditor(make_plate_bridge())
+    assert [s.floating for s in ed.sectors] == [False, True, True]
+    assert ed.set_sector_floating(2, False)
+    assert not ed.sectors[2].floating
+    assert not ed.validate(), ed.validate()
+    assert ed.set_sector_floating(2, True)
+    assert ed.sectors[2].floating
+    assert (ed.sectors[2].floor_h, ed.sectors[2].ceil_h) == (80, 64)
+    assert not ed.validate(), ed.validate()
+    print("  set floating     OK")
+
+
 def main():
     test_vertex_ops()
     test_line_ops()
@@ -1023,10 +1178,10 @@ def main():
     test_sector_from_contour()
     test_sector_from_contour_clockwise()
     test_sector_from_contour_portal()
-    test_sector_from_contour_tent()
+    test_sector_from_contour_mixed_edges()
     test_sector_from_contour_rejects_bad_loops()
-    test_wall_thickness_constant()
     test_height_clamp()
+    test_set_sector_floating()
     test_solid_flag_and_step_textures()
     test_solid_cleared_when_line_becomes_one_sided()
     test_things_roundtrip()

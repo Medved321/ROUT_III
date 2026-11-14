@@ -46,11 +46,19 @@ def normalize_size(width, height) -> tuple[int, int]:
 
 
 class Renderer:
-    def __init__(self, size=None):
+    def __init__(self, size=None, fullscreen: bool | None = None):
         pygame.init()
         self.on_resize = None  # set by the client; called after the window changed
+        # Android has no draggable window: the surface is the device screen and
+        # the saved ``window_size`` preset is meaningless there (it would make
+        # a phone-sized window in the middle of the display). Desktop keeps the
+        # resizable window, and ``None`` means "decide from the platform".
+        if fullscreen is None:
+            from client.mobile import IS_ANDROID
+            fullscreen = IS_ANDROID
+        self.fullscreen = bool(fullscreen)
         want = normalize_size(*(size or (SCREEN_WIDTH, SCREEN_HEIGHT)))
-        self.screen = self._set_mode(want)
+        self.screen = self._set_mode(want, self.fullscreen)
         # Menus are laid out for a fixed 1000x700 canvas and blitted into the
         # window as a whole, so their geometry never depends on the window size.
         self.ui = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
@@ -61,16 +69,25 @@ class Renderer:
 
     # ── window ──────────────────────────────────────────────────────
     @staticmethod
-    def _set_mode(size):
+    def _set_mode(size, fullscreen: bool = False):
         """Create the display surface, falling back on failure.
 
         A 4K window can exhaust the display memory on some drivers, where
         ``set_mode`` raises ``pygame.error``. Dropping ``RESIZABLE`` is the
         fallback: a plain window of the same size always works, so the player
         keeps the resolution they asked for. Fullscreen is deliberately not
-        offered -- a fullscreen surface cannot be resized by dragging, which is
-        the point of this window.
+        offered on desktop -- a fullscreen surface cannot be resized by
+        dragging, which is the point of this window -- but on Android the
+        device screen *is* the window, and fullscreen is what hides the system
+        bars (SDL uses immersive mode for it).
         """
+        if fullscreen:
+            # (0, 0) asks SDL for the current display size, so the phone's
+            # own resolution decides and no preset is applied.
+            try:
+                return pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+            except pygame.error:
+                return pygame.display.set_mode((0, 0))
         try:
             return pygame.display.set_mode(size, pygame.RESIZABLE)
         except pygame.error:
@@ -86,13 +103,29 @@ class Renderer:
         follow the window or the picture would be drawn for the old size and
         only scaled at the end. The bridge owns ``gs.screen`` and re-allocates
         it to these numbers through ``on_resize``.
-        """
-        width, height = normalize_size(*size)
-        if self.screen.get_size() != (width, height):
-            self.screen = self._set_mode((width, height))
 
+        In fullscreen the requested size is ignored: the device decides. The
+        call still republishes the real size, so startup and a display change
+        both go through one path.
+        """
+        if self.fullscreen:
+            self.screen = self._set_mode((0, 0), True)
+        else:
+            width, height = normalize_size(*size)
+            if self.screen.get_size() != (width, height):
+                self.screen = self._set_mode((width, height))
+        return self.publish_size()
+
+    def publish_size(self) -> tuple[int, int]:
+        """Make ``const.W/H`` and the bridge agree with the real surface.
+
+        Separated from ``set_window_size`` because a fullscreen surface is not
+        re-created at startup: the device size is simply published once, and
+        the same code path runs after a real resize.
+        """
         from engine import constants as const
 
+        width, height = self.screen.get_size()
         const.W, const.H = width, height
 
         if self.on_resize is not None:

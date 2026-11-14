@@ -182,6 +182,17 @@ class SectorScene:
         self.light = [s.light for s in sm.sectors]
         self.floor_tex = [s.floor_tex for s in sm.sectors]
         self.ceil_tex = [s.ceil_tex for s in sm.sectors]
+        # Floating slabs (change ``floating-sector-platforms``, task 4.1).  A
+        # plate is not part of the BSP world: its borders never split the tree
+        # (``engine/bsp.py: _floating_lines``) and never draw a band here
+        # (``_seg_wall_bands`` skips them), so the host's floor and ceiling
+        # keep spanning the footprint underneath.  The plate itself is painted
+        # on top by ``engine/platform_render.py``.
+        self.floating = [bool(getattr(s, "floating", False)) for s in sm.sectors]
+        self.has_floating = any(self.floating)
+        self.floating_ids = [i for i, f in enumerate(self.floating) if f]
+        self.floating_line = [self._line_borders_slab(i) for i in range(n)]
+        self._slab_border_cache: dict[int, list] = {}
         self.bsp: object | None = None  # cached BSP tree (built on demand)
         self._flat_rgb_cache: dict[str, tuple] = {}
         self._wall_lit_cache: dict[tuple[str, int], object] = {}
@@ -198,18 +209,81 @@ class SectorScene:
             return sd[side].sector
         return -1
 
+    def _line_borders_slab(self, li: int) -> bool:
+        """True when linedef ``li`` borders a floating slab (task 4.1)."""
+        if not self.has_floating:
+            return False
+        n = len(self.floating)
+        for sec in (self.front_sec[li], self.back_sec[li]):
+            if 0 <= sec < n and self.floating[sec]:
+                return True
+        return False
+
+    def slab_borders(self, sid: int) -> list:
+        """Boundary quads of one slab.
+
+        Each quad is ``(x1, y1, x2, y2, mid, sign, length, other)`` where
+        ``other`` is the sector on the far side of the linedef (-1 when the
+        border is one-sided).  ``(x1, y1) -> (x2, y2)`` is the direction
+        ``_ensure_polys`` builds the slab's own contour with, so a texture
+        ``u`` measured from the edge start runs the same way the wall path
+        measures it.  ``sign`` is the contour's winding (+1 =
+        counter-clockwise): a side face is visible when the camera sits on the
+        *outside* of that contour, which is ``cross(edge, cam - start) * sign
+        < 0``.  Cached per scene — geometry does not change while a party
+        runs.
+        """
+        cached = self._slab_border_cache.get(sid)
+        if cached is not None:
+            return cached
+        out: list = []
+        area2 = 0.0
+        verts = self.sm.verts
+        sides = self.sm.sidedefs
+        for ld in self.sm.linedefs:
+            on_front = (0 <= ld.front < len(sides)
+                        and sides[ld.front].sector == sid)
+            on_back = (0 <= ld.back < len(sides)
+                       and sides[ld.back].sector == sid)
+            if not (on_front or on_back):
+                continue
+            a, b = (ld.v1, ld.v2) if on_front else (ld.v2, ld.v1)
+            if not (0 <= a < len(verts) and 0 <= b < len(verts)):
+                continue
+            x1, y1 = verts[a].x, verts[a].y
+            x2, y2 = verts[b].x, verts[b].y
+            side = sides[ld.front] if on_front else sides[ld.back]
+            far = ld.back if on_front else ld.front
+            other = (sides[far].sector
+                     if 0 <= far < len(sides) else -1)
+            mid = side.mid
+            length = math.hypot(x2 - x1, y2 - y1) or 1.0
+            area2 += x1 * y2 - x2 * y1
+            out.append((x1, y1, x2, y2, mid, length, other))
+        sign = 1 if area2 >= 0.0 else -1
+        out = [(x1, y1, x2, y2, mid, sign, length, other)
+               for (x1, y1, x2, y2, mid, length, other) in out]
+        self._slab_border_cache[sid] = out
+        return out
+
     def ensure_bsp(self):
         """Return (and cache) the scene's BSP tree (task 2.3).
 
         A map loaded from an ``.mt1`` file that carries precomputed
         SEGS/SUBSECTORS/NODES slices reuses them; otherwise the tree is built
         once from the geometry.  Both paths produce the same subsectors.
+
+        A map with floating slabs always rebuilds (change
+        ``floating-sector-platforms``, task 4.1): a stored tree may have been
+        built before slabs existed — it partitions along slab borders, which
+        would give the area under a plate to the plate's own subsector and
+        lose the host floor.  Maps without slabs keep paying nothing.
         """
         from engine.bsp import BspTree, build_bsp
 
         if self.bsp is None:
             bsp_data = getattr(self.sm, "_bsp", None)
-            if bsp_data:
+            if bsp_data and not self.has_floating:
                 lumps = bsp_data["lumps"]
                 self.bsp = BspTree.from_lumps(
                     self.sm, lumps[mt1.L_SEGS], lumps[mt1.L_SUBSECTORS],
@@ -291,12 +365,21 @@ class SectorScene:
         return lit
 
     def floor_at(self, x: float, y: float) -> int:
+        """Floor the camera/particles/editor stand on.
+
+        Under a floating slab this is the **host** floor, never the slab top
+        (design §6): otherwise the camera would jump onto every plate it walks
+        under.  Maps without slabs keep the old single-sector lookup.
+        """
         key = (int(x), int(y))
         f = self._floor_cache.get(key)
         if f is not None:
             return f
-        si = self.sm.find_sector_at(x, y)
-        f = self.sm.sectors[si].floor_h if si >= 0 else 0
+        if self.has_floating:
+            f = self.sm.floor_under(x, y)
+        else:
+            si = self.sm.find_sector_at(x, y)
+            f = self.sm.sectors[si].floor_h if si >= 0 else 0
         if len(self._floor_cache) < 512 or key in self._floor_cache:
             self._floor_cache[key] = f
         return f
@@ -619,6 +702,24 @@ def _seg_wall_bands(bands, scene, tree, si, px, py, pa, F, hc, iw, ih, eye,
     cur = s.front_sec
     if li < 0 or li >= scene.n_lines or not (0 <= cur < len(scene.floor_h)):
         return
+    # A slab border is an overlay, not a wall (task 4.1): the host's flats must
+    # keep spanning the footprint underneath, so this path contributes no
+    # band, no flats and no clip movement.  The plate paints itself on top in
+    # ``engine/platform_render.py``.
+    # Doors on floating borders need special handling.
+    is_door_check = li in scene.door_lines
+    if scene.floating_line[li]:
+        # Only allow doors between floating sectors (both sides floating)
+        # Doors between floating and host must be skipped to preserve host floor spanning
+        if is_door_check:
+            fs_sec = scene.front_sec[li]
+            bs_sec = scene.back_sec[li]
+            both_floating = (0 <= fs_sec < len(scene.floating) and scene.floating[fs_sec] and
+                            0 <= bs_sec < len(scene.floating) and scene.floating[bs_sec])
+            if not both_floating:
+                return
+        else:
+            return
     ca, sa = math.cos(pa), math.sin(pa)
     tan_h = math.tan(const.FOV * 0.5)
     dx1, dy1 = ax1 - px, ay1 - py
@@ -928,6 +1029,10 @@ def bsp_clipped_frame(vh=None, vy=None, view_buf=None) -> tuple:
     vh = vh if vh is not None else const.H
     vy = vy if vy is not None else 0
     scene = gs.sec_scene
+    # Slab occluders are per-frame state: the sprite pass reads them after this
+    # frame, and a map without plates (or the rollback flag) must leave nothing
+    # behind from the previous one.
+    gs.platform_occluders = None
     if scene is None:
         gs.screen.fill(VOID)
         pygame.draw.rect(gs.screen, VOID, (0, vy, const.W, vh))
@@ -992,6 +1097,17 @@ def bsp_clipped_frame(vh=None, vy=None, view_buf=None) -> tuple:
                                  fwidths, view)
     # ---- Phase C: walls (bucket strips, sliced into the frame) ----
     _draw_wall_bands(frame, bands, scene, view, iw, ih, iw_f, ih_f, fwidths)
+    # ---- Phase D: floating slabs (change ``floating-sector-platforms``) ----
+    # After the walls so a plate covers the far wall behind it, before the one
+    # upscale so it costs no second scaling.  A map without plates — the
+    # overwhelming majority — pays a single boolean here and never imports the
+    # module.
+    if gs.platforms_enabled and scene.has_floating:
+        from engine import platform_render
+
+        gs.platform_occluders = platform_render.draw_platforms(
+            frame, scene, px, py, pa, eye, F, hc, iw, ih, iw_f, ih_f,
+            fwidths, clip_top, clip_bot, view_buf, view, vh, vy)
     _upscale(frame, vy, vh)
     return order, clip_top, clip_bot
 
@@ -1010,6 +1126,17 @@ def _upscale(frame, vy, vh):
 
 
 def _current_eye(scene: SectorScene | None) -> float:
+    """Camera height in world units.
+
+    ``gs.player_z`` — the support height the server computed for the local
+    player — wins whenever it is set (change ``floating-sector-platforms``,
+    task 4.4): that is the only value that can be above a plate.  ``gs.pz`` is
+    deliberately NOT reused: it is a dead field with a different history, and
+    two owners of "how high is the camera" is the bug this avoids.
+    """
+    pz = getattr(gs, "player_z", None)
+    if pz is not None:
+        return pz + CAM_Z
     if scene is not None:
         return scene.floor_at(gs.px, gs.py) + CAM_Z
     return CAM_Z
@@ -1017,13 +1144,20 @@ def _current_eye(scene: SectorScene | None) -> float:
 
 def project_object(wx: float, wy: float, world_h: float,
                    vh: float | None = None, vy: float | None = None,
-                   eye: float | None = None) -> tuple | None:
+                   eye: float | None = None,
+                   floor_z: float | None = None) -> tuple | None:
     """Project a world object to (sx, sh, ground_y, perp) or None.
 
     ``sx`` is a screen column of the *current* window: the FOV and width are
     read live, so a resize or an FOV change moves the projection with the
     scene instead of leaving it projected for whichever window was open when
     this module was first imported.
+
+    ``floor_z`` is the surface the object stands on.  ``None`` keeps the old
+    behaviour (the floor of the sector the object is in, i.e. the host floor
+    under a slab); a player standing on a plate passes its snapshot ``z`` so it
+    is drawn on the plate's top instead of on the ground below it (task 4.4).
+    Only the vertical moves with it — ``sx`` and ``perp`` do not.
     """
     if vh is None:
         vh = const.H
@@ -1044,7 +1178,8 @@ def project_object(wx: float, wy: float, world_h: float,
         perp = 1
     if eye is None:
         eye = _current_eye(scene)
-    floor_z = scene.floor_at(wx, wy) if scene is not None else 0.0
+    if floor_z is None:
+        floor_z = scene.floor_at(wx, wy) if scene is not None else 0.0
     sh = world_h * FOCAL / perp
     ground_y = vy + vh / 2 + (eye - floor_z) * FOCAL / perp
     sx = int((0.5 * (ang / (const.FOV / 2)) + 0.5) * const.W)

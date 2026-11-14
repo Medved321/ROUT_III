@@ -59,20 +59,28 @@ _FONT_SIZES = (34, 18)
 _font_cache: dict[tuple[int, int], tuple] = {}
 
 
-def ui_scale() -> float:
+def ui_scale(width: int | None = None, height: int | None = None) -> float:
     """Factor for interface sizes at the current window.
 
     ``min`` over both axes rather than height alone: the HUD bar spans the full
     width, so a very wide window must not buy it elements that no longer fit
     across.  Every preset from 640x480 to 3840x2160 is height-limited anyway,
     so ``min`` only matters for extreme aspect ratios.
+
+    ``width``/``height`` default to the live window (``const.W``/``const.H``).
+    A caller that lays out *before* the next resize lands -- the touch overlay
+    recomputes its geometry from the size it is handed -- passes them
+    explicitly, so the factor stays defined here instead of being copied.
     """
-    w = const.W if const.W > 0 else REF_W
-    h = const.H if const.H > 0 else REF_H
+    w = const.W if width is None else width
+    h = const.H if height is None else height
+    w = w if w > 0 else REF_W
+    h = h if h > 0 else REF_H
     return min(w / float(REF_W), h / float(REF_H))
 
 
-def ui_px(units: float) -> int:
+def ui_px(units: float, width: int | None = None,
+          height: int | None = None) -> int:
     """A length authored against the reference window, in current pixels.
 
     Rounded to whole pixels on purpose.  The world is upscaled with
@@ -81,7 +89,7 @@ def ui_px(units: float) -> int:
     Caches keyed on this value therefore only miss on real resizes, not on
     every pixel of a window drag.
     """
-    return max(1, int(round(units * ui_scale())))
+    return max(1, int(round(units * ui_scale(width, height))))
 
 
 def ensure_hud_fonts() -> None:
@@ -120,7 +128,8 @@ def _tile_ground_y(vh: float, vy: int, perp: float) -> float:
 
 
 def project_point(x: float, y: float, world_h: float,
-                  vh: float | None = None, vy: int | None = None):
+                  vh: float | None = None, vy: int | None = None,
+                  floor_z: float | None = None):
     """Project a world point to ``(sx, sh, ground_y, perp)``, or ``None``.
 
     ``sh``      on-screen height of something ``world_h`` units tall.
@@ -132,7 +141,9 @@ def project_point(x: float, y: float, world_h: float,
 
     In sector mode this delegates to ``sector_render.project_object``, so
     particles follow the floor of the sector they are in instead of the
-    horizon.
+    horizon.  ``floor_z`` overrides that floor (an actor standing on a
+    floating slab passes its own support height); ``None`` keeps the sector
+    floor, so every existing caller is unchanged.
     """
     if vh is None:
         vh = const.H
@@ -140,7 +151,8 @@ def project_point(x: float, y: float, world_h: float,
         vy = 0
     if gs.sector_mode and gs.sec_scene is not None:
         from engine import sector_render
-        proj = sector_render.project_object(x, y, world_h, vh, vy)
+        proj = sector_render.project_object(x, y, world_h, vh, vy,
+                                            floor_z=floor_z)
         if proj is None:
             return None
         sx, sh, ground_y, perp = proj

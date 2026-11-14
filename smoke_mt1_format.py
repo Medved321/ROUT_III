@@ -707,6 +707,96 @@ def test_container():
     print("MT1 CONTAINER TESTS PASSED")
 
 
+def _platform_map(top: int = 88, under: int = 72) -> SectorMap:
+    """Host room with a two-sided floating slab inside it."""
+    sm = SectorMap()
+    sm.sectors.append(Sector(floor_h=16, ceil_h=200))
+    sm.sectors.append(Sector(floor_h=top, ceil_h=under, floating=True))
+
+    def rect(x1, y1, x2, y2, sector):
+        side = len(sm.sidedefs)
+        sm.sidedefs.append(SideDef(sector=sector))
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+        for i in range(4):
+            ax, ay = corners[i]
+            bx, by = corners[(i + 1) % 4]
+            if (bx - ax) * (cy - ay) - (by - ay) * (cx - ax) >= 0:
+                ax, ay, bx, by = bx, by, ax, ay
+
+            def vid(px, py):
+                for idx, v in enumerate(sm.verts):
+                    if v.x == px and v.y == py:
+                        return idx
+                sm.verts.append(Vertex(px, py))
+                return len(sm.verts) - 1
+
+            sm.linedefs.append(LineDef(vid(ax, ay), vid(bx, by), front=side))
+        return side
+
+    rect(0, 0, 512, 512, 0)
+    rect(128, 128, 384, 384, 1)
+    host_side = len(sm.sidedefs)
+    sm.sidedefs.append(SideDef(sector=0))
+    for ld in sm.linedefs:
+        if sm.sidedefs[ld.front].sector == 1:
+            ld.back = host_side
+    sm.things.append(Thing(64, 64))
+    sm.invalidate()
+    return sm
+
+
+def test_sflags_roundtrip():
+    from shared.mt1 import (
+        L_SFLAGS, Mt1Code, MT1_VERSION, decode_sflags, encode_sflags,
+    )
+
+    # Codec: bit 0 only; absence means "no slabs"; bad length is an error.
+    assert encode_sflags([False, True, False]) == b"\x00\x01\x00"
+    assert decode_sflags(None, 3) == [False, False, False]
+    assert decode_sflags(b"", 2) == [False, False]
+    assert decode_sflags(b"\x01\x00", 2) == [True, False]
+    try:
+        decode_sflags(b"\x01", 2)
+        raise AssertionError("short SFLAGS accepted")
+    except Mt1Error as exc:
+        assert exc.code == Mt1Code.MALFORMED_LUMP, exc.code
+
+    sm = _platform_map()
+    assert sm.validate() == [], sm.validate()
+    raw = sm.to_bytes()
+    lumps = unpack(raw)
+    assert L_SFLAGS in lumps, "a slab must write the SFLAGS lump"
+    assert MT1_VERSION == 1, MT1_VERSION
+    assert len(lumps[L_SFLAGS]) == len(sm.sectors)
+
+    back = SectorMap.from_mt1(raw)
+    assert [s.floating for s in back.sectors] == [False, True]
+    assert (back.sectors[1].floor_h, back.sectors[1].ceil_h) == (88, 72)
+    assert back.sectors[1].ceil_tex == "ceiling"
+    assert back.to_json() == sm.to_json()
+    assert SectorMap.validate_bytes(raw) == []
+
+    # A map without slabs keeps the old byte layout (no SFLAGS at all).
+    plain = _two_room_map()
+    assert L_SFLAGS not in unpack(plain.to_bytes())
+    assert [s.floating for s in SectorMap.from_mt1(plain.to_bytes()).sectors] \
+        == [False, False]
+
+    # An old container without SFLAGS reads as all anchored.
+    old_lumps = unpack(raw)
+    del old_lumps[L_SFLAGS]
+    old = SectorMap.from_mt1(pack(old_lumps))
+    assert all(not s.floating for s in old.sectors)
+
+    # Thin slab in .mt1 is rejected with the sector named, before a party.
+    thin = _platform_map(top=76, under=72)
+    errs = SectorMap.validate_bytes(thin.to_bytes())
+    assert any("thinner than" in e and "sector 1" in e for e in errs), errs
+    assert SectorMap.validate_network(thin.to_bytes()) is None
+    print("SFLAGS round-trip, absence, old container, thin slab OK")
+
+
 if __name__ == "__main__":
     test_container()
     test_container_validation()
@@ -719,5 +809,6 @@ if __name__ == "__main__":
     test_bsp_reject_los()
     test_bsp_reject_codec()
     test_solid_flag_roundtrip()
+    test_sflags_roundtrip()
     with tempfile.TemporaryDirectory() as tmp:
         test_model_import_save(tmp)

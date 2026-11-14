@@ -1256,6 +1256,18 @@ def render(vh=None, vy=None):
             if 't' in s_obj and 'id' in s_obj:
                 spr_flr -= int(sh * ITEM_FLOAT_HEIGHT)
             idx = depth_col(z_b, sx, const.W)
+            # A floating slab between the camera and the sprite paints over it
+            # in the frame, but the column z-buffer only knows walls: ask the
+            # plate's own intervals (change ``floating-sector-platforms``,
+            # task 4.5).  Every column covered -> drop the sprite; one
+            # uncovered column -> draw it whole (no per-pixel clipping).
+            if gs.platform_occluders:
+                from engine import platform_render
+
+                if platform_render.sprite_occluded(
+                        gs.platform_occluders, sx, sh // 2,
+                        spr_flr - sh, spr_flr, perp, const.W):
+                    continue
             if idx >= 0 and z_b[idx] > occ:
                 if s_obj.get('type') == 'barrel':
                     r = int(sh * 0.4)
@@ -1495,7 +1507,7 @@ def render(vh=None, vy=None):
                 from engine import sector_render
 
                 proj = sector_render.project_object(
-                    ox, oy, 56, _RH, _RY)
+                    ox, oy, 56, _RH, _RY, floor_z=pl.get('z'))
                 if proj is None:
                     continue
                 sx2, sh2, plr_flr, occ2 = proj
@@ -1509,6 +1521,13 @@ def render(vh=None, vy=None):
             # below is derived from these -- so snap once, here.
             sh2 = int(min(sh2, _RH * 2))
             plr_flr = int(plr_flr)
+            if gs.platform_occluders:
+                from engine import platform_render
+
+                if platform_render.sprite_occluded(
+                        gs.platform_occluders, sx2, sh2 // 2,
+                        plr_flr - sh2, plr_flr, occ2, const.W):
+                    continue
             idx2 = depth_col(z_b, sx2, const.W)
             if idx2 >= 0 and z_b[idx2] > occ2:
                 skin = (230, 190, 150)

@@ -307,6 +307,23 @@ def _u8(value) -> int:
     return 255 if v > 255 else v
 
 
+def _i16(value) -> int:
+    """Clamp a height to the signed 16-bit wire field.
+
+    Sector heights are already i16 in ``SECTOR_STRUCT``, so a support z is
+    naturally in range; this is the same insurance as ``_u8`` for callers
+    that hand over a float or a bogus number.  Rounding keeps the value the
+    surface actually has instead of truncating toward zero.
+    """
+    try:
+        v = int(round(float(value)))
+    except (TypeError, ValueError):
+        return 0
+    if v < -32768:
+        return -32768
+    return 32767 if v > 32767 else v
+
+
 def encode_world_state(
     tick: int,
     players: list[dict],
@@ -354,7 +371,10 @@ def encode_world_state(
             # keys: the player's key bitmask (R/Y/B), use_reason: advisory code
             # for the last "use" attempt (0 = none/ok).  Both are per-player
             # state with no other source in the snapshot.
-            "!HfffBBBBBBBBIBBBBBBBHHIIHHHH",
+            # h: height of the support under the player (int16).  Appended to
+            # the tail so every previous field keeps its offset; the server
+            # computes it, the client only displays it (PROTOCOL_VERSION 14).
+            "!HfffBBBBBBBBIBBBBBBBHHIIHHHHh",
             p["id"] & 0xFFFF,
             p["x"], p["y"], p["angle"],
             _u8(p["health"]),
@@ -379,6 +399,7 @@ def encode_world_state(
             int(stats.get("shots_hit", 0)) & 0xFFFF,
             int(stats.get("items", 0)) & 0xFFFF,
             int(stats.get("secrets", 0)) & 0xFFFF,
+            _i16(p.get("z", 0)),
         )
         body += _encode_string(p.get("name", ""))
     # Enemies
@@ -471,13 +492,13 @@ def decode_world_state(data: bytes) -> tuple[int, list[dict], list[dict], list[d
         (pid, x, y, angle, hp, state, wpn, ap, ash, asg, ark, abfg,
          fire_seq, fire_ready, fire_reason, armor_value, armor_idx, pu_idx,
          keys, use_reason, s_kills, s_deaths, s_dealt, s_taken,
-         s_fired, s_hit, s_items, s_secrets) = struct.unpack(
-            "!HfffBBBBBBBBIBBBBBBBHHIIHHHH", data[offset:offset + 53]
+         s_fired, s_hit, s_items, s_secrets, pz) = struct.unpack(
+            "!HfffBBBBBBBBIBBBBBBBHHIIHHHHh", data[offset:offset + 55]
         )
-        offset += 53
+        offset += 55
         name, offset = _decode_string(data, offset)
         players.append({
-            "id": pid, "x": x, "y": y, "angle": angle,
+            "id": pid, "x": x, "y": y, "angle": angle, "z": pz,
             "health": hp, "state": state, "name": name, "wpn": wpn,
             "ammo": {"pstl": ap, "shl": ash, "slg": asg, "rck": ark, "BFG": abfg},
             "fire_seq": fire_seq, "fire_ready": fire_ready,

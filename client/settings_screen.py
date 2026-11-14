@@ -20,6 +20,14 @@ HINTS = "↑/↓ — выбор | ←/→ — изменить | Enter — пе�
 # to a resolution that is not in the preset list, e.g. 4K on an odd monitor.
 CUSTOM_ROW_KEY = "window_size"
 
+# Rows that own a free-text field, with the caption above it. Two very different
+# values are typed the same way (a ``Ш×В`` size and a server address), so the
+# field, its band and its hit area are shared instead of copied.
+TEXT_ROW_LABELS = {
+    "window_size": "Размер окна (Ш×В, Enter — применить):",
+    "server_host": "Адрес сервера (host или host:port, Enter — применить):",
+}
+
 # Band geometry below the row viewport, top to bottom. Each element owns a
 # strip of its own so a long label or error cannot land on the next element.
 ROWS_Y = 128
@@ -45,7 +53,6 @@ VALUE_MIN_W = 120
 ARROW_W = 34
 ARROW_INSET_L = 118
 ARROW_INSET_R = 42
-FIELD_LABEL = "Размер окна (Ш×В, Enter — применить):"
 
 
 class SettingsScreen:
@@ -54,9 +61,19 @@ class SettingsScreen:
         self.height = height
         self._selected = 0
         self._scroll = 0
-        # Free-text editing of the current row's value (see CUSTOM_ROW_KEY).
+        # Free-text editing of the current row's value (see TEXT_ROW_LABELS).
         self._editing = False
         self._text = ""
+        # Why the last committed text was refused (empty when it was applied).
+        # Screen-local on purpose: it belongs to one field of one screen, unlike
+        # ``Settings.resolution_error``, which the window sizing path reads.
+        self._field_error = ""
+        # Last typed character and which channel delivered it.  Desktop SDL
+        # reports a printable key twice -- as ``KEYDOWN.unicode`` and as
+        # ``TEXTINPUT`` -- while Android reports it only as ``TEXTINPUT``. Both
+        # have to be accepted, so the pair is collapsed when it arrives in the
+        # same batch instead of picking one channel and breaking the other.
+        self._last_typed: tuple[str, str] | None = None
         self.title_font = pygame.font.SysFont("monospace", 42, bold=True)
         self.font = pygame.font.SysFont("monospace", 20)
         self.small_font = pygame.font.SysFont("monospace", 14)
@@ -133,8 +150,15 @@ class SettingsScreen:
             self._scroll = self._selected - self._visible_rows + 1
 
     @property
+    def _field_spec(self) -> dict | None:
+        """SPEC entry whose row owns the text field, or ``None``."""
+        spec = SPEC[self._selected]
+        return spec if spec["key"] in TEXT_ROW_LABELS else None
+
+    @property
     def _editing_row(self) -> bool:
-        return self._editing and SPEC[self._selected]["key"] == CUSTOM_ROW_KEY
+        spec = self._field_spec
+        return bool(self._editing and spec is not None)
 
     def _value_rect(self, rect: pygame.Rect) -> pygame.Rect:
         """The strip a row's value is drawn in: from the column split up to the
@@ -184,27 +208,91 @@ class SettingsScreen:
         if index == self._selected:
             return
         self._selected = max(0, min(len(SPEC) - 1, index))
+        self._stop_editing()
+
+    def _stop_editing(self) -> None:
+        """Close the text field (if open) and hide the soft keyboard with it."""
+        was = self._editing
         self._editing = False
+        if was:
+            self._text_input(False)
+
+    def _text_input(self, start: bool) -> None:
+        """Ask the platform for a soft keyboard while a text row is edited.
+
+        Desktop SDL ignores this (physical keys already arrive as ``KEYDOWN``),
+        Android shows the on-screen keyboard only after ``start_text_input`` --
+        without it the field would be visible, editable in theory, and dead
+        under the finger.
+        """
+        fn = getattr(pygame.key, "start_text_input" if start else "stop_text_input", None)
+        if fn is None:
+            return
+        try:
+            fn()
+        except Exception:
+            pass
+
+    def _field_text(self, settings) -> str:
+        key = SPEC[self._selected]["key"]
+        if key == CUSTOM_ROW_KEY:
+            return str(settings.get(CUSTOM_ROW_KEY))
+        return settings.address_text
 
     def _open_editor(self, settings) -> None:
-        spec = SPEC[self._selected]
+        spec = self._field_spec
+        if spec is None:
+            return
         self._editing = True
-        self._text = str(settings.get(spec["key"]))
+        self._text = self._field_text(settings)
+        self._field_error = ""
+        self._last_typed = None
+        self._text_input(True)
+
+    def _append_typed(self, ch: str, source: str) -> None:
+        """Append one typed character, collapsing a two-channel duplicate.
+
+        ``source`` is ``"key"`` (from ``KEYDOWN.unicode``) or ``"text"`` (from
+        ``TEXTINPUT``).  The same keystroke delivered by both channels arrives
+        one after the other, so a repeat of the identical character from the
+        *other* channel is the same keystroke and is skipped; the same character
+        twice from one channel is two keystrokes and is kept.
+        """
+        if not ch or not ch.isprintable() or len(self._text) >= 64:
+            return
+        other = "text" if source == "key" else "key"
+        if self._last_typed == (ch, other):
+            self._last_typed = (ch, source)
+            return
+        self._text += ch
+        self._last_typed = (ch, source)
 
     def _apply_text(self, settings) -> None:
         """Commit the free-text field. Bad input is reported, not applied."""
-        spec = SPEC[self._selected]
-        size, error = validate_size(self._text)
-        if size is None:
+        key = SPEC[self._selected]["key"]
+        self._text_input(False)
+        if key == CUSTOM_ROW_KEY:
+            size, error = validate_size(self._text)
             settings.resolution_error = error
+            self._field_error = error
+            if size is None:
+                return
+            settings.set(key, f"{size[0]}\u00d7{size[1]}")
             return
-        settings.resolution_error = ""
-        settings.set(spec["key"], f"{size[0]}\u00d7{size[1]}")
+        ok, error = settings.set_address(self._text)
+        self._field_error = error
+        if not ok:
+            return
 
     def handle(self, events, settings) -> str | None:
+        # One keystroke may be reported by two channels within this batch; the
+        # duplicate is recognised only against the previous character, so the
+        # memory is per batch.
+        self._last_typed = None
         for event in events:
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if self.back_btn.collidepoint(event.pos):
+                    self._stop_editing()
                     settings.save()
                     return "back"
                 for i, spec in enumerate(SPEC):
@@ -214,31 +302,35 @@ class SettingsScreen:
                     if self._left_arrow(rect).collidepoint(event.pos):
                         self._select(i)
                         settings.adjust(spec["key"], -1)
-                        self._editing = False
+                        self._stop_editing()
                     elif self._right_arrow(rect).collidepoint(event.pos):
                         self._select(i)
                         settings.adjust(spec["key"], +1)
-                        self._editing = False
+                        self._stop_editing()
                     elif rect.collidepoint(event.pos):
                         self._select(i)
                         if spec["kind"] == "bool":
                             settings.adjust(spec["key"], +1)
-                        elif spec.get("custom") and not self._editing:
+                        elif spec["kind"] == "text" and not self._editing:
                             self._open_editor(settings)
             elif event.type == pygame.MOUSEWHEEL:
                 self._select(self._selected - event.y)
+            elif event.type == pygame.TEXTINPUT and self._editing_row:
+                # Android delivers printable characters here, not as KEYDOWN.
+                for ch in getattr(event, "text", ""):
+                    self._append_typed(ch, "text")
             elif event.type == pygame.KEYDOWN:
                 if self._editing:
                     if event.key == pygame.K_RETURN:
                         self._apply_text(settings)
                         self._editing = False
                     elif event.key == pygame.K_ESCAPE:
-                        self._editing = False
+                        self._stop_editing()
                     elif event.key == pygame.K_BACKSPACE:
                         self._text = self._text[:-1]
-                    elif event.unicode and event.unicode.isprintable():
-                        if len(self._text) < 16:
-                            self._text += event.unicode
+                        self._last_typed = None
+                    elif event.unicode:
+                        self._append_typed(event.unicode, "key")
                     continue
                 if event.key == pygame.K_ESCAPE:
                     settings.save()
@@ -257,7 +349,7 @@ class SettingsScreen:
                     spec = SPEC[self._selected]
                     if spec["kind"] == "bool":
                         settings.adjust(spec["key"], +1)
-                    elif spec.get("custom"):
+                    elif spec["kind"] == "text":
                         self._open_editor(settings)
         return None
 
@@ -286,9 +378,13 @@ class SettingsScreen:
             # Right-aligned inside its own band: the arrows keep their zone and a
             # long value is cut instead of running under them.
             value_rect = self._value_rect(rect)
-            value = settings.get(spec["key"])
+            value = (settings.address_text if spec["key"] == "server_host"
+                     else settings.get(spec["key"]))
+            shown = format_value(spec["key"], value)
+            if spec["kind"] == "text" and not selected:
+                shown = f"{shown} [Enter]"
             value_txt = self.font.render(
-                ellipsize(format_value(spec["key"], value), self.font, value_rect.width),
+                ellipsize(shown, self.font, value_rect.width),
                 True, GREEN if selected else MUTED,
             )
             surface.blit(
@@ -297,7 +393,7 @@ class SettingsScreen:
                  rect.y + (rect.height - value_txt.get_height()) // 2),
             )
 
-            if spec["kind"] != "bool":
+            if spec["kind"] in ("float", "int", "list"):
                 for arrow_rect, char in (
                     (self._left_arrow(rect), "<"),
                     (self._right_arrow(rect), ">"),
@@ -336,19 +432,22 @@ class SettingsScreen:
         surface.blit(hint, ((self.width - hint.get_width()) // 2, self.height - 28))
 
     def _draw_field(self, surface, settings) -> None:
-        """The custom-size field: visible only while the size row is selected.
+        """The free-text field: visible only while a text row is selected.
 
         The label and the error each live in their own band above and below the
-        field (see ``_layout``). The label used to be drawn at ``field.y - 16``,
-        which put it inside the row viewport, and the error at ``field.bottom+2``,
-        which overlapped the back button.
+        field (see ``_layout``), so neither lands inside the row viewport or on
+        the back button. One field serves both the window size and the server
+        address; which row is selected decides the caption and the commit rule.
         """
-        if SPEC[self._selected]["key"] != CUSTOM_ROW_KEY:
+        spec = self._field_spec
+        if spec is None:
             return
+        key = spec["key"]
 
         label_rect = self._field_label_rect
         label_txt = self.small_font.render(
-            ellipsize(FIELD_LABEL, self.small_font, label_rect.width), True, MUTED)
+            ellipsize(TEXT_ROW_LABELS[key], self.small_font, label_rect.width),
+            True, MUTED)
         surface.blit(label_txt, (label_rect.x,
                                  label_rect.centery - label_txt.get_height() // 2))
 
@@ -356,7 +455,7 @@ class SettingsScreen:
         pygame.draw.rect(surface, PANEL, rect, border_radius=4)
         border = SELECT if self._editing_row else MUTED
         pygame.draw.rect(surface, border, rect, 2, border_radius=4)
-        text = self._text if self._editing else str(settings.get(CUSTOM_ROW_KEY))
+        text = self._text if self._editing else self._field_text(settings)
         shown = text + ("|" if self._editing_row else "")
         # Tail-clipped: the value is typed here, so the tail being edited has to
         # stay visible even when it outgrows the field.
@@ -364,7 +463,7 @@ class SettingsScreen:
             clip_tail(shown, self.small_font, rect.width - 16), True, TEXT)
         surface.blit(txt, (rect.x + 8, rect.centery - txt.get_height() // 2))
 
-        error = settings.resolution_error
+        error = self._field_error
         if error:
             err_rect = self._error_rect
             err = self.small_font.render(

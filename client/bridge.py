@@ -249,6 +249,7 @@ class RenderBridge:
         doors: list[dict] | None = None,
         keys: int = 0,
         use_hint: bool = False,
+        player_z: float | None = None,
     ) -> None:
         # The animation clock runs on the frame period, not on snapshots, so a
         # 20 Hz snapshot stream still animates at the display rate.  Fed here
@@ -260,6 +261,11 @@ class RenderBridge:
         gs.py = py
         gs.pa = angle
         gs.pz = 0.0
+        # Support height of the local player from the snapshot.  None means
+        # "the map has no vertical" (tile map), so the camera keeps using the
+        # sector floor exactly as before.  The value is authoritative: the
+        # client never computes it, it only displays it.
+        gs.player_z = None if player_z is None else float(player_z)
         gs.pitch = 0.0
         # Measured by the caller, not by the engine: a clock lives in the
         # client, and gs.fps is only the readout for the HUD.
@@ -292,6 +298,10 @@ class RenderBridge:
                 'wpn': pl.get('wpn', 1),
                 'col': col,
                 'state': pl.get('state', 0),
+                # Support height of a remote player: the renderer projects the
+                # model from it, so a player standing on a slab is drawn on its
+                # top instead of on the host floor below.
+                'z': pl.get('z'),
             })
 
         gs.enemies = [self._enemy_dict(e, i)

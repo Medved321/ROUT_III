@@ -20,7 +20,7 @@ Grammar (case-insensitive keywords, ``#`` starts a comment)::
 
     параметры комнаты: пол N, потолок N, свет N, пол_текстура ИМЯ,
         потол_текстура ИМЯ, стена ИМЯ, текстура ИМЯ, текстура_верх ИМЯ,
-        текстура_низ ИМЯ, тег N, триггер тип ТИП [тег N]
+        текстура_низ ИМЯ, тег N, триггер тип ТИП [тег N], парит да|нет
     параметры СТЕНА: текстура ИМЯ, стена ИМЯ, текстура_верх ИМЯ,
         текстура_низ ИМЯ, тег N, триггер тип ТИП [тег N]
     параметры вещи: направление N, высота Z
@@ -44,7 +44,7 @@ from pathlib import Path
 
 from shared.sector_map import (
     DOOR_TEXTURE_BY_LOCK, DOOR_TEXTURE_NONE, KEY_LOCK_BY_ITEM, KEY_TYPES,
-    SPECIAL_DOORS,
+    MIN_PLATFORM_THICKNESS, SPECIAL_DOORS,
     LineDef, Sector, SectorMap, SideDef, Thing, Vertex,
 )
 
@@ -233,7 +233,7 @@ def _special_name(code: int) -> str:
 class _Room:
     __slots__ = ("line", "name", "contours", "contour_lines", "floor_h",
                  "ceil_h", "floor_tex", "ceil_tex", "light", "upper", "mid",
-                 "lower", "special", "tag")
+                 "lower", "special", "tag", "floating", "float_line")
 
     def __init__(self, line: int, name: str):
         self.line = line
@@ -252,6 +252,8 @@ class _Room:
         self.lower: str | None = None
         self.special = 0
         self.tag = 0
+        self.floating = False
+        self.float_line = line
 
     def add_corner(self, point: tuple[float, float], line: int) -> None:
         self.contours[-1].append(point)
@@ -303,7 +305,8 @@ class _Document:
 # ── parsing ───────────────────────────────────────────────────────────────
 
 _ROOM_PARAM_HELP = "пол, потолок, свет, пол_текстура, потол_текстура, " \
-                   "стена, текстура, текстура_верх, текстура_низ, тег, триггер"
+                   "стена, текстура, текстура_верх, текстура_низ, тег, " \
+                   "триггер, парит"
 _WALL_PARAM_HELP = "текстура, стена, текстура_верх, текстура_низ, тег, " \
                    "триггер, сплошная, замок"
 _THING_PARAM_HELP = "направление, высота"
@@ -313,7 +316,7 @@ _KEYWORDS = frozenset((
     "игрок", "враг",
     "аптечка", "патроны", "вещь", "пол", "потолок", "свет", "пол_текстура",
     "потол_текстура", "текстура_верх", "текстура_низ", "тег", "триггер",
-    "направление", "высота", "сплошная", "замок",
+    "направление", "высота", "сплошная", "замок", "парит",
 ))
 
 _KEY_COLOR_KNOWN = "красный, жёлтый, синий, нет"
@@ -423,6 +426,7 @@ def _parse_document(text: str) -> _Document:
             _wall_param(current, kw, args, lineno, what)
         else:
             _thing_param(current, kw, args, lineno, what)
+    _check_floating_rooms(doc)
     if not doc.rooms and not doc.walls:
         raise TextMapError(max(doc.last_line, 1), "в файле нет ни одной КОМНАТЫ")
     return doc
@@ -496,6 +500,13 @@ def _room_param(room: _Room, kw: str, args: list[str], lineno: int,
                         0, MAX_TAG, "тег")
     elif kw == "триггер":
         room.special, room.tag = _trigger(args, lineno, what, room.tag)
+    elif kw == "парит":
+        value = _arg(args, lineno, what, "парит").lower()
+        if value not in ("да", "нет"):
+            raise TextMapError(
+                lineno, f"{what}: «парит» принимает «да» или «нет»")
+        room.floating = value == "да"
+        room.float_line = lineno
     else:
         raise TextMapError(lineno, f"{what} не подходит к КОМНАТЕ "
                                    f"(допустимо: {_ROOM_PARAM_HELP})")
@@ -561,6 +572,25 @@ def _trigger(args: list[str], lineno: int, what: str,
     elif len(rest) >= 2 and rest[1].lower() != "тег":
         raise TextMapError(lineno, f"{what}: лишний аргумент «{rest[1]}»")
     return special, tag
+
+
+def _check_floating_rooms(doc: _Document) -> None:
+    """Validate ``парит да`` rooms before any geometry is built.
+
+    Contact is free: a slab may share its contour with a host hole, with
+    another slab, with a wall, or with nothing at all.  The only property the
+    text form still checks is the one the model itself requires — a slab has
+    to be thick enough between its two heights.
+    """
+    for room in doc.rooms:
+        if not room.floating:
+            continue
+        if room.floor_h - room.ceil_h < MIN_PLATFORM_THICKNESS:
+            raise TextMapError(
+                room.float_line,
+                f"парящая комната «{room.name}»: плита "
+                f"{room.ceil_h}..{room.floor_h} тоньше "
+                f"{MIN_PLATFORM_THICKNESS}")
 
 
 # ── geometry build ────────────────────────────────────────────────────────
@@ -648,6 +678,7 @@ class _Builder:
             floor_h=room.floor_h, ceil_h=room.ceil_h,
             floor_tex=room.floor_tex, ceil_tex=room.ceil_tex,
             light=room.light, special=room.special, tag=room.tag,
+            floating=room.floating,
         ))
         # The first contour is the room's own boundary; later ones are holes
         # (or islands) of the same sector, so their front -- the sector's own
@@ -1030,6 +1061,8 @@ def render(sm: SectorMap) -> str:
             out.append(f"пол {sector.floor_h}")
         if sector.ceil_h != 128:
             out.append(f"потолок {sector.ceil_h}")
+        if sector.floating:
+            out.append("парит да")
         if sector.light != 160:
             out.append(f"свет {sector.light}")
         if sector.floor_tex != "floor":

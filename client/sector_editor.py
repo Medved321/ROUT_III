@@ -11,27 +11,13 @@ import math
 
 from shared.sector_map import (
     DOOR_LOCK_BY_TEXTURE, DOOR_TEXTURE_BY_LOCK, DOOR_TEXTURE_NONE,
-    MAX_SECTOR_HEIGHT, MIN_SECTOR_HEIGHT, SPECIAL_DOORS, STEP_HEIGHT,
+    MAX_SECTOR_HEIGHT, MIN_PLATFORM_THICKNESS, MIN_SECTOR_HEIGHT,
+    SPECIAL_DOORS, STEP_HEIGHT,
     LineDef, Sector, SectorMap, SideDef, Thing, Vertex,
 )
 
 ENTITY_KINDS = ("vertices", "linedefs", "sidedefs", "sectors", "things")
 GRID_DEFAULT = 16
-
-# ── sector walls ───────────────────────────────────────────────────────────
-# A sector created from a contour is inset by one grid step on every solid
-# edge; the strip between the contour and the inset loop belongs to no sector,
-# so it is a solid wall body rather than a thin zero-width line.  A portal edge
-# is not inset (a door has no thickness), and the wall tapers to the original
-# vertex at the opening's jamb.
-WALL_THICKNESS = float(GRID_DEFAULT)
-# A miter longer than this many thicknesses is a spike at a sharp corner; the
-# offset falls back to the angle bisector instead of shooting off the map.
-WALL_MITER_LIMIT = 4.0
-# Any inner edge shorter than this (or an inner area below the matching bound)
-# means the room has no usable interior left after the wall is subtracted.
-MIN_WALL_LEN = 1.0
-MIN_INNER_AREA = 1.0
 
 # ── stairs ────────────────────────────────────────────────────────────────
 # The tool's whole point is that every riser stays walkable, so the default
@@ -58,20 +44,46 @@ STAIR_MAX_STEPS = 64
 STAIR_FACE_TEX = "wall"
 
 
-def clamp_sector_heights(floor_h, ceil_h) -> tuple[int, int]:
-    """Normalize a floor/ceiling pair: integral, in range, ``floor <= ceil``.
+def clamp_sector_heights(floor_h, ceil_h, floating: bool = False,
+                         driver: str = "floor") -> tuple[int, int]:
+    """Normalize a floor/ceiling pair: integral, in range, ordered.
 
     Single clamp for the whole editor — the ``пол ▲/▼`` buttons and the numeric
     fields both go through it, so the map never goes invalid mid-edit and a
     rejected value is visible in the panel as the applied one.
+
+    The order is **reversed for a floating sector** (``floating=True``): its
+    ``floor_h`` is the plate top and its ``ceil_h`` the underside, so the pair
+    must keep ``floor_h >= ceil_h + MIN_PLATFORM_THICKNESS`` instead of
+    ``floor_h <= ceil_h``.  ``driver`` names the surface the caller just edited
+    (``"floor"`` or ``"ceil"``); when the thickness is too small that one keeps
+    its value and the other gives way — typing a top below the underside drops
+    the underside, typing an underside above the top raises the top.  A clamp
+    that always moved the same side would silently discard half the typed
+    values.
     """
     fl = int(round(float(floor_h)))
     ce = int(round(float(ceil_h)))
     fl = max(MIN_SECTOR_HEIGHT, min(MAX_SECTOR_HEIGHT, fl))
     ce = max(MIN_SECTOR_HEIGHT, min(MAX_SECTOR_HEIGHT, ce))
-    if fl > ce:
-        # the ceiling wins when the floor is pushed through it
-        fl = ce
+    if not floating:
+        if fl > ce:
+            # the ceiling wins when the floor is pushed through it
+            fl = ce
+        return fl, ce
+    need = MIN_PLATFORM_THICKNESS
+    if fl - ce >= need:
+        return fl, ce
+    if driver == "ceil":
+        ce = fl - need
+        if ce < MIN_SECTOR_HEIGHT:
+            ce = MIN_SECTOR_HEIGHT
+            fl = ce + need
+    else:
+        fl = ce + need
+        if fl > MAX_SECTOR_HEIGHT:
+            fl = MAX_SECTOR_HEIGHT
+            ce = fl - need
     return fl, ce
 
 
@@ -114,7 +126,8 @@ def _item_from_json(kind: str, item) -> object:
                        int(item[4]), int(item[5]))
     if kind == "sectors":
         return Sector(int(item[0]), int(item[1]), str(item[2]), str(item[3]),
-                      int(item[4]), int(item[5]), int(item[6]))
+                      int(item[4]), int(item[5]), int(item[6]),
+                      bool(item[7]) if len(item) > 7 else False)
     return Thing(float(item[0]), float(item[1]), str(item[2]), int(item[3]),
                  float(item[4]))
 
@@ -175,61 +188,6 @@ def _segments_intersect(a, b, c, d) -> bool:
     return False
 
 
-def _point_in_polygon(p, poly) -> bool:
-    """Ray-casting test; the boundary is unspecified (callers allow it)."""
-    inside = False
-    n = len(poly)
-    for i in range(n):
-        x1, y1 = poly[i]
-        x2, y2 = poly[(i + 1) % n]
-        if (y1 > p[1]) != (y2 > p[1]):
-            x = (x2 - x1) * (p[1] - y1) / (y2 - y1) + x1
-            if p[0] < x:
-                inside = not inside
-    return inside
-
-
-def _point_on_polygon(p, poly) -> bool:
-    """True when ``p`` lies on any edge of ``poly`` (within 1e-6)."""
-    n = len(poly)
-    for i in range(n):
-        a, b = poly[i], poly[(i + 1) % n]
-        dx, dy = b[0] - a[0], b[1] - a[1]
-        ln = math.hypot(dx, dy)
-        if ln <= 1e-9:
-            continue
-        cross = abs((p[0] - a[0]) * dy - (p[1] - a[1]) * dx) / ln
-        dot = (p[0] - a[0]) * dx + (p[1] - a[1]) * dy
-        if cross <= 1e-6 and -1e-6 <= dot <= ln * ln + 1e-6:
-            return True
-    return False
-
-
-def _offset_vertex(p, d_prev, d_cur, n_prev, n_cur) -> tuple[float, float]:
-    """Miter the inward normals of two adjacent solid edges at ``p``.
-
-    ``d_*`` are unit directions *along* the CCW contour and ``n_*`` their
-    inward (left) normals.  The miter is capped at ``WALL_MITER_LIMIT``
-    thicknesses; beyond that the angle bisector is used, because a sharp
-    corner otherwise shoots the wall deep into the neighbouring room.
-    """
-    den = 1.0 + d_prev[0] * d_cur[0] + d_prev[1] * d_cur[1]
-    if den < 1e-6:
-        # A 180-degree reversal has no meaningful miter; the caller rejects it.
-        qx, qy = p[0] + n_prev[0] * WALL_THICKNESS, p[1] + n_prev[1] * WALL_THICKNESS
-    else:
-        qx = p[0] + (n_prev[0] + n_cur[0]) * WALL_THICKNESS / den
-        qy = p[1] + (n_prev[1] + n_cur[1]) * WALL_THICKNESS / den
-    if math.hypot(qx - p[0], qy - p[1]) > WALL_MITER_LIMIT * WALL_THICKNESS:
-        bx, by = n_prev[0] + n_cur[0], n_prev[1] + n_cur[1]
-        bl = math.hypot(bx, by)
-        if bl <= 1e-9:
-            bx, by, bl = n_prev[0], n_prev[1], 1.0
-        qx = p[0] + bx / bl * WALL_THICKNESS
-        qy = p[1] + by / bl * WALL_THICKNESS
-    return float(round(qx)), float(round(qy))
-
-
 def _apply_item(obj, kind: str, item) -> None:
     if kind == "vertices":
         obj.x, obj.y = float(item[0]), float(item[1])
@@ -248,6 +206,8 @@ def _apply_item(obj, kind: str, item) -> None:
          obj.special, obj.tag) = (
             int(item[0]), int(item[1]), str(item[2]), str(item[3]),
             int(item[4]), int(item[5]), int(item[6]))
+        if hasattr(obj, 'floating') and len(item) > 7:
+            obj.floating = bool(item[7])
     else:
         obj.x, obj.y, obj.type, obj.angle, obj.z = (
             float(item[0]), float(item[1]), str(item[2]), int(item[3]),
@@ -639,7 +599,7 @@ class SectorEditor:
                     return px, py
         return None
 
-    def _merge_loop_lines(self, idx: int) -> list[int]:
+    def _merge_loop_lines(self, idx: int, only: int | None = None) -> list[int]:
         """The surrounding sector's loop around ``idx``, for dissolving it.
 
         A thick room's outer face is a hole in the surrounding sector, not one
@@ -647,6 +607,10 @@ class SectorEditor:
         the wall body as a void, so the enclosing hole loop goes with it — and
         only when the surrounding sector keeps another loop (the old
         ``_polygon_alive`` protection).
+
+        ``only`` restricts the search to one surrounding sector, so a room
+        ringed by several hosts collects one hole loop per host instead of the
+        single smallest one.
         """
         point = self._interior_point(idx)
         if point is None:
@@ -654,7 +618,7 @@ class SectorEditor:
         sm = self.sm
         best = None
         for sid in range(len(sm.sectors)):
-            if sid == idx:
+            if sid == idx or (only is not None and sid != only):
                 continue
             for pts, area, lids in self._sector_loops_with_lines(sid):
                 if area <= 0 or not sm._point_in_loop(point[0], point[1], pts):
@@ -781,6 +745,163 @@ class SectorEditor:
                          ", ".join(str(i) for i in stranded))
         return notes
 
+    # ── floating plates ───────────────────────────────────────────────
+    def _line_sides(self, ld) -> tuple[int, int]:
+        """Sector indices on the front/back side of ``ld`` (-1 when absent)."""
+        sm = self.sm
+        front = (sm.sidedefs[ld.front].sector
+                 if 0 <= ld.front < len(sm.sidedefs) else -1)
+        back = (sm.sidedefs[ld.back].sector
+                if 0 <= ld.back < len(sm.sidedefs) else -1)
+        return front, back
+
+    def _host_outside(self, idx: int, li: int) -> int | None:
+        """Nearest non-void sector just outside wall ``li`` of ``idx``.
+
+        Used by the legacy thick-wall path: a ringed room's own wall is
+        followed by a band of void, and the host is the first sector the
+        outward normal reaches after crossing it.  Looking at a few distances
+        instead of one tolerates a band that is slightly wider at a corner.
+        ``None`` means there is no host on that side (a real map edge, not a
+        ring), which is not an error: a plate may border nothing at all.
+        """
+        sm = self.sm
+        ld = sm.linedefs[li]
+        a, b = sm.verts[ld.v1], sm.verts[ld.v2]
+        dx, dy = b.x - a.x, b.y - a.y
+        ln = math.hypot(dx, dy)
+        if ln <= 1e-9:
+            return None
+        mx, my = (a.x + b.x) * 0.5, (a.y + b.y) * 0.5
+        for sign in (1.0, -1.0):
+            nx, ny = -dy / ln * sign, dx / ln * sign
+            if sm.find_sector_at(mx + nx * 0.5, my + ny * 0.5) == idx:
+                continue
+            for k in range(1, 512):
+                sid = sm.find_sector_at(mx + nx * k, my + ny * k)
+                if sid == idx:
+                    break
+                if sid >= 0:
+                    return sid
+            break
+        return None
+
+    def _swap_plate_heights(self, idx: int) -> None:
+        """Heights of a room become the plate's: old ceiling on top.
+
+        The plate top is ``floor_h`` and the underside ``ceil_h``, so the pair
+        swaps, and the thickness clamp runs the *floating* way with the new
+        underside as the driver: a room thinner than
+        ``MIN_PLATFORM_THICKNESS`` grows upwards, keeping its underside on the
+        sector's own floor as the spec requires.
+        """
+        s = self.sectors[idx]
+        top, under = s.ceil_h, s.floor_h
+        s.floor_h, s.ceil_h = clamp_sector_heights(top, under, True,
+                                                   driver="ceil")
+        s.floating = True
+
+    def set_sector_floating(self, idx: int, on: bool) -> list[str]:
+        """Mark sector ``idx`` as a floating plate, or take the mark away.
+
+        A plate is a volume you walk *under*.  The only thing the mark needs is
+        a flat pair of heights; **contact with other sectors is free**, so no
+        topology is required and none is refused: a plate may border one
+        sector, several sectors, another plate, or nothing at all (a map
+        edge), and its border may be two-sided or one-sided.  The heights swap
+        and the old ceiling becomes the walkable top; the neighbours' heights
+        are never adjusted behind the author's back.
+
+        A legacy room built by the old thick-wall editor still has a ring of
+        void around its own one-sided walls.  Best effort: each such wall is
+        bound to the nearest sector outside the band, the surrounding hole
+        loop of that host goes with it, and a wall with no host across it is
+        simply left one-sided.  Everything is one undo step; a refusal (no
+        boundary at all) leaves the map untouched.
+        """
+        if not (0 <= idx < len(self.sectors)):
+            return ["сектор не выделен"]
+        s = self.sectors[idx]
+        sm = self.sm
+        if not on:
+            if not s.floating:
+                return []
+            self._record()
+            s.floating = False
+            # back to a room: the top becomes the ceiling again and the
+            # ordinary clamp (ceiling wins) decides the pair
+            s.floor_h, s.ceil_h = clamp_sector_heights(s.ceil_h, s.floor_h)
+            self._after_mutate()
+            return [f"сектор {idx}: снова привязан к полу"]
+        if s.floating:
+            return []
+        own: list[int] = []       # walls of this sector not shared with anyone
+        shared: list[int] = []    # borders it shares with another sector
+        for li, ld in enumerate(sm.linedefs):
+            f, b = self._line_sides(ld)
+            if idx not in (f, b):
+                continue
+            other = b if f == idx else f
+            (shared if other >= 0 else own).append(li)
+        if not own and not shared:
+            return [f"сектор {idx}: у него нет границы — плиту не из чего "
+                    f"сделать"]
+
+        self._record()
+        host_by_line: dict[int, int] = {}
+        for li in own:
+            host = self._host_outside(idx, li)
+            if host is None:
+                continue          # a real map edge: leave the wall one-sided
+            host_by_line[li] = host
+        # A legacy ring's outer hole loop is found BEFORE the bindings below:
+        # binding an own wall to the host adds a host-facing loop along that
+        # wall, and it is the SMALLER of the two (the inner contour is inset),
+        # so searching afterwards would select the plate's own border and
+        # dissolve nothing.  The surrounding hole is the one that goes.
+        outer: set[int] = set()
+        for host in set(host_by_line.values()):
+            outer.update(self._merge_loop_lines(idx, only=host))
+        outer -= set(own)
+        for li, host in host_by_line.items():
+            # The wall becomes the plate's border: its own side keeps the
+            # plate's texture, the cloned side belongs to the host and closes
+            # the host's void in the opposite direction (a back side runs
+            # v2->v1).
+            ld = sm.linedefs[li]
+            if 0 <= ld.back < len(sm.sidedefs) and \
+                    sm.sidedefs[ld.back].sector == idx:
+                ld.front = self._clone_side(ld.back, host)
+            else:
+                ld.back = self._clone_side(ld.front, host)
+
+        self._swap_plate_heights(idx)
+        # The surrounding hole loop found above goes with the wall body; a
+        # missing loop is not a refusal: the plate is already legal without
+        # that cleanup.
+        if outer:
+            self._drop(lines=outer,
+                       sides={side for li in outer
+                              for side in (sm.linedefs[li].front,
+                                           sm.linedefs[li].back)
+                              if side >= 0},
+                       prune_orphan_verts=True, record=False)
+        else:
+            self._after_mutate()
+
+        if own and host_by_line:
+            notes = [f"сектор {idx}: парит, стена привязана к соседу"]
+        elif shared:
+            notes = [f"сектор {idx}: парит (высоты обменяны)"]
+        else:
+            notes = [f"сектор {idx}: парит (своя граница осталась)"]
+        inside = [i for i, t in enumerate(self.things)
+                  if sm.find_sector_at(t.x, t.y) == idx]
+        if inside:
+            notes.append("вещи на плите: " +
+                         ", ".join(str(i) for i in inside))
+        return notes
+
     # ── linedef operations ────────────────────────────────────────────
     def _new_side(self, sector: int, mid: str | None = None) -> int:
         self.sides.append(SideDef(sector=sector, mid=mid or self.cur_line_mid))
@@ -797,24 +918,6 @@ class SectorEditor:
         self.sides.append(SideDef(upper=s.upper, mid=s.mid, lower=s.lower,
                                   x_off=s.x_off, y_off=s.y_off, sector=sector))
         return len(self.sides) - 1
-
-    def _ensure_vertex(self, x: float, y: float,
-                       prefer: int | None = None) -> int:
-        """Reuse the contour's own vertex where possible, else add one.
-
-        ``prefer`` is the original contour vertex the point came from.  The
-        inner wall must share that vertex with the portal at a jamb: creating a
-        duplicate there would leave the sector polygons disconnected.
-        """
-        if (prefer is not None and 0 <= prefer < len(self.verts)
-                and abs(self.verts[prefer].x - x) < 1e-6
-                and abs(self.verts[prefer].y - y) < 1e-6):
-            return prefer
-        for i, v in enumerate(self.verts):
-            if abs(v.x - x) < 1e-6 and abs(v.y - y) < 1e-6:
-                return i
-        self.verts.append(Vertex(float(x), float(y)))
-        return len(self.verts) - 1
 
     def add_line(self, v1: int, v2: int, front_sector: int | None = None,
                  back_sector: int | None = None,
@@ -1093,7 +1196,11 @@ class SectorEditor:
         s = self.sectors[idx]
         want_floor = s.floor_h if floor_h is None else floor_h
         want_ceil = s.ceil_h if ceil_h is None else ceil_h
-        got_floor, got_ceil = clamp_sector_heights(want_floor, want_ceil)
+        # A floating sector keeps its thickness the other way round, and the
+        # field that was actually edited decides which surface gives way.
+        driver = "ceil" if (ceil_h is not None and floor_h is None) else "floor"
+        got_floor, got_ceil = clamp_sector_heights(
+            want_floor, want_ceil, floating=bool(s.floating), driver=driver)
         if (got_floor, got_ceil) == (s.floor_h, s.ceil_h):
             return got_floor, got_ceil
         self._record()
@@ -1146,15 +1253,18 @@ class SectorEditor:
                          ceil_tex: str | None = None,
                          light: int | None = None,
                          special: int | None = None,
-                         tag: int | None = None) -> None:
+                         tag: int | None = None) -> tuple[int, int] | None:
         if not (0 <= idx < len(self.sectors)):
-            return
-        self._record()
+            return None
         s = self.sectors[idx]
-        if floor_h is not None:
-            s.floor_h = int(floor_h)
-        if ceil_h is not None:
-            s.ceil_h = int(ceil_h)
+        self._record()
+        if floor_h is not None or ceil_h is not None:
+            want_floor = s.floor_h if floor_h is None else floor_h
+            want_ceil = s.ceil_h if ceil_h is None else ceil_h
+            driver = "ceil" if (ceil_h is not None and floor_h is None) else "floor"
+            got_floor, got_ceil = clamp_sector_heights(
+                want_floor, want_ceil, floating=bool(s.floating), driver=driver)
+            s.floor_h, s.ceil_h = got_floor, got_ceil
         if floor_tex is not None:
             s.floor_tex = floor_tex
         if ceil_tex is not None:
@@ -1166,6 +1276,9 @@ class SectorEditor:
         if tag is not None:
             s.tag = int(tag)
         self._after_mutate()
+        if floor_h is not None or ceil_h is not None:
+            return s.floor_h, s.ceil_h
+        return None
 
     def _contour_loop(
         self, line_ids: list[int]
@@ -1213,128 +1326,20 @@ class SectorEditor:
             return None, "контур не замкнут"
         return order, ""
 
-    def _inner_plan(
-        self, segs: list[tuple[LineDef, int, int]], pts: list[tuple[float, float]]
-    ) -> tuple[list[tuple[float, float]] | None,
-               list[tuple] | None, str]:
-        """Compute the inset inner loop and the wall segments for a contour.
-
-        Solid (one-sided) edges are inset by ``WALL_THICKNESS``; portal
-        (two-sided) edges stay on the contour, so the wall tapers to the
-        opening's jamb and a door still joins the new room to its neighbour.
-        The returned edges are ``(p, q, a_pref, b_pref, seg_index)`` — the
-        original contour vertices are reused where the inner wall meets a
-        portal.  On error the map is untouched.
-        """
-        n = len(segs)
-        solid = [not (ld.front >= 0 and ld.back >= 0) for (ld, _, _) in segs]
-        if not any(solid):
-            # A room whose every edge is a portal has no wall body; the new
-            # sector is simply the overlap of the surrounding sector.
-            return [], [], ""
-        dirs: list[tuple[float, float]] = []
-        normals: list[tuple[float, float]] = []
-        for i, (_, a, b) in enumerate(segs):
-            ax, ay = pts[i]
-            bx, by = self.verts[b].x, self.verts[b].y
-            dx, dy = bx - ax, by - ay
-            ln = math.hypot(dx, dy)
-            if ln <= 1e-9:
-                return None, None, "вырожденное ребро в контуре"
-            dirs.append((dx / ln, dy / ln))
-            normals.append((-dy / ln, dx / ln))
-
-        q: list[tuple[float, float]] = []
-        for i in range(n):
-            prev = (i - 1) % n
-            if solid[prev] and solid[i]:
-                den = 1.0 + (dirs[prev][0] * dirs[i][0]
-                             + dirs[prev][1] * dirs[i][1])
-                if den < 1e-6:
-                    return None, None, "контур имеет разворот на 180°"
-                q.append(_offset_vertex(pts[i], dirs[prev], dirs[i],
-                                        normals[prev], normals[i]))
-            else:
-                q.append(pts[i])
-
-        inner_points: list[tuple[float, float]] = []
-        edges: list[tuple] = []
-        for i in range(n):
-            _, a, b = segs[i]
-            nxt = (i + 1) % n
-            prev = (i - 1) % n
-            if not solid[i]:
-                inner_points.append(pts[i])
-                continue
-            start = q[i]
-            a_pref = a if start == pts[i] else None
-            if not solid[prev] and not solid[nxt]:
-                # An isolated solid edge between two portals: a single miter
-                # would be a point, so the wall forms a small "tent" that
-                # converges at both jambs.
-                mx = (pts[i][0] + self.verts[b].x) / 2.0
-                my = (pts[i][1] + self.verts[b].y) / 2.0
-                mid = (float(round(mx + normals[i][0] * WALL_THICKNESS)),
-                       float(round(my + normals[i][1] * WALL_THICKNESS)))
-                edges.append((start, mid, a_pref, None, i))
-                inner_points.append(start)
-                inner_points.append(mid)
-                edges.append((mid, pts[nxt], None, b, i))
-                continue
-            end = q[nxt] if solid[nxt] else pts[nxt]
-            b_pref = b if end == pts[nxt] else None
-            edges.append((start, end, a_pref, b_pref, i))
-            inner_points.append(start)
-
-        if len(inner_points) < 3:
-            return None, None, "комната слишком мала для толщины стены"
-        area2 = _poly_area2(inner_points)
-        if area2 <= 0 or area2 / 2.0 <= MIN_INNER_AREA:
-            return None, None, "комната слишком мала для толщины стены"
-        m = len(inner_points)
-        for k in range(m):
-            p, r = inner_points[k], inner_points[(k + 1) % m]
-            if math.hypot(r[0] - p[0], r[1] - p[1]) < MIN_WALL_LEN:
-                return None, None, "стена толщиной 16 оставляет слишком узкий проход"
-        for k in range(m):
-            a = inner_points[k]
-            b = inner_points[(k + 1) % m]
-            for j in range(k + 1, m):
-                if j == k + 1 or (k == 0 and j == m - 1):
-                    continue
-                if _segments_intersect(a, b, inner_points[j],
-                                       inner_points[(j + 1) % m]):
-                    return None, None, "внутренний контур самопересекается"
-        for (p, r, _, _, _) in edges:
-            ln = math.hypot(r[0] - p[0], r[1] - p[1])
-            if ln <= 1e-9:
-                return None, None, "стена толщиной 16 не оставляет комнаты"
-            eps = min(0.25, ln / 4.0)
-            ux, uy = (r[0] - p[0]) / ln, (r[1] - p[1]) / ln
-            sp = (p[0] + ux * eps, p[1] + uy * eps)
-            sq = (r[0] - ux * eps, r[1] - uy * eps)
-            for j in range(n):
-                if _segments_intersect(sp, sq, pts[j], pts[(j + 1) % n]):
-                    return None, None, "внутренняя стена пересекает контур"
-        for p in inner_points:
-            if _point_on_polygon(p, pts):
-                continue
-            if not _point_in_polygon(p, pts):
-                return None, None, "внутренний контур выходит за контур"
-        return inner_points, edges, ""
-
     def sector_from_contour(self, line_ids: list[int],
                             floor_h: int = 0, ceil_h: int = 128,
                             floor_tex: str = "floor", ceil_tex: str = "ceiling",
                             light: int = 160) -> tuple[int, list[str]]:
         """Turn a closed chain of existing linedefs into a new sector.
 
-        The contour becomes the outer face of the surrounding sector; solid
-        edges are inset by one grid step and the strip between the two loops
-        belongs to no sector, so it is a real wall body instead of a zero-width
-        line.  Two-sided contour edges are left alone: they are portals, and a
-        new door would have no thickness either.  Returns ``(sector_id,
-        [errors])``; on error the map and history are untouched.
+        The contour is the border itself: every edge becomes two-sided, the
+        surrounding sector keeps its side and the new sector gets the other.
+        There is no wall body between them, so adjacent rooms share one line
+        and a contour drawn inside a room splits that room instead of carving
+        a hole through a thick wall.
+
+        Returns ``(sector_id, [errors])``; on error the map and history are
+        untouched.
         """
         if len(set(line_ids)) != len(line_ids):
             return -1, ["повторяющиеся рёбра в контуре"]
@@ -1344,13 +1349,6 @@ class SectorEditor:
         pts = [(self.verts[a].x, self.verts[a].y) for (_, a, _) in segs]
         if len(pts) < 3:
             return -1, ["контур должен содержать не менее 3 рёбер"]
-        area2 = _poly_area2(pts)
-        if abs(area2) < 1e-6:
-            return -1, ["контур вырожден (нулевая площадь)"]
-        if area2 < 0:
-            segs = [(ld, b, a) for (ld, a, b) in reversed(segs)]
-            pts = [(self.verts[a].x, self.verts[a].y) for (_, a, _) in segs]
-            area2 = -area2
         n = len(segs)
         for i in range(n):
             a, b = pts[i], pts[(i + 1) % n]
@@ -1359,9 +1357,15 @@ class SectorEditor:
                     continue
                 if _segments_intersect(a, b, pts[j], pts[(j + 1) % n]):
                     return -1, ["контур самопересекается"]
-        inner_points, inner_edges, reason = self._inner_plan(segs, pts)
-        if inner_points is None:
-            return -1, [reason]
+        # A bow-tie has zero signed area, so this check runs after the
+        # self-intersection one: the specific reason must win over the
+        # generic "degenerate" message.
+        area2 = _poly_area2(pts)
+        if abs(area2) < 1e-6:
+            return -1, ["контур вырожден (нулевая площадь)"]
+        if area2 < 0:
+            segs = [(ld, b, a) for (ld, a, b) in reversed(segs)]
+            pts = [(self.verts[a].x, self.verts[a].y) for (_, a, _) in segs]
 
         plans = []
         for i, (ld, a, b) in enumerate(segs):
@@ -1371,79 +1375,46 @@ class SectorEditor:
             ln = math.hypot(dx, dy)
             if ln <= 1e-9:
                 return -1, ["вырожденное ребро в контуре"]
+            # CCW loop: the right-hand normal points out of the room.
             nx, ny = dy / ln, -dx / ln
             mx, my = (ax + bx) / 2.0, (ay + by) / 2.0
             outside = self.sm.find_sector_at(mx + nx, my + ny)
-            if outside < 0 or outside >= len(self.sectors):
+            if not (0 <= outside < len(self.sectors)):
+                outside = self.sm.find_sector_at(mx - nx, my - ny)
+            if not (0 <= outside < len(self.sectors)):
                 outside = self.cur_sector
             if not (0 <= outside < len(self.sectors)):
                 outside = 0
-            two = ld.front >= 0 and ld.back >= 0
-            if two and ld.front == ld.back:
-                return -1, ["у ребра контура обе стороны — один сектор"]
-            same_dir = ld.v1 == a and ld.v2 == b
-            if two:
-                mode, swap = "two", not same_dir
-            elif ld.front < 0:
-                mode, swap = "new", False
-            else:
-                mode, swap = ("keep" if same_dir else "move"), False
-            plans.append((ld, a, b, outside, mode, swap))
+            plans.append((ld, a, b, outside))
 
         new_id = len(self.sectors)
         self._record()
         self.sectors.append(Sector(floor_h=floor_h, ceil_h=ceil_h,
                                    floor_tex=floor_tex, ceil_tex=ceil_tex,
                                    light=light))
-        old_front: dict[int, int] = {}
-        for i, (ld, a, b, outside, mode, swap) in enumerate(plans):
-            ld.v1, ld.v2 = a, b
-            if mode == "two":
-                if swap:
-                    ld.front, ld.back = ld.back, ld.front
-                self.sides[ld.front].sector = outside
-                self.sides[ld.back].sector = new_id
-                ld.solid = False
-            elif mode in ("keep", "new"):
-                if mode == "new":
-                    ld.front = self._new_side(outside)
+        for ld, a, b, outside in plans:
+            # Orient the edge along the CCW contour: the front side then faces
+            # the surrounding room, the back side faces the new sector.
+            if not (ld.v1 == a and ld.v2 == b):
+                ld.v1, ld.v2 = a, b
+                ld.front, ld.back = ld.back, ld.front
+            if ld.front < 0:
+                if ld.back >= 0:
+                    ld.front, ld.back = ld.back, -1
                 else:
-                    self.sides[ld.front].sector = outside
-                ld.back = -1
-                ld.solid = False
-                old_front[i] = ld.front
-            else:  # move: reuse the old front as the inner wall
-                src = ld.front
-                old_front[i] = src
-                self.sides[src].sector = new_id
-                ld.front = self._clone_side(src, outside)
-                ld.back = -1
-                ld.solid = False
-
-        # Inner lines are emitted in reverse: the portal's back side traverses
-        # v2->v1 (CW), and the new sector's front edges must chain with it.
-        reuse_idx: set[int] = set()
-        seen_move: set[int] = set()
-        for k, (_, _, _, _, seg_i) in enumerate(inner_edges):
-            if plans[seg_i][4] == "move" and seg_i not in seen_move:
-                reuse_idx.add(k)
-                seen_move.add(seg_i)
-        for k in range(len(inner_edges) - 1, -1, -1):
-            p, r, a_pref, b_pref, seg_i = inner_edges[k]
-            src = old_front[seg_i]
-            vi = self._ensure_vertex(p[0], p[1], a_pref)
-            vj = self._ensure_vertex(r[0], r[1], b_pref)
-            if vi == vj:
-                continue
-            if k in reuse_idx:
-                side = src
-                self.sides[side].sector = new_id
+                    ld.front = self._new_side(outside)
+            front = self.sides[ld.front]
+            front.sector = outside
+            if ld.back < 0 or ld.back == ld.front:
+                ld.back = self._new_side(new_id, front.mid)
+                back = self.sides[ld.back]
+                # keep the author's step lips and offsets on both faces
+                back.upper, back.lower = front.upper, front.lower
+                back.x_off, back.y_off = front.x_off, front.y_off
             else:
-                side = self._clone_side(src, new_id)
-            # Reverse each segment: the inner loop is traversed CCW for
-            # geometry, while the new sector's front edges must run CW so they
-            # chain with the portal's back side (which runs v2->v1).
-            self.lines.append(LineDef(vj, vi, front=side, back=-1))
+                self.sides[ld.back].sector = new_id
+            # the border is a portal now: a two-sided line has no wall body
+            ld.solid = False
         self._after_mutate()
         return new_id, []
 

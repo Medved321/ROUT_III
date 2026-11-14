@@ -17,6 +17,8 @@ from shared.components import (
     Health, Player, Position, Velocity, Dash, WeaponComponent,
 )
 from shared.protocol import INPUT_FLAG_DASH
+from shared.sector_map import (LineDef, Sector, SectorMap, SideDef, Thing,
+                                Vertex)
 
 
 def _park_player(w, player_id, x, y, name='P'):
@@ -47,6 +49,59 @@ def _state(w, player_id=1):
 
 
 # ---------------------------------------------------------------- player
+
+def test_player_respawn_uses_entry_support_not_death_height():
+    """Dying on a slab must respawn on the entry point's floor, not in mid-air."""
+    sm = SectorMap()
+    sm.sectors.append(Sector(floor_h=0, ceil_h=256))
+    sm.sectors.append(Sector(floor_h=88, ceil_h=72, floating=True))
+
+    def vid(px, py):
+        for idx, v in enumerate(sm.verts):
+            if v.x == px and v.y == py:
+                return idx
+        sm.verts.append(Vertex(px, py))
+        return len(sm.verts) - 1
+
+    def rect(x1, y1, x2, y2, sector, back=None):
+        front = len(sm.sidedefs)
+        sm.sidedefs.append(SideDef(sector=sector))
+        back_side = None
+        if back is not None:
+            back_side = len(sm.sidedefs)
+            sm.sidedefs.append(SideDef(sector=back))
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+        for i in range(4):
+            ax, ay = corners[i]
+            bx, by = corners[(i + 1) % 4]
+            if (bx - ax) * (cy - ay) - (by - ay) * (cx - ax) < 0:
+                ax, ay, bx, by = bx, by, ax, ay
+            sm.linedefs.append(LineDef(
+                vid(ax, ay), vid(bx, by), front=front,
+                back=back_side if back_side is not None else -1))
+
+    rect(0, 0, 512, 512, 0)
+    rect(192, 192, 320, 320, 1, back=0)
+    sm.things = [Thing(64, 64, "player1")]
+    sm.invalidate()
+    assert sm.validate() == [], sm.validate()
+
+    w = GameWorld(mode='pve', game_map=sm)
+    eid = w.add_player(1, 'P')
+    pos = w.entities.get_component(eid, Position)
+    assert pos.z == 0, f"entry point support is the host floor: {pos.z}"
+
+    pos.x, pos.y, pos.z = 256.0, 256.0, 88.0   # die on the slab top
+    assert w.damage_player(eid, 1000) is True
+    assert _state(w)['z'] == 88, "death snapshot must keep the height it died at"
+
+    w.respawn_player(1)
+    pos = w.entities.get_component(eid, Position)
+    assert (pos.x, pos.y) == (64.0, 64.0), (pos.x, pos.y)
+    assert pos.z == 0, f"respawned at the death height: {pos.z}"
+    print("respawn uses the entry support, not the death height OK")
+
 
 def test_player_respawns_at_its_own_start_point():
     """The join point is the respawn point -- not a random spawn_points entry."""
@@ -417,6 +472,7 @@ def test_only_a_respawn_brings_the_wave_back():
 
 if __name__ == '__main__':
     test_player_respawns_at_its_own_start_point()
+    test_player_respawn_uses_entry_support_not_death_height()
     test_player_stays_dead_without_a_request()
     test_respawn_of_a_living_player_does_nothing()
     test_player_death_is_published_at_least_one_snapshot()
