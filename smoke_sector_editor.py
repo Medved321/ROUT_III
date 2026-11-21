@@ -1166,6 +1166,34 @@ def test_set_sector_floating():
     print("  set floating     OK")
 
 
+def test_floating_unrestricted_editor():
+    """Floating toggle accepts stacking/no-host/contact; invalid thin still rejected."""
+    ed = SectorEditor(new_room(1600, 1600))
+    b1 = _contour_box(ed, 300, 300, 500, 500)
+    s1, errs = ed.sector_from_contour(b1, floor_h=0, ceil_h=64)
+    assert s1 == 1 and not errs, errs
+    assert ed.set_sector_floating(s1, True) == [] or ed.sectors[s1].floating
+    assert ed.sectors[s1].floating
+    # second overlapping floating room at different height - stacking/contact
+    b2 = _contour_box(ed, 350, 350, 550, 550)
+    s2, errs = ed.sector_from_contour(b2, floor_h=32, ceil_h=96)
+    assert s2 >= 2 and not errs, errs
+    ed.set_sector_floating(s2, True)
+    assert ed.sectors[s2].floating
+    assert not ed.validate(), ed.validate()
+    # no-host: isolated room outside main room
+    ed2 = SectorEditor(new_room(1600, 1600))
+    sid = ed2.add_sector(floor_h=16, ceil_h=96, light=90)
+    ed2.cur_sector = sid
+    _contour_box(ed2, 2000, 2000, 2200, 2200)
+    ed2.cur_sector = 0
+    ed2.sm.invalidate()
+    notes = ed2.set_sector_floating(sid, True)
+    assert ed2.sectors[sid].floating, notes
+    assert not ed2.validate(), ed2.validate()
+    print("  floating unrestricted editor OK")
+
+
 def main():
     test_vertex_ops()
     test_line_ops()
@@ -1182,6 +1210,7 @@ def main():
     test_sector_from_contour_rejects_bad_loops()
     test_height_clamp()
     test_set_sector_floating()
+    test_floating_unrestricted_editor()
     test_solid_flag_and_step_textures()
     test_solid_cleared_when_line_becomes_one_sided()
     test_things_roundtrip()

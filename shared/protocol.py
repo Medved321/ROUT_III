@@ -373,7 +373,7 @@ def encode_world_state(
             # state with no other source in the snapshot.
             # h: height of the support under the player (int16).  Appended to
             # the tail so every previous field keeps its offset; the server
-            # computes it, the client only displays it (PROTOCOL_VERSION 14).
+            # computes it, the client only displays it (PROTOCOL_VERSION 15).
             "!HfffBBBBBBBBIBBBBBBBHHIIHHHHh",
             p["id"] & 0xFFFF,
             p["x"], p["y"], p["angle"],
@@ -410,9 +410,10 @@ def encode_world_state(
         if isinstance(etype, str):
             etype = ENEMY_TYPES.index(etype) if etype in ENEMY_TYPES else 0
         body += struct.pack(
-            "!HfffBHB",
+            "!HffffBHB",
             e["id"] & 0xFFFF,
             e["x"], e["y"], e.get("angle", 0.0),
+            float(e.get("z", 0.0)),
             etype & 0xFF,
             max(0, int(e.get("hp", 0))) & 0xFFFF,
             e.get("state", 0) & 0xFF,
@@ -422,7 +423,7 @@ def encode_world_state(
     body += struct.pack("!H", len(bullets))
     for b in bullets:
         body += struct.pack(
-            "!ffBBBB", b["x"], b["y"],
+            "!fffBBBB", b["x"], b["y"], float(b.get("z", 0.0)),
             *(b.get("col", (200, 200, 200))[:3]),
             1 if b.get("from_player") else 0,
         )
@@ -525,10 +526,10 @@ def decode_world_state(data: bytes) -> tuple[int, list[dict], list[dict], list[d
     offset += 2
     enemies = []
     for _ in range(e_count):
-        eid, ex, ey, ea, etype, ehp, est = struct.unpack("!HfffBHB", data[offset:offset + 18])
-        offset += 18
+        eid, ex, ey, ea, ez, etype, ehp, est = struct.unpack("!HffffBHB", data[offset:offset + 22])
+        offset += 22
         enemies.append({
-            "id": eid, "x": ex, "y": ey, "angle": ea, "type": etype,
+            "id": eid, "x": ex, "y": ey, "z": ez, "angle": ea, "type": etype,
             "hp": ehp, "state": est,
         })
     # Bullets (x, y, r, g, b, from_player)
@@ -536,9 +537,9 @@ def decode_world_state(data: bytes) -> tuple[int, list[dict], list[dict], list[d
     offset += 2
     bullets = []
     for _ in range(b_count):
-        bx, by, r, g, b, from_player = struct.unpack("!ffBBBB", data[offset:offset + 12])
-        offset += 12
-        bullets.append({"x": bx, "y": by, "col": (r, g, b), "from_player": bool(from_player)})
+        bx, by, bz, r, g, b, from_player = struct.unpack("!fffBBBB", data[offset:offset + 16])
+        offset += 16
+        bullets.append({"x": bx, "y": by, "z": bz, "col": (r, g, b), "from_player": bool(from_player)})
     # Corpses
     c_count = struct.unpack("!H", data[offset:offset + 2])[0]
     offset += 2

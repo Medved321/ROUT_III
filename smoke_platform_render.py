@@ -548,23 +548,37 @@ def test_floor_z_moves_only_vertical():
 
 def test_sprite_occlusion_rules():
     from engine import platform_render
+    import pygame
 
     occ = [[(100.0, 300.0, 400.0)] for _ in range(250)]
-    # fully behind the plate and inside its span -> dropped
+    # fully behind the plate and inside its span -> hidden
     assert platform_render.sprite_occluded(occ, 500, 30, 320, 380, 200.0, 1000)
-    # in front of the plate -> drawn
-    assert not platform_render.sprite_occluded(occ, 500, 30, 320, 380, 50.0,
-                                               1000)
-    # taller than the plate (partial cover) -> drawn whole, no clipping
-    assert not platform_render.sprite_occluded(occ, 500, 30, 250, 380, 200.0,
-                                               1000)
-    # one uncovered column is enough to keep the sprite
+    assert platform_render.sprite_visibility(occ, 500, 30, 320, 380, 200.0, 1000) == 'hidden'
+    # in front of the plate -> visible
+    assert not platform_render.sprite_occluded(occ, 500, 30, 320, 380, 50.0, 1000)
+    assert platform_render.sprite_visibility(occ, 500, 30, 320, 380, 50.0, 1000) == 'visible'
+    # taller than the plate (partial cover) -> partially visible, not fully hidden
+    assert not platform_render.sprite_occluded(occ, 500, 30, 250, 380, 200.0, 1000)
+    assert platform_render.sprite_visibility(occ, 500, 30, 250, 380, 200.0, 1000) == 'partial'
+    spans = platform_render.visible_spans(occ, 500, 250, 380, 200.0, 1000)
+    assert spans == [(250, 300)], spans
+    # one uncovered column means not fully hidden (partial overall)
     occ2 = [list(row) for row in occ]
     occ2[120] = []
-    assert not platform_render.sprite_occluded(occ2, 500, 30, 320, 380, 200.0,
-                                               1000)
-    assert not platform_render.sprite_occluded(None, 500, 30, 320, 380, 200.0,
-                                               1000)
+    assert not platform_render.sprite_occluded(occ2, 500, 30, 320, 380, 200.0, 1000)
+    assert platform_render.sprite_visibility(occ2, 500, 30, 320, 380, 200.0, 1000) == 'partial'
+    assert not platform_render.sprite_occluded(None, 500, 30, 320, 380, 200.0, 1000)
+
+    # draw_sprite_clipped restores covered pixels (opaque slab)
+    screen = pygame.Surface((1000, 500))
+    screen.fill((10, 20, 30))
+    rect = (490, 250, 20, 130)
+    def _draw():
+        pygame.draw.rect(screen, (200, 0, 0), rect)
+    platform_render.draw_sprite_clipped(screen, occ, rect, 200.0, _draw, 1000)
+    # covered area (y 300-380) should keep background, uncovered (250-300) red
+    assert screen.get_at((500, 260))[:3] == (200, 0, 0)
+    assert screen.get_at((500, 350))[:3] == (10, 20, 30)
     print("  sprite occlusion  OK")
 
 

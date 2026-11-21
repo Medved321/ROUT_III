@@ -17,7 +17,7 @@ from shared.components import (
     Stats,
 )
 from shared.map_data import GameMap, TILE
-from shared.sector_map import SectorMap, KEY_BITS
+from shared.sector_map import SectorMap, KEY_BITS, EYE_HEIGHT, ACTOR_HEIGHT
 from shared.combat import USE_REASON_OK, USE_REASON_CODES
 from server.game_data import (
     PLAYER_RADIUS, PLAYER_MAX_HP, ENEMY_DB, ENEMY_RADIUS,
@@ -622,19 +622,15 @@ class GameWorld:
             return self.game_map.can_move_px(x, y, r, self._blocked_doors)
         return self.game_map.can_move_px(x, y, r)
 
-    def has_los_px(self, x1: float, y1: float, x2: float, y2: float) -> bool:
+    def has_los_px(self, x1: float, y1: float, x2: float, y2: float,
+                   z1: float | None = None, z2: float | None = None) -> bool:
         if self._blocked_doors:
-            return self.game_map.has_los_px(x1, y1, x2, y2, self._blocked_doors)
-        return self.game_map.has_los_px(x1, y1, x2, y2)
+            return self.game_map.has_los_px(x1, y1, x2, y2, self._blocked_doors, z1=z1, z2=z2)
+        return self.game_map.has_los_px(x1, y1, x2, y2, z1=z1, z2=z2)
 
-    def is_wall_px(self, x: float, y: float) -> bool:
-        """Solid for projectiles/hitscans: void OR a shut/moving door plane.
-
-        ``is_wall_px`` only sees void, so a point just past a closed door lies in
-        the neighbouring (walkable) sector and would let a bullet through; the
-        door segment is tested explicitly.
-        """
-        if self.game_map.is_wall_px(x, y):
+    def is_wall_px(self, x: float, y: float, z: float | None = None) -> bool:
+        """Solid for projectiles/hitscans: void/slab OR a shut/moving door plane."""
+        if self.game_map.is_wall_px(x, y, z):
             return True
         if self._blocked_doors:
             door_hit = getattr(self.game_map, 'door_hit_px', None)
@@ -747,17 +743,18 @@ class GameWorld:
         return float(floor_under(x, y)) if floor_under is not None else 0.0
 
     def _enemy_step_ok(self, en: dict, nx: float, ny: float) -> float | None:
-        """Enemy move: same plan-view test, but the slab top is not a support.
+        """Enemy move: plan-view test plus height/support check.
 
-        Enemies do not plan a climb and must not end up on a slab they cannot
-        be reached on; they still walk under it when the clearance fits.
+        Enemies can step onto floating platforms the same way players can
+        (step-height limited), while still being able to pass under slabs when
+        there is clearance.
         """
         if not self.can_move_px(nx, ny, ENEMY_RADIUS):
             return None
         support_at = getattr(self.game_map, "support_at", None)
         if support_at is None:
             return 0.0
-        return support_at(nx, ny, en.get('z', 0.0), allow_platforms=False)
+        return support_at(nx, ny, en.get('z', 0.0), allow_platforms=True)
 
     @staticmethod
     def _set_axis(pos: Position, value: float, axis: int) -> None:
@@ -837,7 +834,7 @@ class GameWorld:
             pos = self.entities.get_component(eid, Position)
             hp = self.entities.get_component(eid, Health)
             if pos and hp and hp.value > 0:
-                player_positions.append((eid, pos.x, pos.y))
+                player_positions.append((eid, pos.x, pos.y, pos.z))
 
         # O(1) attacker lookup and O(neighbors) alert/separation for the whole
         # tick.  Rebuilt once here; per-tick movement is far smaller than a
@@ -872,7 +869,9 @@ class GameWorld:
                 other = by_id.get(attacker_id)
                 if (other is not None and other['a'] and other['hp'] > 0
                         and math.hypot(other['x'] - ex, other['y'] - ey) < ENEMY_DETECT_RANGE
-                        and self.has_los_px(ex, ey, other['x'], other['y'])):
+                        and self.has_los_px(ex, ey, other['x'], other['y'],
+                                            en.get('z', 0.0) + EYE_HEIGHT,
+                                            other.get('z', 0.0) + EYE_HEIGHT)):
                     target_enemy = other
                 if target_enemy is not None:
                     en['attack_ticks'] -= 1
@@ -881,16 +880,18 @@ class GameWorld:
                 en['attack_ticks'] = 0
 
             # --- target selection (nearest player with LOS) ----------------
-            target_eid, tx, ty = None, None, None
+            target_eid, tx, ty, tz = None, None, None, 0.0
             if target_enemy is None:
                 best = ENEMY_DETECT_RANGE
-                for peid, px, py in player_positions:
+                for peid, px, py, pz in player_positions:
                     dst = math.hypot(px - ex, py - ey)
-                    if dst < best and self.has_los_px(ex, ey, px, py):
+                    if dst < best and self.has_los_px(ex, ey, px, py,
+                                                      en.get('z', 0.0) + EYE_HEIGHT,
+                                                      pz + EYE_HEIGHT):
                         best = dst
-                        target_eid, tx, ty = peid, px, py
+                        target_eid, tx, ty, tz = peid, px, py, pz
             else:
-                tx, ty = target_enemy['x'], target_enemy['y']
+                tx, ty, tz = target_enemy['x'], target_enemy['y'], target_enemy.get('z', 0.0)
 
             # --- alert nearby sleeping enemies ----------------------------
             if target_eid is not None or target_enemy is not None:
@@ -960,7 +961,8 @@ class GameWorld:
             db = ENEMY_DB[etype]
             if db.get('melee') and tx is not None:
                 dst = math.hypot(tx - ex, ty - ey)
-                if dst < MELEE_RANGE and self.tick - en['ls'] > ENEMY_MELEE_COOLDOWN * TICK_RATE / 1000:
+                z_ok = abs(en.get('z', 0.0) - tz) <= ACTOR_HEIGHT
+                if dst < MELEE_RANGE and z_ok and self.tick - en['ls'] > ENEMY_MELEE_COOLDOWN * TICK_RATE / 1000:
                     if target_enemy is not None:
                         _damage_enemy(self, target_enemy, db['dmg'])
                         self._register_enemy_attack(target_enemy, en['id'])
@@ -973,7 +975,9 @@ class GameWorld:
             if rdb and tx is not None:
                 dst = math.hypot(tx - ex, ty - ey)
                 if dst < ENEMY_DETECT_RANGE and self.tick - en['ls'] > rdb['cd'] * TICK_RATE / 1000:
-                    if self.has_los_px(ex, ey, tx, ty):
+                    if self.has_los_px(ex, ey, tx, ty,
+                                       en.get('z', 0.0) + EYE_HEIGHT,
+                                       tz + EYE_HEIGHT):
                         self._fire_enemy_proj(en, rdb, tx, ty)
                         en['ls'] = self.tick
 
@@ -995,6 +999,7 @@ class GameWorld:
             self.bullets.append({
                 'x': en['x'] + math.cos(angle) * 20,
                 'y': en['y'] + math.sin(angle) * 20,
+                'z': en.get('z', 0.0) + EYE_HEIGHT,
                 'vx': math.cos(angle) * spd,
                 'vy': math.sin(angle) * spd,
                 'dmg': rdb['dmg'],
@@ -1010,11 +1015,12 @@ class GameWorld:
     def _update_bullets(self) -> None:
         alive = []
         for b in self.bullets:
+            bz = b.get('z')
             if not b.get('spawn_checked'):
                 b['spawn_checked'] = True
                 if b['dist'] > b.get('max_dist', 1200):
                     continue
-                if self.is_wall_px(b['x'], b['y']):
+                if self.is_wall_px(b['x'], b['y'], bz):
                     continue
                 hit = (self._resolve_player_ball(b) if b.get('from_player')
                        else self._resolve_enemy_ball(b))
@@ -1035,7 +1041,7 @@ class GameWorld:
                 if b['dist'] > b.get('max_dist', 1200):
                     stopped = True
                     break
-                if self.is_wall_px(b['x'], b['y']):
+                if self.is_wall_px(b['x'], b['y'], bz):
                     stopped = True
                     break
                 hit = (self._resolve_player_ball(b) if b.get('from_player')
@@ -1060,10 +1066,13 @@ class GameWorld:
 
     def _resolve_enemy_ball(self, b: dict) -> bool:
         """Enemy projectile -> player or (infighting) another enemy hit."""
+        bz = b.get('z')
         for _pid, eid in self.players.items():
             pos = self.entities.get_component(eid, Position)
             hp = self.entities.get_component(eid, Health)
             if pos and hp and hp.value > 0:
+                if bz is not None and not (pos.z <= bz <= pos.z + ACTOR_HEIGHT):
+                    continue
                 if math.hypot(pos.x - b['x'], pos.y - b['y']) < PLAYER_RADIUS:
                     self.damage_player(eid, b['dmg'])
                     return True
@@ -1071,6 +1080,10 @@ class GameWorld:
         for e in self.enemies:
             if not e['a'] or e['hp'] <= 0 or e['id'] == src:
                 continue
+            if bz is not None:
+                ez = e.get('z', 0.0)
+                if not (ez <= bz <= ez + ACTOR_HEIGHT):
+                    continue
             if math.hypot(e['x'] - b['x'], e['y'] - b['y']) < ENEMY_RADIUS + 4:
                 _damage_enemy(self, e, b['dmg'])
                 self._register_enemy_attack(e, src)
@@ -1093,9 +1106,14 @@ class GameWorld:
     def _resolve_player_ball(self, b: dict) -> bool:
         """Player projectile -> enemy or (PvP) other player hit."""
         src = b.get('src')
+        bz = b.get('z')
         for e in self.enemies:
             if not e['a'] or e['hp'] <= 0:
                 continue
+            if bz is not None:
+                ez = e.get('z', 0.0)
+                if not (ez <= bz <= ez + ACTOR_HEIGHT):
+                    continue
             if math.hypot(e['x'] - b['x'], e['y'] - b['y']) < ENEMY_RADIUS + 4:
                 _damage_enemy(self, e, b['dmg'], src)
                 self.note_shot_hit(src)
@@ -1106,6 +1124,8 @@ class GameWorld:
             pos = self.entities.get_component(eid, Position)
             hp = self.entities.get_component(eid, Health)
             if pos and hp and hp.value > 0:
+                if bz is not None and not (pos.z <= bz <= pos.z + ACTOR_HEIGHT):
+                    continue
                 if math.hypot(pos.x - b['x'], pos.y - b['y']) < PLAYER_RADIUS:
                     self.damage_player(eid, b['dmg'], source_eid=src)
                     self.note_shot_hit(src)
@@ -1623,7 +1643,7 @@ class GameWorld:
     def get_enemy_states(self) -> list[dict]:
         return [
             {
-                'id': e['id'], 'x': e['x'], 'y': e['y'],
+                'id': e['id'], 'x': e['x'], 'y': e['y'], 'z': e.get('z', 0.0),
                 'angle': e['pa'], 't': e['t'],
                 'hp': e['hp'], 'state': 0 if e['a'] else 1,
                 'd_flash': e.get('d_flash', 0),
@@ -1633,7 +1653,8 @@ class GameWorld:
 
     def get_bullet_states(self) -> list[dict]:
         return [
-            {'x': b['x'], 'y': b['y'], 'col': b['col'], 'dmg': b['dmg'],
+            {'x': b['x'], 'y': b['y'], 'z': b.get('z', 0.0),
+             'col': b['col'], 'dmg': b['dmg'],
              'from_player': b.get('from_player', False)}
             for b in self.bullets
         ]

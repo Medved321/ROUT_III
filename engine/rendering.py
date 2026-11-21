@@ -1233,7 +1233,8 @@ def render(vh=None, vy=None):
                 else:
                     world_h = 64
                 proj = sector_render.project_object(
-                    s_obj['x'], s_obj['y'], world_h, _RH, _RY)
+                    s_obj['x'], s_obj['y'], world_h, _RH, _RY,
+                    floor_z=s_obj.get('z', 0.0))
                 if proj is None:
                     continue
                 sx, sh, spr_flr, perp = proj
@@ -1256,19 +1257,17 @@ def render(vh=None, vy=None):
             if 't' in s_obj and 'id' in s_obj:
                 spr_flr -= int(sh * ITEM_FLOAT_HEIGHT)
             idx = depth_col(z_b, sx, const.W)
-            # A floating slab between the camera and the sprite paints over it
-            # in the frame, but the column z-buffer only knows walls: ask the
-            # plate's own intervals (change ``floating-sector-platforms``,
-            # task 4.5).  Every column covered -> drop the sprite; one
-            # uncovered column -> draw it whole (no per-pixel clipping).
+            # Floating-slab occlusion: per-column/scanline clip.
+            vis = 'visible'
             if gs.platform_occluders:
                 from engine import platform_render
-
-                if platform_render.sprite_occluded(
-                        gs.platform_occluders, sx, sh // 2,
-                        spr_flr - sh, spr_flr, perp, const.W):
+                vis = platform_render.sprite_visibility(
+                    gs.platform_occluders, sx, sh // 2,
+                    spr_flr - sh, spr_flr, occ, const.W)
+                if vis == 'hidden':
                     continue
-            if idx >= 0 and z_b[idx] > occ:
+
+            def _draw_obj():
                 if s_obj.get('type') == 'barrel':
                     r = int(sh * 0.4)
                     brl_col = (160, 40, 20)
@@ -1403,6 +1402,19 @@ def render(vh=None, vy=None):
                         br = max(int(sh / 24), 4)
                         pygame.draw.circle(gs.screen, bcol, (sx, spr_flr), br)
 
+            if idx >= 0 and z_b[idx] > occ:
+                if vis == 'partial':
+                    bx = int(sx - sh)
+                    by = int(spr_flr - sh * 1.6)
+                    bw = int(sh * 2)
+                    bh = int(sh * 2.0)
+                    from engine import platform_render
+                    platform_render.draw_sprite_clipped(
+                        gs.screen, gs.platform_occluders,
+                        (bx, by, bw, bh), occ, _draw_obj, const.W)
+                else:
+                    _draw_obj()
+
         # Sector mode exit marker
         if gs.sector_mode and gs.exit_pos:
             ex, ey = gs.exit_pos
@@ -1463,6 +1475,14 @@ def render(vh=None, vy=None):
                 bot_flr = int(bot_flr)
                 idx2 = depth_col(z_b, sx2, const.W)
                 if idx2 >= 0 and z_b[idx2] > occ2:
+                    vis_b = 'visible'
+                    if gs.platform_occluders:
+                        from engine import platform_render
+                        vis_b = platform_render.sprite_visibility(
+                            gs.platform_occluders, sx2, sh2 // 2,
+                            bot_flr - sh2, bot_flr, occ2, const.W)
+                        if vis_b == 'hidden':
+                            continue
                     pcol = bot.get('col', (200, 40, 40))
                     if bot.get('d_flash', 0) > 0:
                         pcol = (255, 255, 255)
@@ -1485,13 +1505,26 @@ def render(vh=None, vy=None):
                         surf = pygame.transform.flip(surf, True, False)
                     sr = surf.get_width() // 2
                     blit_y = max(0, bot_flr - sr)
-                    gs.screen.blit(surf, (sx2 - sr, blit_y))
-                    # HP bar (max 200)
-                    bw = sh2 // 4
-                    pygame.draw.rect(gs.screen, (60, 0, 0), (sx2 - bw, bot_flr + sr + 4, bw * 2, 4))
-                    hp_w = int(bw * 2 * bot['hp'] / 200)
-                    hp_col = (50, 200, 50) if bot['hp'] > 100 else (200, 200, 50) if bot['hp'] > 50 else (200, 50, 50)
-                    pygame.draw.rect(gs.screen, hp_col, (sx2 - bw, bot_flr + sr + 4, hp_w, 4))
+
+                    def _draw_bot():
+                        gs.screen.blit(surf, (sx2 - sr, blit_y))
+                        # HP bar (max 200)
+                        bw = sh2 // 4
+                        pygame.draw.rect(gs.screen, (60, 0, 0), (sx2 - bw, bot_flr + sr + 4, bw * 2, 4))
+                        hp_w = int(bw * 2 * bot['hp'] / 200)
+                        hp_col = (50, 200, 50) if bot['hp'] > 100 else (200, 200, 50) if bot['hp'] > 50 else (200, 50, 50)
+                        pygame.draw.rect(gs.screen, hp_col, (sx2 - bw, bot_flr + sr + 4, hp_w, 4))
+
+                    if vis_b == 'partial':
+                        bx = int(sx2 - sr - 2)
+                        by = int(blit_y)
+                        from engine import platform_render
+                        platform_render.draw_sprite_clipped(
+                            gs.screen, gs.platform_occluders,
+                            (bx, by, int(sr * 2 + 4), int(bot_flr + sr + 10 - blit_y)),
+                            occ2, _draw_bot, const.W)
+                    else:
+                        _draw_bot()
 
     # Other players (co-op)
     for pl in gs.players:
@@ -1521,83 +1554,73 @@ def render(vh=None, vy=None):
             # below is derived from these -- so snap once, here.
             sh2 = int(min(sh2, _RH * 2))
             plr_flr = int(plr_flr)
+            vis2 = 'visible'
             if gs.platform_occluders:
                 from engine import platform_render
-
-                if platform_render.sprite_occluded(
-                        gs.platform_occluders, sx2, sh2 // 2,
-                        plr_flr - sh2, plr_flr, occ2, const.W):
+                vis2 = platform_render.sprite_visibility(
+                    gs.platform_occluders, sx2, sh2 // 2,
+                    plr_flr - sh2, plr_flr, occ2, const.W)
+                if vis2 == 'hidden':
                     continue
             idx2 = depth_col(z_b, sx2, const.W)
             if idx2 >= 0 and z_b[idx2] > occ2:
-                skin = (230, 190, 150)
-                shirt = pl.get('col', (50, 130, 200))
-                # state 3 = dashing: lighten the shirt so the burst of speed is
-                # readable to other players (the world-state player record is
-                # unchanged in size, this only paints the value it already had).
-                if pl.get('state') == 3:
-                    shirt = _brighter(shirt)
-                pants = (70, 70, 85)
-                boots = (55, 45, 35)
-                br2 = sh2 // 4
-                body_h = sh2 // 2
-                leg_h = sh2 // 5
-                head_y = plr_flr - body_h - leg_h - br2
+                def _draw_pl():
+                    skin = (230, 190, 150)
+                    shirt = pl.get('col', (50, 130, 200))
+                    # state 3 = dashing: lighten the shirt so the burst of speed is
+                    # readable to other players (the world-state player record is
+                    # unchanged in size, this only paints the value it already had).
+                    if pl.get('state') == 3:
+                        shirt = _brighter(shirt)
+                    pants = (70, 70, 85)
+                    boots = (55, 45, 35)
+                    br2 = sh2 // 4
+                    body_h = sh2 // 2
+                    leg_h = sh2 // 5
+                    head_y = plr_flr - body_h - leg_h - br2
 
-                # Head
-                pygame.draw.circle(gs.screen, skin, (sx2, head_y + br2), br2)
-                # Eyes
-                eye_off = br2 // 3
-                pygame.draw.circle(gs.screen, (40, 40, 40), (sx2 - eye_off, head_y + br2 - eye_off), max(1, br2 // 5))
-                pygame.draw.circle(gs.screen, (40, 40, 40), (sx2 + eye_off, head_y + br2 - eye_off), max(1, br2 // 5))
+                    # Head
+                    pygame.draw.circle(gs.screen, skin, (sx2, head_y + br2), br2)
+                    # Eyes
+                    eye_off = br2 // 3
+                    pygame.draw.circle(gs.screen, (40, 40, 40), (sx2 - eye_off, head_y + br2 - eye_off), max(1, br2 // 5))
+                    pygame.draw.circle(gs.screen, (40, 40, 40), (sx2 + eye_off, head_y + br2 - eye_off), max(1, br2 // 5))
 
-                # Torso
-                tw = int(br2 * 1.3)
-                torso_top = head_y + br2 * 2
-                torso_bot = torso_top + body_h
-                pygame.draw.rect(gs.screen, shirt, (sx2 - tw, torso_top, tw * 2, body_h))
+                    # Torso
+                    tw = int(br2 * 1.3)
+                    torso_top = head_y + br2 * 2
+                    torso_bot = torso_top + body_h
+                    pygame.draw.rect(gs.screen, shirt, (sx2 - tw, torso_top, tw * 2, body_h))
 
-                # Arms
-                arm_len = int(body_h * 0.7)
-                ax1 = sx2 - tw
-                ax2 = sx2 + tw
-                ay = torso_top + body_h // 3
-                pygame.draw.line(gs.screen, skin, (ax1, ay),
-                                 (ax1 - int(math.cos(oa + 0.6) * arm_len),
-                                  ay + int(math.sin(oa + 0.6) * arm_len)), max(2, br2 // 3))
-                pygame.draw.line(gs.screen, skin, (ax2, ay),
-                                 (ax2 - int(math.cos(oa - 0.6) * arm_len),
-                                  ay + int(math.sin(oa - 0.6) * arm_len)), max(2, br2 // 3))
+                    # Arms
+                    arm_len = int(body_h * 0.7)
+                    ax1 = sx2 - tw
+                    ax2 = sx2 + tw
+                    ay = torso_top + body_h // 3
+                    pygame.draw.line(gs.screen, shirt, (ax1, ay), (ax1 - tw // 2, ay + arm_len), max(2, tw // 3))
+                    pygame.draw.line(gs.screen, shirt, (ax2, ay), (ax2 + tw // 2, ay + arm_len), max(2, tw // 3))
+                    # Hands
+                    pygame.draw.circle(gs.screen, skin, (ax1 - tw // 2, ay + arm_len), max(2, tw // 3))
+                    pygame.draw.circle(gs.screen, skin, (ax2 + tw // 2, ay + arm_len), max(2, tw // 3))
 
-                # Legs
-                lw = max(2, br2 // 2)
-                pygame.draw.line(gs.screen, pants, (sx2 - lw, torso_bot), (sx2 - lw, torso_bot + leg_h), lw)
-                pygame.draw.line(gs.screen, pants, (sx2 + lw, torso_bot), (sx2 + lw, torso_bot + leg_h), lw)
-                pygame.draw.line(gs.screen, boots, (sx2 - lw, torso_bot + leg_h), (sx2 - lw - 1, torso_bot + leg_h + 3), max(2, lw))
-                pygame.draw.line(gs.screen, boots, (sx2 + lw, torso_bot + leg_h), (sx2 + lw + 1, torso_bot + leg_h + 3), max(2, lw))
+                    # Legs
+                    leg_w = tw * 2 // 3
+                    pygame.draw.rect(gs.screen, pants, (sx2 - tw, torso_bot, leg_w, leg_h))
+                    pygame.draw.rect(gs.screen, pants, (sx2 + tw - leg_w, torso_bot, leg_w, leg_h))
+                    # Boots
+                    boot_h = leg_h // 3
+                    pygame.draw.rect(gs.screen, boots, (sx2 - tw, torso_bot + leg_h - boot_h, leg_w, boot_h))
+                    pygame.draw.rect(gs.screen, boots, (sx2 + tw - leg_w, torso_bot + leg_h - boot_h, leg_w, boot_h))
 
-                # Weapon
-                wpn_idx = pl.get('wpn', 1)
-                if 0 <= wpn_idx < len(WPN):
-                    wcol = WPN[wpn_idx]['c']
+                if vis2 == 'partial':
+                    bx = int(sx2 - sh2)
+                    by = int(plr_flr - sh2 * 1.5)
+                    from engine import platform_render
+                    platform_render.draw_sprite_clipped(
+                        gs.screen, gs.platform_occluders,
+                        (bx, by, int(sh2 * 2), int(sh2 * 1.8)), occ2, _draw_pl, const.W)
                 else:
-                    wcol = (180, 180, 100)
-                whb = max(2, br2 // 3)
-                wlen = int(br2 * 1.8)
-                wdx = int(math.cos(oa) * wlen)
-                wdy = int(math.sin(oa) * wlen)
-                wx2 = sx2 - tw + wdx
-                wy2 = ay + wdy
-                pygame.draw.line(gs.screen, wcol, (sx2 - tw, ay), (wx2, wy2), whb + 1)
-
-                # Name tag
-                oname = pl.get('name', '')
-                if oname:
-                    nm_surf = _cached_text(gs.sm_font, oname, (255, 255, 255))
-                    nm_x = sx2 - nm_surf.get_width() // 2
-                    nm_y = head_y - nm_surf.get_height() - 2
-                    if nm_y > _RY - 10:
-                        gs.screen.blit(nm_surf, (nm_x, nm_y))
+                    _draw_pl()
 
     # Floor glow when standing on F/E/L tiles. The band is a layout unit: as a
     # literal 40px it was 8.3% of a 480px window and 1.9% of a 2160px one, so

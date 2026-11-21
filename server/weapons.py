@@ -13,6 +13,7 @@ from typing import NamedTuple
 from shared.combat import wpn_cooldown_ticks
 from shared.components import (Position, Rotation, Health, Player,
                              WeaponComponent, Powerup)
+from shared.sector_map import ACTOR_HEIGHT, EYE_HEIGHT
 from server.game_data import (
     WPN, MELEE_RANGE, PLAYER_MELEE_DMG, MELEE_ANGLE_THRESHOLD,
     PLAYER_RADIUS, ENEMY_RADIUS,
@@ -92,18 +93,10 @@ def _ray_candidates(grid: dict, cell: float, live: int, x: float, y: float,
     return [en for bucket in grid.values() for en in bucket]
 
 
-def _ray_wall_dist(world, x: float, y: float, angle: float, dist: float) -> float:
-    """Distance along a ray until it hits a wall, capped by ``dist`` (px).
-
-    Steps from the muzzle with a step much smaller than the entity radius
-    (4 px) and includes points closer than 8 px from the muzzle, so a wall
-    right in front of the barrel blocks the shot.  ``cos``/``sin`` of the
-    ray angle are hoisted out of the step loop: they are loop-invariant, and
-    a 900 px ray took 225 x 2 trig calls per pellet for the same values.
-    """
+def _ray_wall_dist(world, x: float, y: float, angle: float, dist: float,
+                   z: float | None = None) -> float:
+    """Distance along a ray until it hits a wall/slab volume, capped by dist."""
     step = 4.0
-    nx = x
-    ny = y
     travelled = 0.0
     ca = math.cos(angle)
     sa = math.sin(angle)
@@ -111,7 +104,7 @@ def _ray_wall_dist(world, x: float, y: float, angle: float, dist: float) -> floa
         travelled += step
         nx = x + ca * travelled
         ny = y + sa * travelled
-        if world.is_wall_px(nx, ny):
+        if world.is_wall_px(nx, ny, z):
             return travelled
     return dist
 
@@ -119,20 +112,20 @@ def _ray_wall_dist(world, x: float, y: float, angle: float, dist: float) -> floa
 def _ray_circle_hit(
     x: float, y: float, angle: float,
     cx: float, cy: float, r: float, max_dist: float,
+    ray_z: float | None = None, target_z: float = 0.0,
+    target_h: float = ACTOR_HEIGHT,
 ) -> float | None:
-    """Nearest positive distance along the ray entering a circle, or None.
-
-    ``r`` is the target radius (ENEMY_RADIUS / PLAYER_RADIUS).  Handles
-    point-blank shots (origin on/inside the circle -> t=0) and tangential
-    hits; a target behind the muzzle or farther than ``max_dist`` is a miss.
-    """
+    """Nearest positive distance along ray entering a vertical cylinder."""
+    if ray_z is not None and not (target_z <= ray_z <= target_z + target_h):
+        return None
     dx = cx - x
     dy = cy - y
     dist2 = dx * dx + dy * dy
     proj = dx * math.cos(angle) + dy * math.sin(angle)
     if proj < 0.0:
-        # Behind the muzzle: only a hit when the circle already overlaps it.
-        return 0.0 if dist2 <= r * r else None
+        if dist2 <= r * r:
+            return 0.0
+        return None
     lateral2 = dist2 - proj * proj
     if lateral2 > r * r:
         return None
@@ -178,7 +171,8 @@ def _damage_player(world, target_eid: int, dmg: int,
 
 
 def _hitscan_players(world, shooter_eid: int, x: float, y: float,
-                     angle: float, dmg: int, dist: float) -> bool:
+                     angle: float, dmg: int, dist: float,
+                     ray_z: float | None = None) -> bool:
     """PvP only: resolve a hitscan ray against other players (ray-circle)."""
     best_t: float | None = None
     best_eid: int | None = None
@@ -189,7 +183,8 @@ def _hitscan_players(world, shooter_eid: int, x: float, y: float,
         hp: Health = comps[Health]
         if hp.value <= 0:
             continue
-        t = _ray_circle_hit(x, y, angle, pos.x, pos.y, PLAYER_RADIUS, dist)
+        t = _ray_circle_hit(x, y, angle, pos.x, pos.y, PLAYER_RADIUS, dist,
+                            ray_z=ray_z, target_z=pos.z, target_h=ACTOR_HEIGHT)
         if t is None:
             continue
         if best_t is None or t < best_t:
@@ -277,6 +272,7 @@ def handle_shoot(world, entity_id: int) -> FireResult:
         world.bullets.append({
             'x': x,
             'y': y,
+            'z': pos.z + EYE_HEIGHT,
             'vx': math.cos(base_angle) * spd,
             'vy': math.sin(base_angle) * spd,
             'dmg': dmg,
@@ -302,31 +298,34 @@ def handle_shoot(world, entity_id: int) -> FireResult:
     grid = world._enemy_grid(world.enemies, _SHOT_GRID_CELL)
     live = sum(len(b) for b in grid.values())
 
+    ray_z = pos.z + EYE_HEIGHT
     world.note_shot_fired(entity_id)
     any_hit = False
     for _ in range(pellets):
         angle = base_angle + (random.uniform(-cone, cone) if cone else 0.0)
         ca = math.cos(angle)
         sa = math.sin(angle)
-        # Wall distance along the same ray (4 px steps from the muzzle, incl.
-        # points closer than 8 px). The nearest of "wall" and "entity" wins.
-        end_dist = _ray_wall_dist(world, x, y, angle, rng)
+        # Wall/slab distance along the same ray.
+        end_dist = _ray_wall_dist(world, x, y, angle, rng, z=ray_z)
 
         # PvP players first
         if world.mode == 'pvp':
-            if _hitscan_players(world, entity_id, x, y, angle, dmg, end_dist):
+            if _hitscan_players(world, entity_id, x, y, angle, dmg, end_dist,
+                                ray_z=ray_z):
                 any_hit = True
                 continue
 
-        # Enemies: nearest positive ray-circle intersection, with the wall as
-        # an occluder (entity behind the wall is not hit; wall wins ties).
+        # Enemies: nearest positive ray-circle intersection, with wall/slab as
+        # an occluder.
         best = None
         best_t = end_dist
         for e in _ray_candidates(grid, _SHOT_GRID_CELL, live, x, y, ca, sa,
                                  end_dist):
             if not e['a'] or e['hp'] <= 0:
                 continue
-            t = _ray_circle_hit(x, y, angle, e['x'], e['y'], ENEMY_RADIUS, rng)
+            t = _ray_circle_hit(x, y, angle, e['x'], e['y'], ENEMY_RADIUS, rng,
+                                ray_z=ray_z, target_z=e.get('z', 0.0),
+                                target_h=ACTOR_HEIGHT)
             if t is None or t >= best_t:
                 continue
             best = e
@@ -356,6 +355,8 @@ def _fire_melee(world, entity_id: int, pos: Position, rot: Rotation,
     best_d = MELEE_RANGE
     for e in world.enemies:
         if not e['a'] or e['hp'] <= 0:
+            continue
+        if abs(e.get('z', 0.0) - pos.z) > ACTOR_HEIGHT:
             continue
         d = math.hypot(e['x'] - x, e['y'] - y)
         if d <= best_d:

@@ -210,14 +210,19 @@ class SectorScene:
         return -1
 
     def _line_borders_slab(self, li: int) -> bool:
-        """True when linedef ``li`` borders a floating slab (task 4.1)."""
+        """True when linedef ``li`` separates a floating slab from non-floating.
+
+        Floating-floating borders are normal slab seams and are not skipped.
+        One-sided slab borders count as slab borders.
+        """
         if not self.has_floating:
             return False
         n = len(self.floating)
-        for sec in (self.front_sec[li], self.back_sec[li]):
-            if 0 <= sec < n and self.floating[sec]:
-                return True
-        return False
+        f = self.front_sec[li]
+        b = self.back_sec[li]
+        f_float = 0 <= f < n and self.floating[f]
+        b_float = 0 <= b < n and self.floating[b]
+        return f_float != b_float
 
     def slab_borders(self, sid: int) -> list:
         """Boundary quads of one slab.
