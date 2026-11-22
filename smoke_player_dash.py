@@ -39,9 +39,10 @@ from smoke_sector_server import _strip_map
 def test_flags_roundtrip():
     # 8: the player record also carries the fire decision (fire_seq/fire_ready);
     # 9: armor/powerup/items; 10: key mask + use_reason and the doors block;
-    # 11: player_id is uint16 in JOIN_ACCEPT and LOBBY_STATE.
+    # 11: player_id is uint16 in JOIN_ACCEPT and LOBBY_STATE;
+    # 16: HELLO_ACK carries the negotiated tick rate.
     # PLAYER_INPUT itself is unchanged, still flags.
-    assert PROTOCOL_VERSION == 12, PROTOCOL_VERSION
+    assert PROTOCOL_VERSION == 16, PROTOCOL_VERSION
     assert INPUT_FLAG_DASH == 0x01, INPUT_FLAG_DASH
     assert INPUT_FLAG_USE == 0x02, INPUT_FLAG_USE
 

@@ -306,9 +306,12 @@ async def section_state() -> None:
         creator.running = True
         row = _open_rows(lb)["both"]
         await _pump(creator, _click(lb.map_btn), _click(row), quit_event)
-        create = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_p, unicode="p")
+        # The visible button, not just the P shortcut, must reach CREATE_PARTY.
+        # A server-side exception here used to be swallowed as a malformed
+        # datagram, leaving the lobby stuck with no error shown to the player.
         creator.running = True
-        await _pump(creator, create, wait_game=True)
+        await _pump(creator, _click(lb.create_btn), wait_game=True)
+        assert server.lobby.parties, "create button never reached the server"
         assert creator.network.map_format == MAP_FORMAT_SECTOR
         assert creator.network.map_data == chosen
 

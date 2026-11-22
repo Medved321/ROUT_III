@@ -144,8 +144,8 @@ async def run():
 
 
 def _vertical_protocol():
-    """Task 3.1: the player record carries the support height at its tail."""
-    assert PROTOCOL_VERSION == 14, PROTOCOL_VERSION
+    """The player record carries the support height; HELLO_ACK carries tick rate."""
+    assert PROTOCOL_VERSION == 16, PROTOCOL_VERSION
     assert struct.calcsize("!HfffBBBBBBBBIBBBBBBBHHIIHHHHh") == 55
     for z in (-96, 0, 88):
         p = {"id": 1, "x": 1.0, "y": 2.0, "angle": 0.5, "health": 100,
@@ -228,7 +228,8 @@ def _floating_platform_world():
     pos = spawn.entities.get_component(eid, Position)
     assert pos.z == 0, f"spawned on the slab top: {pos.z}"
 
-    # Enemies never take the slab top as support (allow_platforms=False).
+    # Enemies use the same STEP_HEIGHT-limited support rule as players: a low
+    # slab is climbable, a slab whose top is out of reach is not.
     enemies = GameWorld(mode='pve', game_map=_slab_map(16, 8))
     enemies.add_player(1, "Bait")
     enemies._add_enemy('soldier', 512.0, 256.0, 0.0)
@@ -237,7 +238,17 @@ def _floating_platform_world():
     en['pa'] = 0.0
     for _ in range(20):
         enemies.update()
-    assert en['z'] == 0, f"enemy climbed onto the slab: {en['z']}"
+    assert en['z'] == 16, f"enemy did not step onto a reachable slab: {en['z']}"
+
+    high = GameWorld(mode='pve', game_map=_slab_map(88, 72))
+    high.add_player(1, "Bait")
+    high._add_enemy('soldier', 512.0, 256.0, 0.0)
+    hen = high.enemies[-1]
+    hen['alert'] = True
+    hen['pa'] = 0.0
+    for _ in range(20):
+        high.update()
+    assert hen['z'] == 0, f"enemy climbed onto an unreachable slab: {hen['z']}"
     print("  floating support OK (under/climb/headroom/spawn/enemy)")
 
 

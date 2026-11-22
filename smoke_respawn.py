@@ -9,6 +9,8 @@ respawn, every death path -- melee, enemy fireball, friendly fire, hitscan -- is
 covered by the one death routine instead of four hand-written copies, and nothing
 but an explicit respawn request brings a player back.
 Server-side deterministic sim."""
+from types import SimpleNamespace
+
 import server.weapons as weapons
 from server.game_world import GameWorld
 from server.server import GameServer
@@ -274,23 +276,25 @@ def test_all_death_paths_funnel_into_damage_player():
 def test_live_input_still_fires_but_dead_input_is_ignored():
     """PLAYER_INPUT runs at 25 Hz against a 20 Hz tick and must not resurrect.
 
-    Calls the real ``_apply_input`` (it touches nothing on ``self``, so it can be
-    driven unbound): a live player's dash still publishes state 3, a dead player's
-    input changes nothing, and only a respawn clears the death state.
+    Calls the real ``_apply_input`` with a minimal server stand-in: it now reads
+    ``self.tick_interval`` to convert movement speed, so ``None`` no longer works.
+    A live player's dash still publishes state 3, a dead player's input changes
+    nothing, and only a respawn clears the death state.
     """
     w = GameWorld(mode='pve')
     eid = w.add_player(1, 'P')
     dash = w.entities.get_component(eid, Dash)
     dash.ticks = 5
+    srv = SimpleNamespace(tick_interval=w.tick_interval)
 
-    GameServer._apply_input(None, w, eid, None, 1, 0, 0.0, False,
+    GameServer._apply_input(srv, w, eid, None, 1, 0, 0.0, False,
                             flags=INPUT_FLAG_DASH)
     pl = w.entities.get_component(eid, Player)
     assert pl.state == 3, "a live player must still publish the dash"
 
     w.damage_player(eid, 1000)
     assert pl.state == 1
-    GameServer._apply_input(None, w, eid, None, 1, 0, 0.0, False,
+    GameServer._apply_input(srv, w, eid, None, 1, 0, 0.0, False,
                             flags=INPUT_FLAG_DASH)
     assert pl.state == 1, "input resurrected a dead player"
     w.respawn_player(1)

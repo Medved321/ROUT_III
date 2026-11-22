@@ -96,7 +96,7 @@ MUTATIONS = [
     (
         "a player's death does not reset the items",
         "server/game_world.py",
-        "        self._reset_doors()\n        self._reset_items()",
+        "            self._reset_doors()\n            self._reset_items()",
         "        self._reset_doors()  # MUTATED: items never come back",
     ),
     (

@@ -18,18 +18,20 @@ from shared.components import (
 )
 from shared.map_data import GameMap, TILE
 from shared.sector_map import SectorMap, KEY_BITS, EYE_HEIGHT, ACTOR_HEIGHT
-from shared.combat import USE_REASON_OK, USE_REASON_CODES
+from shared.combat import (
+    DEFAULT_TICK_RATE, USE_REASON_OK, USE_REASON_CODES,
+    fps60_per_tick, ms_to_ticks, tick_interval, validate_tick_rate,
+)
 from server.game_data import (
     PLAYER_RADIUS, PLAYER_MAX_HP, ENEMY_DB, ENEMY_RADIUS,
     ENEMY_DETECT_RANGE, ENEMY_ALERT_AOE, ENEMY_MELEE_COOLDOWN,
-    MELEE_RANGE, RANGED_DB, SPAWN_POOL, CORPSE_LIFETIME,
-    EXIT_RADIUS, PVP_MATCH_TICKS,
-    TICK_RATE, TICK_INTERVAL, FPS_60, MAX_PLAYER_PROJ, MAX_ENEMY_PROJ,
-    IMPACT_TTL, MAX_IMPACTS,
-    BALL_SUB_STEP, INFIGHT_TICKS, MAX_MOVE_STEP_PX,
-    ITEM_DB, ITEM_PICKUP_DIST,
-    ARMOR_MAX, AMMO_KEYS, AMMO_MAX, WPN,
-    DOOR_OPEN_TICKS, DOOR_HOLD_TICKS, DOOR_CLOSE_TICKS, DOOR_USE_DIST,
+    MELEE_RANGE, SPAWN_POOL, EXIT_RADIUS,
+    MAX_PLAYER_PROJ, MAX_ENEMY_PROJ, MAX_IMPACTS,
+    BALL_SUB_STEP, ITEM_DB, ITEM_PICKUP_DIST,
+    ARMOR_MAX, AMMO_KEYS, AMMO_MAX, WPN, DOOR_USE_DIST,
+    corpse_lifetime, dash_cooldown_ticks, dash_ticks, door_close_ticks,
+    door_hold_ticks, door_open_ticks, impact_ttl, infight_ticks,
+    item_spec, max_move_step_px, pvp_match_ticks, ranged_db,
 )
 from server.weapons import _damage_enemy
 
@@ -79,7 +81,27 @@ def _turn_toward(current: float, target: float, max_step: float) -> float:
 
 class GameWorld:
     def __init__(self, mode: str = 'pve',
-                 game_map: GameMap | SectorMap | None = None):
+                 game_map: GameMap | SectorMap | None = None,
+                 tick_rate: int = DEFAULT_TICK_RATE):
+        # One authoritative rate per world. Every tick-denominated duration and
+        # px-per-tick speed is derived from it so changing --fps preserves real
+        # time instead of silently shortening or stretching the game.
+        self.tick_rate = validate_tick_rate(tick_rate)
+        self.tick_interval = tick_interval(self.tick_rate)
+        self.max_move_step_px = max_move_step_px(self.tick_rate)
+        self.dash_ticks = dash_ticks(self.tick_rate)
+        self.dash_cooldown_ticks = dash_cooldown_ticks(self.tick_rate)
+        self.door_open_ticks = door_open_ticks(self.tick_rate)
+        self.door_hold_ticks = door_hold_ticks(self.tick_rate)
+        self.door_close_ticks = door_close_ticks(self.tick_rate)
+        self.melee_cooldown_ticks = ms_to_ticks(
+            ENEMY_MELEE_COOLDOWN, self.tick_rate)
+        self.enemy_turn_step = ENEMY_TURN_RATE * self.tick_interval
+        self.infight_ticks = infight_ticks(self.tick_rate)
+        self.impact_ttl = impact_ttl(self.tick_rate)
+        self.corpse_lifetime = corpse_lifetime(self.tick_rate)
+        self.ranged_db = ranged_db(self.tick_rate)
+
         self.entities = EntityManager()
         self.game_map = game_map if game_map is not None else GameMap()
         self.tick: int = 0
@@ -102,7 +124,8 @@ class GameWorld:
         self.match_phase: str = 'playing'
         self.winner_id: int = 0
         # PvP clock in ticks; 0 (and unused) in PvE.
-        self.pvp_match_ticks: int = PVP_MATCH_TICKS if mode == 'pvp' else 0
+        self.pvp_match_ticks: int = (
+            pvp_match_ticks(self.tick_rate) if mode == 'pvp' else 0)
         # Exit thing position (px) or None for a map without one -- such a map
         # stays endless (spec: map without exit never finishes by exit).
         self.exit_pos: tuple[float, float] | None = self._read_exit_pos()
@@ -221,7 +244,7 @@ class GameWorld:
     def get_match_state(self) -> dict:
         """Trailing match block for WORLD_STATE (phase/winner/clock/secrets)."""
         if self.mode == 'pvp':
-            time_left = max(0, self.pvp_match_ticks) // TICK_RATE
+            time_left = max(0, self.pvp_match_ticks) // self.tick_rate
         else:
             time_left = 0
         return {
@@ -357,7 +380,8 @@ class GameWorld:
             self._add_enemy(etype, sx, sy, random.uniform(0, 2 * math.pi))
 
     def _add_enemy(self, etype: str, x: float, y: float, angle: float,
-                   tick_rate: float = TICK_RATE) -> None:
+                   tick_rate: int | None = None) -> None:
+        rate = self.tick_rate if tick_rate is None else validate_tick_rate(tick_rate)
         db = ENEMY_DB[etype]
         self._enemy_id_seq += 1
         self.enemies.append({
@@ -367,7 +391,7 @@ class GameWorld:
             't': etype,
             'hp': db['hp'],
             'max_hp': db['hp'],
-            'spd': db['spd'] * (FPS_60 / tick_rate),
+            'spd': fps60_per_tick(db['spd'], rate),
             'col': db['col'],
             'a': True,
             'dying': 0,
@@ -481,25 +505,25 @@ class GameWorld:
         for d in self.doors.values():
             phase = d['phase']
             if phase == 'opening':
-                d['progress'] += 1.0 / DOOR_OPEN_TICKS
+                d['progress'] += 1.0 / self.door_open_ticks
                 if d['progress'] >= 1.0:
                     d['progress'] = 1.0
                     d['phase'] = 'open'
-                    d['hold'] = DOOR_HOLD_TICKS
+                    d['hold'] = self.door_hold_ticks
             elif phase == 'open':
                 d['hold'] -= 1
                 if d['hold'] <= 0:
                     # Never shut on an actor standing in the gap: wait another
                     # full hold window instead (Doom door behaviour).
                     if self._door_obstructed(d['li']):
-                        d['hold'] = DOOR_HOLD_TICKS
+                        d['hold'] = self.door_hold_ticks
                     else:
                         d['phase'] = 'closing'
             elif phase == 'closing':
                 if self._door_obstructed(d['li']):
                     d['phase'] = 'opening'
                 else:
-                    d['progress'] -= 1.0 / DOOR_CLOSE_TICKS
+                    d['progress'] -= 1.0 / self.door_close_ticks
                     if d['progress'] <= 0.0:
                         d['progress'] = 0.0
                         d['phase'] = 'closed'
@@ -599,7 +623,7 @@ class GameWorld:
                 return USE_REASON_LOCKED
         # Open it, or restart the hold if it is already open/opening.
         if d['phase'] == 'open':
-            d['hold'] = DOOR_HOLD_TICKS
+            d['hold'] = self.door_hold_ticks
         elif d['phase'] != 'opening':
             d['phase'] = 'opening'
         self._use_reason[pl.player_id] = USE_REASON_OK
@@ -719,13 +743,13 @@ class GameWorld:
         """
         cur = pos.x if axis == 0 else pos.y
         a = abs(step)
-        if a <= MAX_MOVE_STEP_PX:
+        if a <= self.max_move_step_px:
             z = self._step_free(pos, cur + step, r, axis)
             if z is not None:
                 self._set_axis(pos, cur + step, axis)
                 pos.z = z
             return
-        n = int(math.ceil(a / MAX_MOVE_STEP_PX))
+        n = int(math.ceil(a / self.max_move_step_px))
         sub = step / n
         start = cur
         for i in range(1, n + 1):
@@ -955,14 +979,14 @@ class GameWorld:
             # the chase.
             if tx is not None:
                 en['pa'] = _turn_toward(en['pa'], math.atan2(ty - ey, tx - ex),
-                                        ENEMY_TURN_RATE * TICK_INTERVAL)
+                                        self.enemy_turn_step)
 
             # --- melee attack (if close) -----------------------------------
             db = ENEMY_DB[etype]
             if db.get('melee') and tx is not None:
                 dst = math.hypot(tx - ex, ty - ey)
                 z_ok = abs(en.get('z', 0.0) - tz) <= ACTOR_HEIGHT
-                if dst < MELEE_RANGE and z_ok and self.tick - en['ls'] > ENEMY_MELEE_COOLDOWN * TICK_RATE / 1000:
+                if dst < MELEE_RANGE and z_ok and self.tick - en['ls'] > self.melee_cooldown_ticks:
                     if target_enemy is not None:
                         _damage_enemy(self, target_enemy, db['dmg'])
                         self._register_enemy_attack(target_enemy, en['id'])
@@ -971,10 +995,10 @@ class GameWorld:
                     en['ls'] = self.tick
 
             # --- ranged attack (projectile) --------------------------------
-            rdb = RANGED_DB.get(etype)
+            rdb = self.ranged_db.get(etype)
             if rdb and tx is not None:
                 dst = math.hypot(tx - ex, ty - ey)
-                if dst < ENEMY_DETECT_RANGE and self.tick - en['ls'] > rdb['cd'] * TICK_RATE / 1000:
+                if dst < ENEMY_DETECT_RANGE and self.tick - en['ls'] > rdb['cd_ticks']:
                     if self.has_los_px(ex, ey, tx, ty,
                                        en.get('z', 0.0) + EYE_HEIGHT,
                                        tz + EYE_HEIGHT):
@@ -1093,7 +1117,7 @@ class GameWorld:
     def _register_enemy_attack(self, target: dict, attacker_id: int) -> None:
         """Infighting bookkeeping: retaliate against the attacker, alert the AOE."""
         target['attack_from'] = attacker_id
-        target['attack_ticks'] = INFIGHT_TICKS
+        target['attack_ticks'] = self.infight_ticks
         target['alert'] = True
         cell = float(ENEMY_ALERT_AOE)
         grid = self._enemy_grid(self.enemies, cell)
@@ -1150,7 +1174,7 @@ class GameWorld:
         self._impact_seq = (self._impact_seq + 1) & 0xFFFFFFFF
         self.impacts.append({
             'x': x, 'y': y, 'type': itype,
-            'id': self._impact_seq, 'ttl': IMPACT_TTL,
+            'id': self._impact_seq, 'ttl': self.impact_ttl,
         })
 
     def _update_impacts(self) -> None:
@@ -1174,7 +1198,7 @@ class GameWorld:
             'x': en['x'], 'y': en['y'],
             't': en['t'],
             'col': en['col'],
-            'time': CORPSE_LIFETIME,
+            'time': self.corpse_lifetime,
         })
 
     # ------------------------------------------------------------------
@@ -1299,7 +1323,7 @@ class GameWorld:
         listed per category -- a new entry in ITEM_DB cannot silently bring
         the old always-take behaviour back.
         """
-        spec = ITEM_DB.get(it['t'])
+        spec = item_spec(it['t'], self.tick_rate)
         if spec is None:
             # A type the server does not know (an editor-only entry): data
             # error, not full pockets, so it keeps leaving the floor as it

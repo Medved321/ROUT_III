@@ -23,6 +23,11 @@ async def run_live():
     ok1 = await c1.connect("Alice")
     ok2 = await c2.connect("Bob")
     assert ok1 and ok2, "connect failed"
+    # FIRE is a reliable intent. GameClient.run() normally owns these pumps;
+    # this smoke drives NetworkClient directly, so without them the intents sit
+    # in the client's outgoing buffer and no ball can ever exist on the wire.
+    r1 = asyncio.ensure_future(c1.start_reliable_loop())
+    r2 = asyncio.ensure_future(c2.start_reliable_loop())
     c1.send_create_party("A", "pve")
     await asyncio.sleep(0.2)
     c2.send_join_party(1)
@@ -65,6 +70,13 @@ async def run_live():
     assert c2_imps > 0, "no impact events reached client B"
 
     server.stop()
+    for pump in (r1, r2):
+        pump.cancel()
+    for pump in (r1, r2):
+        try:
+            await pump
+        except asyncio.CancelledError:
+            pass
     try:
         await task
     except asyncio.CancelledError:
