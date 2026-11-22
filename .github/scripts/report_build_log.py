@@ -26,6 +26,10 @@ one line that explains the failure:
   each chunk is cut well below that limit and each line is shortened.
 * **One line per workflow command.**  Newlines and percent signs are escaped.
 
+buildozer also prints its complete environment on failure.  That dump is pure
+volume, so it is collapsed: otherwise it fills the tail window and pushes the
+traceback that explains the failure out of the annotation.
+
 The same text goes to ``$GITHUB_STEP_SUMMARY`` for a human reading the run, and
 the raw file is uploaded as an artifact by the workflow.
 
@@ -44,10 +48,28 @@ from pathlib import Path
 CHUNK = 3000
 TAIL_CHUNKS = 4
 ERROR_CHUNKS = 6
-TAIL_LINES = 100
-LINE_MAX = 300
+TAIL_LINES = 150
+# Long lines used to be cut at 300 chars.  That hid the whole point of a pip or
+# configure line: the failing command and its flags sit past the first 300
+# characters, and only "[...]" was left in the annotation.
+LINE_MAX = 700
 ERROR_CONTEXT = 3
 MAX_ERRORS = 30
+
+# buildozer dumps its entire environment between the traceback and the final
+# "# Command failed" verdict.  Those lines ("#     ANDROIDNDK = '...'") carry no
+# diagnosis and used to fill three of the four tail chunks, pushing the actual
+# exception out of the annotation entirely.
+#
+# The same dump is echoed a second time by the Gradle wrapper as ``export
+# NAME='...'``; only the first form used to be collapsed, so that copy still
+# filled the tail window and pushed Gradle's own "What went wrong" block out of
+# the annotations -- the one line that names the cause.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_ENV_LINE = re.compile(
+    r"^\s*(?:#\s{2,}[A-Za-z_][A-Za-z0-9_]*\s*=\s"
+    r"|export\s+[A-Za-z_][A-Za-z0-9_]*=)"
+)
 
 # Keyword matches use whole words, so ``-Werror=implicit-function-declaration``
 # in a compiler command line is not "an interesting error": it matched every
@@ -73,8 +95,37 @@ def _short(line: str) -> str:
     return line if len(line) <= LINE_MAX else line[:LINE_MAX] + " [...]"
 
 
-def _chunks(title: str, lines: list[str], limit: int) -> list[str]:
-    """Split ``lines`` into annotation-sized workflow commands."""
+def _strip_environment(lines: list[str]) -> list[str]:
+    """Collapse buildozer's environment dump to one line.
+
+    The dump sits between the traceback that explains the failure and the final
+    ``# Command failed`` verdict, so leaving it in the tail window hides both.
+    """
+    out: list[str] = []
+    dropped = 0
+    for line in lines:
+        plain = _ANSI.sub("", line)
+        if _ENV_LINE.match(plain):
+            dropped += 1
+            continue
+        if dropped:
+            out.append(f"# (environment variables omitted: {dropped} lines)")
+            dropped = 0
+        out.append(line)
+    if dropped:
+        out.append(f"# (environment variables omitted: {dropped} lines)")
+    return out
+
+
+def _chunks(title: str, lines: list[str], limit: int,
+            keep: str = "first") -> list[str]:
+    """Split ``lines`` into annotation-sized workflow commands.
+
+    ``keep="last"`` returns the *newest* chunks instead of the oldest ones.
+    The tail of a build log is where the verdict is, and 150 buildozer
+    ``[DEBUG]`` lines are far more than four annotations hold, so keeping the
+    first chunks would publish the middle of the build and drop the exception.
+    """
     commands: list[str] = []
     buf: list[str] = []
     size = 0
@@ -86,7 +137,7 @@ def _chunks(title: str, lines: list[str], limit: int) -> list[str]:
         size += len(line) + 1
     if buf:
         commands.append(f"::error title={title}::{_escape(chr(10).join(buf))}")
-    return commands[:limit]
+    return commands[-limit:] if keep == "last" else commands[:limit]
 
 
 def _error_block(lines: list[str]) -> list[str]:
@@ -125,9 +176,15 @@ def main(argv: list[str]) -> int:
         print("::error title=buildozer log::the build produced no output")
         return 0
 
-    commands = _chunks(_TAIL_TITLE, [_short(l) for l in lines[-TAIL_LINES:]],
-                       TAIL_CHUNKS)
-    commands += _chunks(_ERROR_TITLE, _error_block(lines), ERROR_CHUNKS)
+    readable = _strip_environment(lines)
+    # The tail is the verdict: keep the *newest* chunks, or a window of long
+    # ``[DEBUG]`` lines publishes the middle of the build and loses the
+    # exception.  The keyword matches keep their earliest chunks on purpose --
+    # the root cause (a patch that no longer applies, a missing symbol) is often
+    # printed long before the traceback that unwinds to it.
+    commands = _chunks(_TAIL_TITLE, [_short(l) for l in readable[-TAIL_LINES:]],
+                       TAIL_CHUNKS, keep="last")
+    commands += _chunks(_ERROR_TITLE, _error_block(readable), ERROR_CHUNKS)
     for command in commands:
         print(command)
 
@@ -135,7 +192,7 @@ def main(argv: list[str]) -> int:
     if summary:
         with open(summary, "a", encoding="utf-8") as handle:
             handle.write("## buildozer log (tail)\n\n```\n")
-            handle.write("\n".join(lines[-TAIL_LINES:]))
+            handle.write("\n".join(readable[-TAIL_LINES:]))
             handle.write("\n```\n")
     return 0
 

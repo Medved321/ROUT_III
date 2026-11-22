@@ -337,17 +337,14 @@ def _initial_segs(sm: SectorMap) -> list:
 
 
 def _floating_lines(sm: SectorMap) -> set[int]:
-    """Linedefs that touch a floating slab (host border or slab-to-slab seam).
+    """Linedefs that border a floating slab against a non-floating sector.
 
-    The BSP is the flat world of *host* sectors.  Any slab border is not a
-    partition: splitting the plane along it would hand the area under the
-    slab to the slab's own subsector, and the host's floor — which by
-    ``_ensure_polys`` still spans the footprint — would have nothing left to
-    draw it.  A seam between two plates is the same overlay geometry: the
-    base pass must not turn it into a solid wall that owns the column in
-    ``view_buf`` and hides the far plate (change
-    ``floating-sector-overlay-clip-fix``).  The height step, when there is
-    one, is painted by ``platform_render._side_bands``.
+    The BSP is the flat world of *host* sectors.  An ordinary<->floating
+    border is not a partition: splitting the plane along it would hand the
+    area under the slab to the slab's own subsector, and the host's floor —
+    which by ``_ensure_polys`` still spans the footprint — would have nothing
+    left to draw it.  Floating-floating borders are normal borders between
+    slabs and may be partitioned/rendered.
 
     Maps without slabs get an empty set, so their tree is bit-for-bit the one
     they had before this change.
@@ -364,7 +361,9 @@ def _floating_lines(sm: SectorMap) -> set[int]:
 
     out = set()
     for li, ld in enumerate(sm.linedefs):
-        if _is_float(ld.front) or _is_float(ld.back):
+        f = _is_float(ld.front)
+        b = _is_float(ld.back)
+        if f != b:
             out.add(li)
     return out
 
