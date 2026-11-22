@@ -17,7 +17,8 @@ What is covered:
   4. project_point() puts an effect on the floor line the sprite pass uses, and
      the depth test compares perpendicular distance;
   5. the near plane clamps size without rewriting the distance;
-  6. the fonts follow the window (the client bridge no longer freezes one size).
+  6. the fonts follow the window (the client bridge no longer freezes one size);
+  7. hud_layout() gives every text band a disjoint, measured box at each preset.
 
 The measurements are of *fractions*, deliberately: comparing pixel counts
 between two window sizes is exactly the mistake this change is about.
@@ -254,6 +255,44 @@ try:
     big = gs.font.get_height()
     assert big > small * 2, f"HUD font did not scale: {small}px -> {big}px"
     print("HUD fonts follow the window OK")
+
+    # ── 6b. one measured HUD layout, shared by render and this check ────────
+    for w, h in PRESETS:
+        _scene(w, h)
+        const.W, const.H = w, h
+        V.ensure_hud_fonts()
+        gs.enemies = [0, 0, 0]          # exercise the ENE band too
+        layout = R.hud_layout(w, h, 0)
+        bar = layout["bar"]
+        text_keys = ("hp", "stat0", "stat1", "armor", "ene", "weapon",
+                     "ammo", "top", "bottom")
+        boxes = {k: layout[k] for k in text_keys
+                 if layout[k].width > 0 and layout[k].height > 0}
+        for key, rect in boxes.items():
+            assert bar.contains(rect), f"{w}x{h}: {key} {rect} escapes {bar}"
+        # The face is not text, but a label running under it is just as unreadable.
+        check_boxes = dict(boxes)
+        check_boxes["face"] = layout["face"]
+        keys = list(check_boxes)
+        for i, an in enumerate(keys):
+            for bn in keys[i + 1:]:
+                assert not check_boxes[an].colliderect(check_boxes[bn]), (
+                    f"{w}x{h}: HUD {an} {check_boxes[an]} overlaps "
+                    f"{bn} {check_boxes[bn]}")
+        # Left/centre/right columns are disjoint by construction, not by luck.
+        assert layout["hp"].right <= layout["face"].left
+        assert layout["face"].right <= layout["top"].left
+        assert layout["face"].right <= layout["armor"].left
+        assert layout["bottom"].right <= layout["armor"].left
+        assert layout["stat0"].y - layout["hp"].y >= gs.font.get_height()
+        assert layout["stat1"].y - layout["stat0"].y >= gs.sm_font.get_height()
+        assert bar.contains(layout["ammo_bar"]), (
+            f"{w}x{h}: ammo bar {layout['ammo_bar']} escapes {bar}")
+        long_name = "ОЧЕНЬ-ДЛИННОЕ-ИМЯ-ОРУЖИЯ-" * 4
+        shown = V.fit_text(long_name, gs.sm_font, layout["weapon"].width)
+        assert shown != long_name and shown.endswith(V.ELLIPSIS)
+        assert gs.sm_font.size(shown)[0] <= layout["weapon"].width
+    print("HUD text bands are disjoint OK")
 
     # ── 7. nothing is re-fit or re-allocated in a steady window ─────────────
     # The weapon blit and the font are on the per-frame path, so a resize must

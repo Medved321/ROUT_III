@@ -14,8 +14,9 @@ This module paints the plate on top of that base pass:
   textured with the ``mid`` of the slab's *own* sidedef and shaded by the
   slab's light;
 * per column: occluded by the base walls through ``view_buf`` and bounded by
-  the residual ``clip_top``/``clip_bot`` opening, exactly like a flat pushed
-  during the walk;
+  the ``clip_top``/``clip_bot`` opening **of the last portal in front of the
+  plate** (``clip_hist``), so a farther sector behind it cannot erase the
+  plate while a nearer doorway still limits it;
 * far slabs before near ones, top/underside before sides inside one slab (a
   side face overlaps the near edge of its own top).
 
@@ -32,6 +33,8 @@ pixel: a partially covered sprite is drawn whole.
 from __future__ import annotations
 
 import math
+
+import pygame
 
 from engine import constants as const
 from engine import game_state as gs
@@ -51,6 +54,25 @@ from engine.sector_render import (
 # projection divides by ``t``, and a plate the camera is standing on would
 # otherwise paint a screen-filling gradient instead of the floor under it.
 _NEAR = 0.5
+
+
+def _clip_at(col, t, clip_top, clip_bot, clip_hist, ih) -> tuple[float, float]:
+    """Opening for a surface at depth ``t`` in column ``col``.
+
+    ``clip_top``/``clip_bot`` are the frontier left by the *whole* wall walk.
+    ``clip_hist[col]`` holds ``(depth, top, bot)`` snapshots after each portal
+    tightened it, in near-to-far order.  The opening for a plate is the last
+    snapshot in front of it: portals behind the plate are ignored, but a
+    nearer doorway still clips (change ``floating-sector-overlay-clip-fix``).
+    """
+    if clip_hist is None:
+        return clip_top[col], clip_bot[col]
+    hist = clip_hist[col]
+    if hist:
+        for depth, top, bot in reversed(hist):
+            if depth <= t:
+                return top, bot
+    return 0.0, float(ih)
 
 
 def _bbox_of_loops(loops) -> tuple:
@@ -155,7 +177,7 @@ def _ray_intervals(loops, px, py, dx, dy, t_max) -> list:
 
 
 def _side_bands(scene, sid, px, py, pa, eye, F, hc, iw, ih,
-                clip_top, clip_bot, view_buf, view) -> list:
+                clip_top, clip_bot, view_buf, view, clip_hist=None) -> list:
     """Vertical side faces of one slab as ``_draw_wall_bands`` bands."""
     borders = scene.slab_borders(sid)
     if not borders:
@@ -224,10 +246,11 @@ def _side_bands(scene, sid, px, py, pa, eye, F, hc, iw, ih,
             y1 = hc + (eye - bot) * F / t
             if y1 < y0:
                 y0, y1 = y1, y0
-            if y0 < clip_top[col]:
-                y0 = clip_top[col]
-            if y1 > clip_bot[col]:
-                y1 = clip_bot[col]
+            ct, cb = _clip_at(col, t, clip_top, clip_bot, clip_hist, ih)
+            if y0 < ct:
+                y0 = ct
+            if y1 > cb:
+                y1 = cb
             if y1 <= y0:
                 continue
             bands.append((col, y0, y1, mid_tex,
@@ -238,7 +261,7 @@ def _side_bands(scene, sid, px, py, pa, eye, F, hc, iw, ih,
 
 def draw_platforms(frame, scene, px, py, pa, eye, F, hc, iw, ih,
                    iw_f, ih_f, fwidths, clip_top, clip_bot, view_buf,
-                   view, vh=None, vy=0):
+                   view, vh=None, vy=0, clip_hist=None):
     """Paint every visible floating slab into ``frame`` (tasks 4.2/4.3).
 
     Returns the per-ray-column occluder intervals for the sprite pass —
@@ -270,25 +293,26 @@ def draw_platforms(frame, scene, px, py, pa, eye, F, hc, iw, ih,
             if not ivs:
                 continue
             for (t0, t1) in ivs:
+                ct, cb = _clip_at(col, t0, clip_top, clip_bot, clip_hist, ih)
                 # Top: visible while the camera is above it.  The projected
                 # span is [far edge, near edge] because a floor recedes upward.
                 if eye > top:
                     y0 = hc + (eye - top) * F / t1
                     y1 = hc + (eye - top) * F / t0
-                    if y0 < clip_top[col]:
-                        y0 = clip_top[col]
-                    if y1 > clip_bot[col]:
-                        y1 = clip_bot[col]
+                    if y0 < ct:
+                        y0 = ct
+                    if y1 > cb:
+                        y1 = cb
                     _push_flat(spans, col, y0, y1, sid, True, ih)
                 # Underside: visible while the camera is below it; near edge
                 # is the top of the span (a ceiling recedes downward).
                 if eye < bot:
                     y0 = hc + (eye - bot) * F / t0
                     y1 = hc + (eye - bot) * F / t1
-                    if y0 < clip_top[col]:
-                        y0 = clip_top[col]
-                    if y1 > clip_bot[col]:
-                        y1 = clip_bot[col]
+                    if y0 < ct:
+                        y0 = ct
+                    if y1 > cb:
+                        y1 = cb
                     _push_flat(spans, col, y0, y1, sid, False, ih)
                 # Occluder interval: the whole plate volume in this column
                 # (four projected corners), so a sprite behind it disappears
@@ -311,7 +335,7 @@ def draw_platforms(frame, scene, px, py, pa, eye, F, hc, iw, ih,
                                      eye, F, hc, ih, ih_f, iw, iw_f,
                                      fwidths, view)
         bands = _side_bands(scene, sid, px, py, pa, eye, F, hc, iw, ih,
-                            clip_top, clip_bot, view_buf, view)
+                            clip_top, clip_bot, view_buf, view, clip_hist)
         if bands:
             _draw_wall_bands(frame, bands, scene, view, iw, ih, iw_f, ih_f,
                              fwidths)
@@ -333,43 +357,145 @@ def draw_platforms(frame, scene, px, py, pa, eye, F, hc, iw, ih,
     return occluders
 
 
-def sprite_occluded(occluders, sx: int, half_w: int, top: int, bottom: int,
-                    perp: float, screen_w: int | None = None) -> bool:
-    """True when a nearer slab covers the sprite's whole box (task 4.5).
+def _covered_span(entries, perp: float, top: int, bottom: int):
+    """Return covered y-interval inside [top, bottom], or None."""
+    best = None
+    for (t_near, y0, y1) in entries:
+        if t_near > perp:
+            continue
+        lo = y0 if y0 > top else top
+        hi = y1 if y1 < bottom else bottom
+        if hi <= lo:
+            continue
+        if best is None or (hi - lo) > (best[1] - best[0]):
+            best = (lo, hi)
+    return best
 
-    Every column the sprite occupies must hold an interval that starts in
-    front of it and spans at least its vertical extent.  The test is
-    deliberately conservative: the moment one column is uncovered the sprite
-    is drawn *whole*, because the renderer has no per-pixel clipping and a
-    half-sprite would be a worse lie than an overlapping one.
 
-    Every column really is tested, not a sample of them: a sprite blit costs
-    orders of magnitude more than this scan (a few list lookups per column),
-    and a sampled test would drop a sprite whose plate has a one-column hole —
-    the opposite of the conservative rule the box test is here to enforce.
-    """
+def visible_spans(occluders, sxc: int, top: int, bottom: int, perp: float,
+                  screen_w: int | None = None) -> list[tuple[int, int]]:
+    """Visible y-intervals inside [top, bottom] for one screen column."""
+    top = int(math.floor(top))
+    bottom = int(math.ceil(bottom))
+    if bottom <= top:
+        return []
     if not occluders:
-        return False
+        return [(top, bottom)]
+    if screen_w is None:
+        screen_w = const.W
+    col = depth_col(occluders, sxc, screen_w)
+    if col < 0:
+        return [(top, bottom)]
+    entries = occluders[col]
+    if not entries:
+        return [(top, bottom)]
+    # collect covered intervals in front of sprite
+    covered = []
+    for (t_near, y0, y1) in entries:
+        if t_near > perp:
+            continue
+        lo = y0 if y0 > top else top
+        hi = y1 if y1 < bottom else bottom
+        if hi > lo:
+            covered.append((int(math.floor(lo)), int(math.ceil(hi))))
+    if not covered:
+        return [(top, bottom)]
+    covered.sort()
+    merged = []
+    for lo, hi in covered:
+        if not merged or lo > merged[-1][1]:
+            merged.append([lo, hi])
+        elif hi > merged[-1][1]:
+            merged[-1][1] = hi
+    out = []
+    cur = top
+    for lo, hi in merged:
+        if lo > cur:
+            out.append((cur, lo))
+        if hi > cur:
+            cur = hi
+        if cur >= bottom:
+            break
+    if cur < bottom:
+        out.append((cur, bottom))
+    return out
+
+
+def sprite_visibility(occluders, sx: int, half_w: int, top: int, bottom: int,
+                      perp: float, screen_w: int | None = None) -> str:
+    """Classify sprite occlusion: 'hidden', 'visible', or 'partial'."""
+    if not occluders:
+        return 'visible'
     if screen_w is None:
         screen_w = const.W
     top = int(math.floor(top))
     bottom = int(math.ceil(bottom))
     x0 = sx - max(0, int(half_w))
     x1 = sx + max(0, int(half_w))
-    if x1 < 0 or x0 >= screen_w:
-        return False
+    if x1 < 0 or x0 >= screen_w or bottom <= top:
+        return 'visible'
     x0 = max(0, x0)
     x1 = min(screen_w - 1, x1)
+    any_hidden = False
+    any_visible = False
     for sxc in range(x0, x1 + 1):
-        col = depth_col(occluders, sxc, screen_w)
-        if col < 0:
-            return False
-        entries = occluders[col]
-        if not entries:
-            return False
-        for (t_near, y0, y1) in entries:
-            if t_near <= perp and y0 <= top and y1 >= bottom:
-                break
+        spans = visible_spans(occluders, sxc, top, bottom, perp, screen_w)
+        if not spans:
+            any_hidden = True
+        elif spans == [(top, bottom)]:
+            any_visible = True
         else:
-            return False
-    return True
+            # partially covered column counts as both
+            any_hidden = True
+            any_visible = True
+        if any_hidden and any_visible:
+            return 'partial'
+    if any_hidden:
+        return 'hidden'
+    return 'visible'
+
+
+def sprite_occluded(occluders, sx: int, half_w: int, top: int, bottom: int,
+                    perp: float, screen_w: int | None = None) -> bool:
+    """True when a nearer slab covers the sprite completely."""
+    return sprite_visibility(occluders, sx, half_w, top, bottom, perp,
+                             screen_w) == 'hidden'
+
+
+def draw_sprite_clipped(screen, occluders, rect, perp, draw_fn,
+                        screen_w: int | None = None) -> None:
+    """Draw *draw_fn* then restore pixels covered by nearer slabs.
+
+    ``rect`` is the screen-space bounding box ``(x, y, w, h)`` that contains
+    all pixels *draw_fn* may touch. The function saves that box, calls
+    *draw_fn* (which draws to ``screen``), and restores covered
+    column/scanline regions so slabs remain opaque.
+    """
+    if screen_w is None:
+        screen_w = const.W
+    x, y, w, h = rect
+    x0 = max(0, int(x))
+    y0 = max(0, int(y))
+    x1 = min(screen_w, int(x + w))
+    y1 = min(screen.get_height(), int(y + h))
+    if x1 <= x0 or y1 <= y0:
+        draw_fn()
+        return
+    save = pygame.Surface((x1 - x0, y1 - y0), screen.get_flags() & pygame.SRCALPHA and pygame.SRCALPHA or 0)
+    # copy without alpha; we restore RGB only
+    save.blit(screen, (0, 0), (x0, y0, x1 - x0, y1 - y0))
+    draw_fn()
+    for sxc in range(x0, x1):
+        spans = visible_spans(occluders, sxc, y0, y1, perp, screen_w)
+        if spans == [(y0, y1)]:
+            continue
+        if not spans:
+            screen.blit(save, (sxc, y0), (sxc - x0, 0, 1, y1 - y0))
+            continue
+        cur = y0
+        for sy0, sy1 in spans:
+            if sy0 > cur:
+                screen.blit(save, (sxc, cur), (sxc - x0, cur - y0, 1, sy0 - cur))
+            cur = sy1
+        if cur < y1:
+            screen.blit(save, (sxc, cur), (sxc - x0, cur - y0, 1, y1 - cur))

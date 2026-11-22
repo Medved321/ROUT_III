@@ -15,6 +15,7 @@ Covers the `window-size-and-tractor-controls` change:
   * mouse mode keeps its old layout (LMB fire, Space dash);
   * the settings screen scrolls to the new rows and commits/rejects a custom size.
 """
+import asyncio
 import json
 import os
 import sys
@@ -163,6 +164,63 @@ assert s2.get('window_size') == '3840\u00d72160', s2.get('window_size')
 assert s2.resolution() == (3840, 2160)
 print("window size survives a config.json roundtrip OK")
 
+# ── startup creates the window at the saved size ─────────────────
+# A saved full-screen preset must be applied by the FIRST set_mode, not by a
+# second call after a default-sized window has already appeared. The old
+# startup order (Renderer() before Settings.load()) failed this: a small window
+# flashed on every launch and some drivers kept it.
+from client.client import GameClient
+
+boot_config = os.path.join(tmpdir, 'boot_config.json')
+with open(boot_config, 'w', encoding='utf-8') as f:
+    json.dump({'window_size': '3840\u00d72160'}, f)
+old_config_path = settings_mod.CONFIG_PATH
+settings_mod.CONFIG_PATH = boot_config
+real_set_mode = pygame.display.set_mode
+mode_calls = []
+
+def recording_set_mode(size, flags=0, *args, **kwargs):
+    mode_calls.append(tuple(size))
+    return real_set_mode(size, flags, *args, **kwargs)
+
+pygame.display.set_mode = recording_set_mode
+try:
+    boot = GameClient()
+finally:
+    pygame.display.set_mode = real_set_mode
+    settings_mod.CONFIG_PATH = old_config_path
+assert mode_calls, 'GameClient never created a display'
+assert mode_calls[0] == (3840, 2160), (
+    'the first window must use the saved full-screen size', mode_calls)
+assert (1000, 700) not in mode_calls, (
+    'no default-sized window may be created at startup', mode_calls)
+assert boot.renderer.window_size == (3840, 2160), boot.renderer.window_size
+assert (const.W, const.H) == (3840, 2160), (const.W, const.H)
+boot.renderer.set_window_size((1000, 700))
+print("startup creates the window at the saved size, no small flash OK")
+
+# Closing settings with the window's X goes through QUIT, not Esc/back. The
+# chosen size must still reach config.json or the next launch is small again.
+quit_config = os.path.join(tmpdir, 'quit_config.json')
+with open(quit_config, 'w', encoding='utf-8') as f:
+    json.dump({'window_size': '1000\u00d7700'}, f)
+settings_mod.CONFIG_PATH = quit_config
+quitter = GameClient()
+quitter.running = True
+quitter.settings.set_window_size('3840\u00d72160')
+real_get = pygame.event.get
+pygame.event.get = lambda: [pygame.event.Event(pygame.QUIT)]
+try:
+    asyncio.run(quitter._settings_loop(from_pause=False))
+finally:
+    pygame.event.get = real_get
+    settings_mod.CONFIG_PATH = old_config_path
+with open(quit_config, encoding='utf-8') as f:
+    saved_quit = json.load(f)
+assert saved_quit.get('window_size') == '3840\u00d72160', saved_quit
+quitter.renderer.set_window_size((1000, 700))
+print("closing settings with X persists the chosen size OK")
+
 # ── control mode plumbing ─────────────────────────────────────────
 assert control_mode('Мышь') == CONTROL_MODE_MOUSE
 assert control_mode('Трактор') == CONTROL_MODE_TRACTOR
@@ -170,7 +228,7 @@ assert control_mode('tractor') == CONTROL_MODE_TRACTOR
 assert control_mode(1) == CONTROL_MODE_TRACTOR
 assert control_mode('garbage') == CONTROL_MODE_MOUSE
 assert is_tractor('Трактор') and not is_tractor('Мышь')
-assert '\u2190' in control_hints('Трактор') and 'Пробел' in control_hints('Трактор')
+assert 'Стрелки влево/вправо' in control_hints('Трактор') and 'Пробел' in control_hints('Трактор')
 assert 'ЛКМ' in control_hints('Мышь')
 # Third mode: the touch label must not be swallowed by the generic "known
 # label -> mouse" branch, and it must survive both a label and an index.

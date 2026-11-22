@@ -312,6 +312,7 @@ class RenderBridge:
             entry = {
                 'x': b['x'],
                 'y': b['y'],
+                'z': b.get('z', 0.0),
                 'col': b.get('col', (255, 255, 0)),
                 'from_player': bool(b.get('from_player', 0)),
             }
@@ -475,7 +476,7 @@ class RenderBridge:
         x, y = e['x'], e['y']
         ls = int(e.get('ls', 0) or 0)
         entry = {
-            'x': x, 'y': y,
+            'x': x, 'y': y, 'z': e.get('z', 0.0),
             'pa': e.get('angle', 0.0),
             'a': state == 0 and hp > 0,
             'dying': 0 if hp > 0 else 15,

@@ -11,7 +11,8 @@ from engine.constants import (SCALE, TILE, FOV, TEX_W, WPN, ENEMY_DB,
 from engine import constants as const
 from engine import game_state as gs
 from engine.framebuffer import depth_col
-from engine.viewport import ensure_hud_fonts, ui_px, ui_scale, project_point
+from engine.viewport import (ensure_hud_fonts, fit_text, project_point, ui_px,
+                             ui_scale)
 from engine.particles import draw_particles, draw_decals, draw_weather
 from engine.particles import update_particles, update_decals, update_weather
 from engine.map_utils import get_t
@@ -961,6 +962,81 @@ def draw_dash_streaks(rh=None, ry=None):
         screen.blit(r.spr, (int(cx + r.ux * d) - r.ax, ry + int(cy + r.uy * d) - r.ay))
 
 
+def hud_layout(width: int | None = None, height: int | None = None,
+               vy: int | None = None) -> dict:
+    """All HUD text bands, measured once from the active fonts.
+
+    The old HUD used literal offsets (``ui_px(14)`` for a 18px font, ``+16`` for
+    a 34px one) and let the right column, the under-face line and the key list
+    share the same pixels.  ``render`` and the layout smoke both ask here, so a
+    band cannot be measured differently from the one that is painted.
+    """
+    w = const.W if width is None else width
+    vh = const.H if height is None else height
+    y0 = (vy or 0) + vh
+    bar_h = ui_px(100, w, vh)
+    bar = pygame.Rect(0, y0 - bar_h, w, bar_h)
+    # The bar is 100 layout units tall; at the reference window that is exactly
+    # 2*big_font + 1*small_font.  A literal pad here pushed the ammo row (and its
+    # bar) below the HUD strip, so vertical pitch is the font height itself and
+    # ``gap`` stays horizontal only.
+    pad = 0
+    gap = max(1, ui_px(2, w, vh))
+    row_gap = 0
+    big_h = gs.font.get_height() if gs.font is not None else ui_px(34, w, vh)
+    sm_h = gs.sm_font.get_height() if gs.sm_font is not None else ui_px(18, w, vh)
+
+    edge = ui_px(12, w, vh)
+    left_w = ui_px(170, w, vh)
+    right_w = ui_px(200, w, vh)
+    hp = pygame.Rect(edge, bar.y + pad, left_w, big_h)
+    stat_y = hp.bottom + row_gap
+    stat0 = pygame.Rect(edge, stat_y, left_w, sm_h)
+    stat1 = pygame.Rect(edge, stat_y + sm_h + row_gap, left_w, sm_h)
+
+    # ENE shares the armour row on the right: it is a short counter, while the
+    # armour label may be wide. Splitting by measured width keeps them disjoint
+    # without shrinking either font.
+    rx = w - edge - right_w
+    ene_text = f"ENE:{len(gs.enemies)}" if gs.enemies else ""
+    ene_w = gs.sm_font.size(ene_text)[0] if ene_text and gs.sm_font is not None else 0
+    ene_w = min(ene_w, right_w // 2)
+    armor_w = right_w - ene_w - gap if ene_w else right_w
+    armor = pygame.Rect(rx, bar.y + pad, max(1, armor_w), big_h)
+    ene = (pygame.Rect(rx + armor.width + gap,
+                       armor.y + (big_h - sm_h) // 2, ene_w, sm_h)
+           if ene_w else pygame.Rect(rx + right_w, armor.y, 0, sm_h))
+    weapon = pygame.Rect(rx, armor.bottom + row_gap, right_w, sm_h)
+    ammo = pygame.Rect(rx, weapon.bottom + row_gap, right_w, big_h)
+    bar_thick = ui_px(4, w, vh)
+    ammo_bar = pygame.Rect(
+        rx, min(ammo.bottom + row_gap, bar.bottom - bar_thick),
+        ui_px(90, w, vh), bar_thick)
+
+    face_sz = ui_px(52, w, vh)
+    face_cy = bar.y + ui_px(50, w, vh)
+    face = pygame.Rect(w // 2 - face_sz // 2, face_cy - face_sz // 2,
+                       face_sz, face_sz)
+
+    # Powerup and keys sit above/right of the face; mode and damage sit below
+    # it.  Both bands stop before the right column, so neither can slide under
+    # the armour/weapon stack as the strings grow.
+    top_left = face.right + gap
+    top = pygame.Rect(top_left, bar.y + pad,
+                      max(1, rx - gap - top_left), sm_h)
+    bottom_left = hp.right + gap
+    bottom_y = min(face.bottom + gap, bar.bottom - sm_h)
+    bottom = pygame.Rect(bottom_left, bottom_y,
+                         max(1, rx - gap - bottom_left), sm_h)
+
+    return {
+        "bar": bar, "face": face, "gap": gap,
+        "hp": hp, "stat0": stat0, "stat1": stat1,
+        "armor": armor, "ene": ene, "weapon": weapon, "ammo": ammo,
+        "ammo_bar": ammo_bar, "top": top, "bottom": bottom,
+    }
+
+
 def render(vh=None, vy=None):
     global _RH, _RY
     _RH = vh if vh is not None else const.H
@@ -1233,7 +1309,8 @@ def render(vh=None, vy=None):
                 else:
                     world_h = 64
                 proj = sector_render.project_object(
-                    s_obj['x'], s_obj['y'], world_h, _RH, _RY)
+                    s_obj['x'], s_obj['y'], world_h, _RH, _RY,
+                    floor_z=s_obj.get('z', 0.0))
                 if proj is None:
                     continue
                 sx, sh, spr_flr, perp = proj
@@ -1256,19 +1333,17 @@ def render(vh=None, vy=None):
             if 't' in s_obj and 'id' in s_obj:
                 spr_flr -= int(sh * ITEM_FLOAT_HEIGHT)
             idx = depth_col(z_b, sx, const.W)
-            # A floating slab between the camera and the sprite paints over it
-            # in the frame, but the column z-buffer only knows walls: ask the
-            # plate's own intervals (change ``floating-sector-platforms``,
-            # task 4.5).  Every column covered -> drop the sprite; one
-            # uncovered column -> draw it whole (no per-pixel clipping).
+            # Floating-slab occlusion: per-column/scanline clip.
+            vis = 'visible'
             if gs.platform_occluders:
                 from engine import platform_render
-
-                if platform_render.sprite_occluded(
-                        gs.platform_occluders, sx, sh // 2,
-                        spr_flr - sh, spr_flr, perp, const.W):
+                vis = platform_render.sprite_visibility(
+                    gs.platform_occluders, sx, sh // 2,
+                    spr_flr - sh, spr_flr, occ, const.W)
+                if vis == 'hidden':
                     continue
-            if idx >= 0 and z_b[idx] > occ:
+
+            def _draw_obj():
                 if s_obj.get('type') == 'barrel':
                     r = int(sh * 0.4)
                     brl_col = (160, 40, 20)
@@ -1403,6 +1478,19 @@ def render(vh=None, vy=None):
                         br = max(int(sh / 24), 4)
                         pygame.draw.circle(gs.screen, bcol, (sx, spr_flr), br)
 
+            if idx >= 0 and z_b[idx] > occ:
+                if vis == 'partial':
+                    bx = int(sx - sh)
+                    by = int(spr_flr - sh * 1.6)
+                    bw = int(sh * 2)
+                    bh = int(sh * 2.0)
+                    from engine import platform_render
+                    platform_render.draw_sprite_clipped(
+                        gs.screen, gs.platform_occluders,
+                        (bx, by, bw, bh), occ, _draw_obj, const.W)
+                else:
+                    _draw_obj()
+
         # Sector mode exit marker
         if gs.sector_mode and gs.exit_pos:
             ex, ey = gs.exit_pos
@@ -1463,6 +1551,14 @@ def render(vh=None, vy=None):
                 bot_flr = int(bot_flr)
                 idx2 = depth_col(z_b, sx2, const.W)
                 if idx2 >= 0 and z_b[idx2] > occ2:
+                    vis_b = 'visible'
+                    if gs.platform_occluders:
+                        from engine import platform_render
+                        vis_b = platform_render.sprite_visibility(
+                            gs.platform_occluders, sx2, sh2 // 2,
+                            bot_flr - sh2, bot_flr, occ2, const.W)
+                        if vis_b == 'hidden':
+                            continue
                     pcol = bot.get('col', (200, 40, 40))
                     if bot.get('d_flash', 0) > 0:
                         pcol = (255, 255, 255)
@@ -1485,13 +1581,26 @@ def render(vh=None, vy=None):
                         surf = pygame.transform.flip(surf, True, False)
                     sr = surf.get_width() // 2
                     blit_y = max(0, bot_flr - sr)
-                    gs.screen.blit(surf, (sx2 - sr, blit_y))
-                    # HP bar (max 200)
-                    bw = sh2 // 4
-                    pygame.draw.rect(gs.screen, (60, 0, 0), (sx2 - bw, bot_flr + sr + 4, bw * 2, 4))
-                    hp_w = int(bw * 2 * bot['hp'] / 200)
-                    hp_col = (50, 200, 50) if bot['hp'] > 100 else (200, 200, 50) if bot['hp'] > 50 else (200, 50, 50)
-                    pygame.draw.rect(gs.screen, hp_col, (sx2 - bw, bot_flr + sr + 4, hp_w, 4))
+
+                    def _draw_bot():
+                        gs.screen.blit(surf, (sx2 - sr, blit_y))
+                        # HP bar (max 200)
+                        bw = sh2 // 4
+                        pygame.draw.rect(gs.screen, (60, 0, 0), (sx2 - bw, bot_flr + sr + 4, bw * 2, 4))
+                        hp_w = int(bw * 2 * bot['hp'] / 200)
+                        hp_col = (50, 200, 50) if bot['hp'] > 100 else (200, 200, 50) if bot['hp'] > 50 else (200, 50, 50)
+                        pygame.draw.rect(gs.screen, hp_col, (sx2 - bw, bot_flr + sr + 4, hp_w, 4))
+
+                    if vis_b == 'partial':
+                        bx = int(sx2 - sr - 2)
+                        by = int(blit_y)
+                        from engine import platform_render
+                        platform_render.draw_sprite_clipped(
+                            gs.screen, gs.platform_occluders,
+                            (bx, by, int(sr * 2 + 4), int(bot_flr + sr + 10 - blit_y)),
+                            occ2, _draw_bot, const.W)
+                    else:
+                        _draw_bot()
 
     # Other players (co-op)
     for pl in gs.players:
@@ -1521,83 +1630,73 @@ def render(vh=None, vy=None):
             # below is derived from these -- so snap once, here.
             sh2 = int(min(sh2, _RH * 2))
             plr_flr = int(plr_flr)
+            vis2 = 'visible'
             if gs.platform_occluders:
                 from engine import platform_render
-
-                if platform_render.sprite_occluded(
-                        gs.platform_occluders, sx2, sh2 // 2,
-                        plr_flr - sh2, plr_flr, occ2, const.W):
+                vis2 = platform_render.sprite_visibility(
+                    gs.platform_occluders, sx2, sh2 // 2,
+                    plr_flr - sh2, plr_flr, occ2, const.W)
+                if vis2 == 'hidden':
                     continue
             idx2 = depth_col(z_b, sx2, const.W)
             if idx2 >= 0 and z_b[idx2] > occ2:
-                skin = (230, 190, 150)
-                shirt = pl.get('col', (50, 130, 200))
-                # state 3 = dashing: lighten the shirt so the burst of speed is
-                # readable to other players (the world-state player record is
-                # unchanged in size, this only paints the value it already had).
-                if pl.get('state') == 3:
-                    shirt = _brighter(shirt)
-                pants = (70, 70, 85)
-                boots = (55, 45, 35)
-                br2 = sh2 // 4
-                body_h = sh2 // 2
-                leg_h = sh2 // 5
-                head_y = plr_flr - body_h - leg_h - br2
+                def _draw_pl():
+                    skin = (230, 190, 150)
+                    shirt = pl.get('col', (50, 130, 200))
+                    # state 3 = dashing: lighten the shirt so the burst of speed is
+                    # readable to other players (the world-state player record is
+                    # unchanged in size, this only paints the value it already had).
+                    if pl.get('state') == 3:
+                        shirt = _brighter(shirt)
+                    pants = (70, 70, 85)
+                    boots = (55, 45, 35)
+                    br2 = sh2 // 4
+                    body_h = sh2 // 2
+                    leg_h = sh2 // 5
+                    head_y = plr_flr - body_h - leg_h - br2
 
-                # Head
-                pygame.draw.circle(gs.screen, skin, (sx2, head_y + br2), br2)
-                # Eyes
-                eye_off = br2 // 3
-                pygame.draw.circle(gs.screen, (40, 40, 40), (sx2 - eye_off, head_y + br2 - eye_off), max(1, br2 // 5))
-                pygame.draw.circle(gs.screen, (40, 40, 40), (sx2 + eye_off, head_y + br2 - eye_off), max(1, br2 // 5))
+                    # Head
+                    pygame.draw.circle(gs.screen, skin, (sx2, head_y + br2), br2)
+                    # Eyes
+                    eye_off = br2 // 3
+                    pygame.draw.circle(gs.screen, (40, 40, 40), (sx2 - eye_off, head_y + br2 - eye_off), max(1, br2 // 5))
+                    pygame.draw.circle(gs.screen, (40, 40, 40), (sx2 + eye_off, head_y + br2 - eye_off), max(1, br2 // 5))
 
-                # Torso
-                tw = int(br2 * 1.3)
-                torso_top = head_y + br2 * 2
-                torso_bot = torso_top + body_h
-                pygame.draw.rect(gs.screen, shirt, (sx2 - tw, torso_top, tw * 2, body_h))
+                    # Torso
+                    tw = int(br2 * 1.3)
+                    torso_top = head_y + br2 * 2
+                    torso_bot = torso_top + body_h
+                    pygame.draw.rect(gs.screen, shirt, (sx2 - tw, torso_top, tw * 2, body_h))
 
-                # Arms
-                arm_len = int(body_h * 0.7)
-                ax1 = sx2 - tw
-                ax2 = sx2 + tw
-                ay = torso_top + body_h // 3
-                pygame.draw.line(gs.screen, skin, (ax1, ay),
-                                 (ax1 - int(math.cos(oa + 0.6) * arm_len),
-                                  ay + int(math.sin(oa + 0.6) * arm_len)), max(2, br2 // 3))
-                pygame.draw.line(gs.screen, skin, (ax2, ay),
-                                 (ax2 - int(math.cos(oa - 0.6) * arm_len),
-                                  ay + int(math.sin(oa - 0.6) * arm_len)), max(2, br2 // 3))
+                    # Arms
+                    arm_len = int(body_h * 0.7)
+                    ax1 = sx2 - tw
+                    ax2 = sx2 + tw
+                    ay = torso_top + body_h // 3
+                    pygame.draw.line(gs.screen, shirt, (ax1, ay), (ax1 - tw // 2, ay + arm_len), max(2, tw // 3))
+                    pygame.draw.line(gs.screen, shirt, (ax2, ay), (ax2 + tw // 2, ay + arm_len), max(2, tw // 3))
+                    # Hands
+                    pygame.draw.circle(gs.screen, skin, (ax1 - tw // 2, ay + arm_len), max(2, tw // 3))
+                    pygame.draw.circle(gs.screen, skin, (ax2 + tw // 2, ay + arm_len), max(2, tw // 3))
 
-                # Legs
-                lw = max(2, br2 // 2)
-                pygame.draw.line(gs.screen, pants, (sx2 - lw, torso_bot), (sx2 - lw, torso_bot + leg_h), lw)
-                pygame.draw.line(gs.screen, pants, (sx2 + lw, torso_bot), (sx2 + lw, torso_bot + leg_h), lw)
-                pygame.draw.line(gs.screen, boots, (sx2 - lw, torso_bot + leg_h), (sx2 - lw - 1, torso_bot + leg_h + 3), max(2, lw))
-                pygame.draw.line(gs.screen, boots, (sx2 + lw, torso_bot + leg_h), (sx2 + lw + 1, torso_bot + leg_h + 3), max(2, lw))
+                    # Legs
+                    leg_w = tw * 2 // 3
+                    pygame.draw.rect(gs.screen, pants, (sx2 - tw, torso_bot, leg_w, leg_h))
+                    pygame.draw.rect(gs.screen, pants, (sx2 + tw - leg_w, torso_bot, leg_w, leg_h))
+                    # Boots
+                    boot_h = leg_h // 3
+                    pygame.draw.rect(gs.screen, boots, (sx2 - tw, torso_bot + leg_h - boot_h, leg_w, boot_h))
+                    pygame.draw.rect(gs.screen, boots, (sx2 + tw - leg_w, torso_bot + leg_h - boot_h, leg_w, boot_h))
 
-                # Weapon
-                wpn_idx = pl.get('wpn', 1)
-                if 0 <= wpn_idx < len(WPN):
-                    wcol = WPN[wpn_idx]['c']
+                if vis2 == 'partial':
+                    bx = int(sx2 - sh2)
+                    by = int(plr_flr - sh2 * 1.5)
+                    from engine import platform_render
+                    platform_render.draw_sprite_clipped(
+                        gs.screen, gs.platform_occluders,
+                        (bx, by, int(sh2 * 2), int(sh2 * 1.8)), occ2, _draw_pl, const.W)
                 else:
-                    wcol = (180, 180, 100)
-                whb = max(2, br2 // 3)
-                wlen = int(br2 * 1.8)
-                wdx = int(math.cos(oa) * wlen)
-                wdy = int(math.sin(oa) * wlen)
-                wx2 = sx2 - tw + wdx
-                wy2 = ay + wdy
-                pygame.draw.line(gs.screen, wcol, (sx2 - tw, ay), (wx2, wy2), whb + 1)
-
-                # Name tag
-                oname = pl.get('name', '')
-                if oname:
-                    nm_surf = _cached_text(gs.sm_font, oname, (255, 255, 255))
-                    nm_x = sx2 - nm_surf.get_width() // 2
-                    nm_y = head_y - nm_surf.get_height() - 2
-                    if nm_y > _RY - 10:
-                        gs.screen.blit(nm_surf, (nm_x, nm_y))
+                    _draw_pl()
 
     # Floor glow when standing on F/E/L tiles. The band is a layout unit: as a
     # literal 40px it was 8.3% of a 480px window and 1.9% of a 2160px one, so
@@ -1711,17 +1810,15 @@ def render(vh=None, vy=None):
             ov.fill((255, 255, 0))
         gs.screen.blit(ov, (0, _RY))
 
-    if gs.p['hp'] <= 50 and gs.p['hp'] > 0:
+    if 0 < gs.p['hp'] <= 50:
+        # Steady red tint.  The old hp <= 20 overlay was time-gated and made
+        # the whole view blink; low HP must read as a constant warning, while
+        # the short damage flash above stays the only blinking red effect.
         intensity = int(80 * (1 - gs.p['hp'] / 50))
         ov = _overlay('hpo', (const.W, _RH))
         ov.set_alpha(intensity)
         ov.fill((180, 0, 0))
         gs.screen.blit(ov, (0, _RY))
-        if gs.p['hp'] <= 20 and int(curr_t * 0.005) % 2 == 0:
-            ov2 = _overlay('hppulse', (const.W, _RH))
-            ov2.set_alpha(60)
-            ov2.fill((200, 0, 0))
-            gs.screen.blit(ov2, (0, _RY))
 
     # Elevator prompt
     if gs.elevator_prompt:
@@ -1782,7 +1879,13 @@ def render(vh=None, vy=None):
         if gs.p['keys']['B'] > 0:
             gs.screen.blit(gs.sm_font.render(f"B:{gs.p['keys']['B']}", True, (50, 50, 255)), (kx, ky)); ky += mm_pitch
         if gs.secrets_total > 0:
-            gs.screen.blit(gs.sm_font.render(f"SEC: {gs.secrets_found}/{gs.secrets_total}", True, (100, 200, 100)), (kx, ky))
+            gs.screen.blit(gs.sm_font.render(f"SEC: {gs.secrets_found}/{gs.secrets_total}", True, (kx, ky)))
+    elif gs.show_minimap and gs.sector_mode and gs.sec_scene is not None:
+        # Sector maps clear the tile grid, so the tile minimap above cannot
+        # draw them.  Import lazily: maps without a sector scene pay only the
+        # flag checks.  The module paints geometry only -- no actors, no fog.
+        from engine import sector_minimap
+        sector_minimap.draw_hud()
 
     # Frame-rate readout, top edge of the screen.  The engine has no clock,
     # so gs.fps is whatever the client measured for the frame being drawn.
@@ -1860,12 +1963,15 @@ def render(vh=None, vy=None):
 
     # ── HUD ──
     # Every size below is a layout unit of the reference window (1000x700),
-    # converted to pixels by ui_px().  Authoring them as literal pixels is what
-    # made the HUD 20.8% of a 480px window and 4.6% of a 2160px one.
-    hud_bh = ui_px(100)
-    hud_by = _RY + _RH - hud_bh
-    pygame.draw.rect(gs.screen, (15, 15, 20), (0, hud_by, const.W, hud_bh))
-    pygame.draw.rect(gs.screen, (100, 100, 100), (0, hud_by, const.W, hud_bh), 1)
+    # converted to pixels by ui_px().  The text bands themselves come from one
+    # measured layout, shared with the smoke test, so the font cannot outgrow
+    # the row it was assigned to.
+    hud = hud_layout(const.W, _RH, _RY)
+    hud_by, hud_bh = hud["bar"].y, hud["bar"].height
+    face_rect = hud["face"]
+    hud_gap = hud["gap"]
+    pygame.draw.rect(gs.screen, (15, 15, 20), hud["bar"])
+    pygame.draw.rect(gs.screen, (100, 100, 100), hud["bar"], 1)
 
     hp = gs.p['hp']
     max_hp = gs.start_hp
@@ -1874,9 +1980,7 @@ def render(vh=None, vy=None):
     arm_type = arm['type'] if arm else None
 
     # ── Square face, big and expressive ──
-    face_sz = ui_px(52)
-    face_x, face_y = const.W // 2, hud_by + hud_bh // 2
-    face_rect = pygame.Rect(face_x - face_sz // 2, face_y - face_sz // 2, face_sz, face_sz)
+    face_x, face_y = face_rect.centerx, face_rect.centery
     blink = (int(curr_t * 0.003) % 200) < 3
 
     if hp <= 0:
@@ -2008,31 +2112,48 @@ def render(vh=None, vy=None):
         pygame.draw.line(gs.screen, (180, 0, 0), (fex + ui_px(5), m_y + ui_px(8)), (fex + ui_px(5), m_y + ui_px(12)), lw_mid)
         pygame.draw.line(gs.screen, (180, 0, 0), (fex - ui_px(1), m_y + ui_px(9)), (fex - ui_px(1), m_y + ui_px(12)), lw_mid)
 
-    # ── Left: HP + thin bar + stats ──
-    lx = ui_px(12)
+    # ── Left: HP + two rows of compact stats ──
     hp_col = (0, 220, 0) if hp > 50 else ((220, 220, 0) if hp > 25 else (220, 0, 0))
     hp_str = f"{hp}/{max_hp}"
-    gs.screen.blit(gs.font.render(hp_str, True, hp_col), (lx, hud_by + ui_px(4)))
-    # Stats (compact)
-    stats_y = hud_by + ui_px(14)
-    pitch_stat = ui_px(12)
-    gs.screen.blit(gs.sm_font.render(f"K:{gs.kills}", True, (180, 120, 120)), (lx, stats_y))
-    gs.screen.blit(gs.sm_font.render(f"I:{gs.items_picked}", True, (180, 180, 120)), (lx, stats_y + pitch_stat))
-    gs.screen.blit(gs.sm_font.render(f"S:{gs.secrets_found}/{gs.secrets_total}", True, (160, 160, 160)), (lx, stats_y + pitch_stat * 2))
-    # Accuracy
+    hp_surf = _cached_text(gs.font, fit_text(hp_str, gs.font, hud["hp"].width),
+                           hp_col)
+    gs.screen.blit(hp_surf, hud["hp"])
+
+    stat_rows = [
+        [(f"K:{gs.kills}", (180, 120, 120)),
+         (f"I:{gs.items_picked}", (180, 180, 120))],
+        [(f"S:{gs.secrets_found}/{gs.secrets_total}", (160, 160, 160))],
+    ]
     if gs.shots_fired > 0:
         acc = gs.shots_hit * 100 // gs.shots_fired
-        acc_col = (100, 200, 100) if acc > 50 else ((200, 200, 100) if acc > 25 else (200, 100, 100))
-        gs.screen.blit(gs.sm_font.render(f"A:{acc}%", True, acc_col), (lx, stats_y + pitch_stat * 3))
+        acc_col = ((100, 200, 100) if acc > 50
+                   else ((200, 200, 100) if acc > 25 else (200, 100, 100)))
+        stat_rows[1].append((f"A:{acc}%", acc_col))
+    half_w = (hud["stat0"].width - hud_gap) // 2
+    for band, row in ((hud["stat0"], stat_rows[0]), (hud["stat1"], stat_rows[1])):
+        for i, (text, color) in enumerate(row):
+            x = band.x + i * (half_w + hud_gap)
+            surf = _cached_text(gs.sm_font, fit_text(text, gs.sm_font, half_w),
+                                color)
+            gs.screen.blit(surf, (x, band.y))
 
-    # ── Right: Armor + weapon + ammo + kills count ──
-    rx = const.W - ui_px(120)
+    # ── Right: armour/ENE, weapon, ammo and its bar ──
+    ene_left = len(gs.enemies)
+    if ene_left > 0:
+        ene_col = ((200, 100, 100) if ene_left > 5
+                   else ((200, 200, 100) if ene_left > 1 else (200, 50, 50)))
+        ene_surf = _cached_text(gs.sm_font, f"ENE:{ene_left}", ene_col)
+        gs.screen.blit(ene_surf, (hud["ene"].right - ene_surf.get_width(),
+                                  hud["ene"].y))
 
-    # Armor value with type icon
     if arm_val > 0:
         arm_label = f"ARM {arm_val}"
-        arm_col2 = (50, 220, 50) if arm_type == 'green' else ((50, 80, 220) if arm_type == 'blue' else (100, 100, 100))
-        gs.screen.blit(gs.font.render(arm_label, True, arm_col2), (rx, hud_by + ui_px(4)))
+        arm_col2 = ((50, 220, 50) if arm_type == 'green'
+                    else ((50, 80, 220) if arm_type == 'blue'
+                          else (100, 100, 100)))
+        arm_surf = _cached_text(
+            gs.font, fit_text(arm_label, gs.font, hud["armor"].width), arm_col2)
+        gs.screen.blit(arm_surf, hud["armor"])
 
     if gs.p['wpn'] >= 100:
         # Same story as draw_wpn: no content package in the engine, so the
@@ -2042,6 +2163,7 @@ def render(vh=None, vy=None):
                         f"weapon index {gs.p['wpn']} has no registered "
                         "content package: HUD shows a placeholder")
         wpn_name, amm = "Custom", "?"
+        amm_key = None
     else:
         wpn = WPN[gs.p['wpn']]
         wpn_name = wpn['n']
@@ -2050,44 +2172,70 @@ def render(vh=None, vy=None):
     if gs.lvl_type == 'slaughter':
         amm = "INF"
 
-    wpn_y = hud_by + ui_px(28)
-    gs.screen.blit(gs.sm_font.render(wpn_name, True, (210, 210, 210)), (rx + ui_px(2), wpn_y))
+    wpn_surf = _cached_text(
+        gs.sm_font, fit_text(wpn_name, gs.sm_font, hud["weapon"].width),
+        (210, 210, 210))
+    gs.screen.blit(wpn_surf, hud["weapon"])
     if isinstance(amm, int):
-        amc = {'pstl': (180, 180, 100), 'shl': (200, 120, 50), 'slg': (100, 200, 100), 'rck': (0, 200, 0), 'BFG': (0, 200, 50)}.get(amm_key if gs.p['wpn'] < 100 else 'pstl', (200, 200, 200))
-        amm_str = f"{amm}"
-        gs.screen.blit(gs.font.render(amm_str, True, amc), (rx, wpn_y + ui_px(16)))
-        # Thin ammo bar
-        amm_max = {'pstl': 200, 'shl': 50, 'slg': 50, 'rck': 10, 'BFG': 10}.get(amm_key if gs.p['wpn'] < 100 else 'pstl', 100)
+        amc = ({'pstl': (180, 180, 100), 'shl': (200, 120, 50),
+                'slg': (100, 200, 100), 'rck': (0, 200, 0),
+                'BFG': (0, 200, 50)}.get(
+                    amm_key if gs.p['wpn'] < 100 else 'pstl', (200, 200, 200)))
+        amm_surf = _cached_text(
+            gs.font, fit_text(f"{amm}", gs.font, hud["ammo"].width), amc)
+        gs.screen.blit(amm_surf, hud["ammo"])
+        amm_max = ({'pstl': 200, 'shl': 50, 'slg': 50, 'rck': 10,
+                    'BFG': 10}.get(amm_key if gs.p['wpn'] < 100 else 'pstl', 100))
         if amm_max > 0:
-            amm_frac = min(1.0, amm / amm_max)
-            abw, abh = ui_px(90), ui_px(4)
-            pygame.draw.rect(gs.screen, (25, 25, 25), (rx, wpn_y + ui_px(38), abw, abh))
-            pygame.draw.rect(gs.screen, amc, (rx, wpn_y + ui_px(38), int(abw * amm_frac), abh))
-    # Remaining enemies
-    ene_left = len(gs.enemies)
-    if ene_left > 0:
-        ene_col = (200, 100, 100) if ene_left > 5 else ((200, 200, 100) if ene_left > 1 else (200, 50, 50))
-        gs.screen.blit(gs.sm_font.render(f"ENE:{ene_left}", True, ene_col), (rx, wpn_y + ui_px(48)))
+            ab = hud["ammo_bar"]
+            pygame.draw.rect(gs.screen, (25, 25, 25), ab)
+            pygame.draw.rect(gs.screen, amc,
+                             (ab.x, ab.y, int(ab.width * min(1.0, amm / amm_max)),
+                              ab.height))
 
     # ── Weapon slots (top area between panels) ──
     owned = sorted(gs.p['guns'])
     slot_w = ui_px(30)
-    slots_start = max(lx + ui_px(80), face_rect.left - len(owned) * slot_w - ui_px(8))
+    slots_start = max(hud["hp"].right + hud_gap,
+                      face_rect.left - len(owned) * slot_w - ui_px(8))
     slot_y = hud_by + ui_px(8)
     for i, w in enumerate(owned):
         wx = slots_start + i * slot_w
         wcol = (255, 255, 255) if w == gs.p['wpn'] else (120, 120, 120)
         lbl = str(w + 1) if w < 6 else f"C{w-99}"
         if w < 6:
-            pygame.draw.rect(gs.screen, WPN[w]['c'], (wx + ui_px(2), slot_y + ui_px(1), ui_px(6), ui_px(5)))
+            pygame.draw.rect(gs.screen, WPN[w]['c'],
+                             (wx + ui_px(2), slot_y + ui_px(1), ui_px(6), ui_px(5)))
         lw = gs.sm_font.size(lbl)[0]
-        gs.screen.blit(gs.sm_font.render(lbl, True, wcol), (wx + (slot_w - lw) // 2, slot_y + ui_px(8)))
+        gs.screen.blit(gs.sm_font.render(lbl, True, wcol),
+                       (wx + (slot_w - lw) // 2, slot_y + ui_px(8)))
         if w == gs.p['wpn']:
-            pygame.draw.rect(gs.screen, (255, 255, 255), (wx, slot_y, slot_w - 1, ui_px(22)), 1)
+            pygame.draw.rect(gs.screen, (255, 255, 255),
+                             (wx, slot_y, slot_w - 1, ui_px(22)), 1)
 
-    # ── Under face: mode / dmg / powerup / keys ──
-    bot_y = hud_by + hud_bh - ui_px(16)
-    mode_str = ""
+    # ── Centre: powerup + keys above the face, mode + DMG below it ──
+    top = hud["top"]
+    tx = top.x
+    pu_str = f"{gs.p['powerup']}" if gs.p['powerup'] else ""
+    if pu_str:
+        surf = _cached_text(gs.sm_font,
+                            fit_text(pu_str, gs.sm_font, top.right - tx),
+                            (255, 255, 0))
+        gs.screen.blit(surf, (tx, top.y))
+        tx += surf.get_width() + hud_gap
+    for kc, kv in sorted(gs.p.get('keys', {}).items()):
+        if kv <= 0 or tx >= top.right:
+            continue
+        text = f"{kc}:{kv}"
+        kcol = {'R': (255, 50, 50), 'Y': (255, 255, 50),
+                'B': (50, 50, 255)}.get(kc, (200, 200, 200))
+        shown = fit_text(text, gs.sm_font, top.right - tx)
+        if not shown:
+            break
+        surf = _cached_text(gs.sm_font, shown, kcol)
+        gs.screen.blit(surf, (tx, top.y))
+        tx += surf.get_width() + hud_gap
+
     if gs.lvl_type == 'slaughter':
         mode_str = f"W:{gs.rounds}"
     elif gs.lvl_type == 'deathmatch':
@@ -2100,32 +2248,25 @@ def render(vh=None, vy=None):
         mode_str = f"W{gs.orda_wave}"
     else:
         mode_str = 'ENDLESS' if gs.lvl_type == 'endless' else 'EXIT'
-    if mode_str:
-        # Centred on the face by measuring the label: a blind offset drifts as
-        # soon as the string changes length ("ENDLESS" vs "EXIT").
-        lbl = gs.sm_font.render(mode_str, True, (150, 150, 150))
-        gs.screen.blit(lbl, (face_rect.centerx - lbl.get_width() // 2, bot_y))
-    # Damage dealt/taken on the bottom line
-    lbl = gs.sm_font.render(f"DMG:{gs.damage_dealt}d/{gs.damage_taken}t", True, (140, 140, 140))
-    gs.screen.blit(lbl, (face_rect.centerx - lbl.get_width() // 2, bot_y + ui_px(10)))
-    pu_str = f"{gs.p['powerup']}" if gs.p['powerup'] else ""
-    if pu_str:
-        lbl = gs.sm_font.render(pu_str, True, (255, 255, 0))
-        gs.screen.blit(lbl, (face_rect.centerx - lbl.get_width() // 2, hud_by + ui_px(2)))
-    kx = face_rect.right + ui_px(8)
-    key_pitch = ui_px(28)
-    for kc, kv in sorted(gs.p.get('keys', {}).items()):
-        if kv > 0:
-            kcol = {'R': (255, 50, 50), 'Y': (255, 255, 50), 'B': (50, 50, 255)}.get(kc, (200, 200, 200))
-            gs.screen.blit(gs.sm_font.render(f"{kc}:{kv}", True, kcol), (kx, bot_y))
-            kx += key_pitch
+    dmg_str = f"DMG:{gs.damage_dealt}d/{gs.damage_taken}t"
+    bottom = hud["bottom"]
+    mode_shown = fit_text(mode_str, gs.sm_font,
+                          max(1, bottom.width // 3))
+    dmg_shown = fit_text(dmg_str, gs.sm_font,
+                         bottom.width - gs.sm_font.size(mode_shown)[0] - hud_gap)
+    mode_surf = _cached_text(gs.sm_font, mode_shown, (150, 150, 150))
+    dmg_surf = _cached_text(gs.sm_font, dmg_shown, (140, 140, 140))
+    line_w = mode_surf.get_width() + hud_gap + dmg_surf.get_width()
+    bx = bottom.x + max(0, (bottom.width - line_w) // 2)
+    gs.screen.blit(mode_surf, (bx, bottom.y))
+    gs.screen.blit(dmg_surf, (bx + mode_surf.get_width() + hud_gap, bottom.y))
 
     # Cheat input display
     if gs.cheat_open:
         cheat_h = ui_px(42)
         pygame.draw.rect(gs.screen, (0, 0, 0), (0, _RY + _RH - cheat_h, const.W, cheat_h))
         pygame.draw.rect(gs.screen, (100, 100, 100), (0, _RY + _RH - cheat_h, const.W, cheat_h), 1)
-        txt = f"CHEAT: {gs.cheat_buf}█"
+        txt = f"CHEAT: {gs.cheat_buf}|"
         gs.screen.blit(gs.font.render(txt, True, (255, 255, 0)), (ui_px(30), _RY + _RH - ui_px(35)))
 
     # Crosshair — centred on the screen, sized in layout units so it stays

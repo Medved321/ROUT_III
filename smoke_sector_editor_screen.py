@@ -24,7 +24,11 @@ from shared.sector_map import (  # noqa: E402
     LineDef, Sector, SectorMap, SideDef, Vertex,
 )
 from client.sector_editor_screen import (  # noqa: E402
-    BASE_CHIPS_H, HINT_BLOCK_H, MAPS_DIR, MAP_ROW_H, SectorEditorScreen)
+    BASE_CHIPS_H, CHIP_ROW_H, FIELD_H, HINT_BLOCK_H, MAPS_DIR, MAP_ROW_H,
+    TEX_COLS, TEX_ROW_H, THING_MIN_CHIP_W, SectorEditorScreen)
+from client import map_library  # noqa: E402
+from client.ui_layout import ellipsize  # noqa: E402
+from shared.text_map import WALL_TEXTURE_ORDER  # noqa: E402
 
 
 def _evt(t, **kw):
@@ -106,12 +110,15 @@ def main():
     scr.handle([_evt(pygame.MOUSEWHEEL, y=0, x=0)])
     scr.draw(surface)
 
-    # E→sector screen exposes toggle to the client wrapper
-    assert scr._button("mode") == "tile"
+    # There is no path back to the retired tile editor.
+    assert "mode" not in scr.buttons
+    assert scr._button("mode") is None
     scr.draw(surface)
     _check_heights_and_solid(scr, surface)
     _check_tex_palette(scr, surface)
     _check_panel_layout(surface)
+    _check_thing_palette_scroll()
+    _check_status_and_fps_bands(scr, surface)
     _check_front_side_invariant(scr, surface)
     _check_side_toggle_refusals_reach_the_status_line(scr, surface)
     _check_load_reports_a_repair(scr, surface)
@@ -191,7 +198,7 @@ def _check_map_list(scr, surface) -> None:
     # stub the write out and keep the shared maps/sector1.mts on disk intact.
     real_save = scr._save
     scr._save = lambda: None
-    real = scr._scan_map_files()
+    real = map_library.list_map_names()
     assert real, f"no maps to list in {MAPS_DIR}"
     assert len(real) == len(set(real)), f"a map is listed twice: {real}"
     # synthetic names: the row geometry is all that matters here, and a name
@@ -422,6 +429,41 @@ def _check_heights_and_solid(scr, surface) -> None:
     print("  heights + solid UI OK")
 
 
+def _check_status_and_fps_bands(scr, surface) -> None:
+    """The two on-canvas readouts must not share pixels with the toolbar."""
+    saved = scr.status
+    try:
+        scr.status = "Ошибка загрузки: " + "очень длинное имя карты " * 8
+        scr.draw(surface)
+        status = scr._status_rect()
+        fps = scr._fps_rect()
+        for button in scr.buttons.values():
+            assert not status.colliderect(button), \
+                f"status {status} runs over button {button}"
+            assert not fps.colliderect(button), \
+                f"FPS {fps} runs over button {button}"
+        assert fps.bottom < status.y, f"FPS {fps} must be above status {status}"
+        assert fps.left <= status.left, f"FPS {fps} must start left of {status}"
+        assert surface.get_rect().contains(status)
+        assert surface.get_rect().contains(fps)
+        shown = ellipsize(scr.status, scr.tiny_font, status.width)
+        assert scr.tiny_font.size(shown)[0] <= status.width
+        fps_text = f"FPS: {scr.fps:4.1f}"
+        fps_shown = ellipsize(fps_text, scr.tiny_font, fps.width)
+        assert scr.tiny_font.size(fps_shown)[0] <= fps.width
+    finally:
+        scr.status = saved
+
+
+def _assert_text_blocks_disjoint(blocks: dict[str, pygame.Rect], label: str) -> None:
+    """Every named text line owns its own pixels."""
+    names = list(blocks)
+    for i, an in enumerate(names):
+        for bn in names[i + 1:]:
+            assert not blocks[an].colliderect(blocks[bn]), \
+                f"{label}: {an} {blocks[an]} overlaps {bn} {blocks[bn]}"
+
+
 def _check_panel_layout(surface) -> None:
     """The side panel must fit its contents at any reasonable window size.
 
@@ -452,6 +494,47 @@ def _check_panel_layout(surface) -> None:
         assert scr.panel.contains(pygame.Rect(scr.panel.x, scr._hint_y,
                                               scr.panel.width, HINT_BLOCK_H)), \
             f"{w}x{h}: hints at {scr._hint_y} fall outside {scr.panel}"
+        # Worst case: a two-sided line has 9 chips. They used to run into the
+        # description at prop_rect.y + 118, which was a fixed offset.
+        assert len(scr._prop_chips) == 9, \
+            f"{w}x{h}: expected 9 chips, got {sorted(scr._prop_chips)}"
+        assert all(r.height == FIELD_H for r in scr._prop_chips.values())
+        tex_rows = -(-len(WALL_TEXTURE_ORDER) // TEX_COLS)
+        assert scr._tex_block_h == 52 + tex_rows * TEX_ROW_H
+        assert max(r.bottom for r in scr._tex_rects.values()) \
+            <= scr._context_y + scr._tex_block_h
+        chip_rects = list(scr._prop_chips.values())
+        field_rects = list(scr._height_fields.values())
+        blocks = dict(scr._prop_text_rects)
+        assert "header" in blocks
+        for rect in chip_rects + field_rects + list(blocks.values()):
+            assert scr._prop_rect.contains(rect), \
+                f"{w}x{h}: {rect} escapes the property panel {scr._prop_rect}"
+        _assert_text_blocks_disjoint(blocks, f"{w}x{h}: props")
+        for name, text_rect in blocks.items():
+            for control in chip_rects + field_rects:
+                assert not text_rect.colliderect(control), \
+                    f"{w}x{h}: {name} {text_rect} covers {control}"
+        # Sector fields + an in-progress contour stack four service lines.
+        scr._set_sel(sector=0)
+        scr.tool = "sector"
+        scr.contour = list(ids)
+        scr.draw(surf)
+        sector_blocks = dict(scr._prop_text_rects)
+        assert {"header", "field_hint", "extra", "contour"} <= set(sector_blocks), \
+            f"{w}x{h}: missing property lines {sorted(sector_blocks)}"
+        for rect in list(scr._height_fields.values()) + list(sector_blocks.values()):
+            assert scr._prop_rect.contains(rect), \
+                f"{w}x{h}: {rect} escapes the property panel {scr._prop_rect}"
+        _assert_text_blocks_disjoint(sector_blocks, f"{w}x{h}: sector props")
+        for name, text_rect in sector_blocks.items():
+            for control in list(scr._prop_chips.values()) + list(scr._height_fields.values()):
+                assert not text_rect.colliderect(control), \
+                    f"{w}x{h}: {name} {text_rect} covers {control}"
+        scr.contour = []
+        assert scr.panel.contains(scr._hint_rects["undo"]), \
+            f"{w}x{h}: {scr._hint_rects['undo']} escapes the panel"
+        _assert_text_blocks_disjoint(scr._hint_rects, f"{w}x{h}: hints")
         # the thing palette still selects a type by click
         name, rect, _ch = scr._palette_items[0][0]
         scr._set_sel()
@@ -468,6 +551,71 @@ def _check_panel_layout(surface) -> None:
     print("  panel layout fits OK")
 
 
+def _check_thing_palette_scroll() -> None:
+    """The Вещь palette is paged, readable, and its header is not a chip."""
+    for w, h in ((640, 480), (1000, 700)):
+        scr = SectorEditorScreen(w, h)
+        surf = pygame.Surface((w, h))
+        scr.draw(surf)
+        total = len(scr._palette_entries)
+        assert total > scr._palette_page, \
+            f"{w}x{h}: fixture must need scrolling ({total} vs {scr._palette_page})"
+
+        label, counter, counter_text = scr._palette_header_bands()
+        chips = [r for items in scr._palette_items for _n, r, _c in items]
+        assert not label.colliderect(counter), f"{w}x{h}: header bands overlap"
+        for rect in chips:
+            assert scr.panel.contains(rect), \
+                f"{w}x{h}: chip {rect} escapes the panel"
+            assert not label.colliderect(rect) and not counter.colliderect(rect), \
+                f"{w}x{h}: header text sits on a chip at {rect}"
+            assert rect.width >= THING_MIN_CHIP_W, \
+                f"{w}x{h}: chip squeezed to {rect.width}px"
+        for i, a in enumerate(chips):
+            for b in chips[i + 1:]:
+                assert not a.colliderect(b), f"{w}x{h}: chips {a}/{b} overlap"
+        assert scr.tiny_font.size(counter_text)[0] <= counter.width
+        for _name, rect, ch in (e for items in scr._palette_items for e in items):
+            shown = ellipsize(f"{ch} {_name}", scr.tiny_font, rect.width - 4)
+            assert scr.tiny_font.size(shown)[0] <= rect.width - 4, \
+                f"{w}x{h}: label {shown!r} runs over its chip"
+
+        # A wheel over the palette pages the list; the canvas keeps its zoom.
+        zoom = scr.zoom
+        pos = scr._palette_area.center
+        scr.handle([_evt(pygame.MOUSEWHEEL, y=-1, pos=pos)])
+        assert scr._palette_offset > 0, f"{w}x{h}: wheel did not scroll"
+        assert scr.zoom == zoom, f"{w}x{h}: palette wheel zoomed the canvas"
+        scr.draw(surf)
+        _label2, counter2, text2 = scr._palette_header_bands()
+        assert text2 != counter_text and not counter2.colliderect(label), \
+            f"{w}x{h}: page counter did not follow the scroll"
+
+        offset = scr._palette_offset
+        scr.handle([_evt(pygame.MOUSEWHEEL, y=1, pos=scr.canvas.center)])
+        assert scr.zoom != zoom, f"{w}x{h}: canvas wheel stopped zooming"
+        assert scr._palette_offset == offset, \
+            f"{w}x{h}: canvas wheel scrolled the palette"
+
+        for _ in range(20):
+            scr.handle([_evt(pygame.MOUSEWHEEL, y=-3, pos=pos)])
+        assert scr._palette_offset == scr._max_palette_offset(), \
+            f"{w}x{h}: scrolling did not stop at the last page"
+        names = [n for items in scr._palette_items for n, _r, _c in items]
+        assert scr._palette_entries[-1][0] in names, \
+            f"{w}x{h}: last thing cannot be reached"
+        name, rect, _ch = scr._palette_items[0][0]
+        scr.thing_type = "imp"
+        scr.handle([_evt(pygame.MOUSEBUTTONDOWN, pos=rect.center, button=1)])
+        assert scr.thing_type == name, f"{w}x{h}: a scrolled chip is not clickable"
+
+        for _ in range(20):
+            scr.handle([_evt(pygame.MOUSEWHEEL, y=3, pos=pos)])
+        assert scr._palette_offset == 0, f"{w}x{h}: scrolling did not return to page 0"
+        scr.draw(surf)
+    print("  thing palette scroll OK")
+
+
 def _check_tex_palette(scr, surface) -> None:
     """The wall texture palette writes the chosen slot of the chosen side."""
     ed = SectorEditor(new_room(1600, 1600))
@@ -478,7 +626,10 @@ def _check_tex_palette(scr, surface) -> None:
     ids = [ed.add_line(*e) for e in ((a, b), (b, c), (c, d), (d, a))]
     sid, errs = ed.sector_from_contour(ids, floor_h=16, ceil_h=128)
     assert sid > 0 and not errs, errs
-    outer = ids[0]
+    # A genuinely one-sided wall: the surrounding room's outer map border.
+    # The contour itself became a shared portal, so it no longer exercises
+    # the one-sided palette branch.
+    outer = next(i for i, ld in enumerate(ed.lines) if ld.back < 0)
     assert not ed.lines[outer].two_sided
     scr.editor = ed
     scr.frame_around()
@@ -723,8 +874,9 @@ def _check_front_side_invariant(scr, surface) -> None:
 def _two_rooms_map():
     """Two rooms side by side, split by the one wall they share.
 
-    Built by hand: ``sector_from_contour`` now makes a thick room whose outer
-    face is one-sided, so a contour can no longer donate a portal edge.
+    Built by hand: the fixture wants a portal between two ordinary rooms with
+    a known line index, independent of how ``sector_from_contour`` shapes a
+    newly created room.
     """
     sm = SectorMap()
     sm.sectors.append(Sector(floor_h=0, ceil_h=128, light=90))
@@ -883,14 +1035,12 @@ def _check_load_reports_a_repair(scr, surface) -> None:
 
 
 def _check_create_status(scr, surface) -> None:
-    """Creating through the screen builds a thick room and says so.
+    """Creating through the screen builds a zero-thickness room and says so.
 
-    The sector is born with its inner loop inset by ``WALL_THICKNESS``: the
-    surrounding sector keeps a hole where the old contour was, and the strip
-    between the two loops is the solid wall body.
+    The contour IS the border: all four edges become two-sided portals between
+    the surrounding sector and the new one, with no inset loop and no wall body
+    between them.
     """
-    from client.sector_editor import WALL_THICKNESS
-
     ed = scr.editor = SectorEditor(new_room(1600, 1600))
     n0 = len(ed.lines)
     scr.contour = []
@@ -905,17 +1055,19 @@ def _check_create_status(scr, surface) -> None:
                 ((v1, v2), (v2, v3), (v3, v4), (v4, v1))]
 
     scr.contour = box(300, 300, 700, 700)
+    contour = list(scr.contour)
     scr._create_sector()
-    assert scr.status == "Сектор 1 создан (толщина стены 16)", scr.status
+    assert scr.status == "Сектор 1 создан (границы — общие проёмы)", scr.status
     n = len(ed.lines) - n0
-    assert n == 8, f"4 contour + 4 inner lines: {n}"
-    inner = [i for i, ld in enumerate(ed.lines)
-             if 0 <= ld.front < len(ed.sides)
-             and ed.sides[ld.front].sector == 1 and ld.back < 0]
-    assert len(inner) == 4, inner
+    assert n == 4, f"the contour is the whole border: {n}"
+    for li in contour:
+        ld = ed.lines[li]
+        assert ld.front >= 0 and ld.back >= 0, (li, "expected a portal")
+        assert ed.sides[ld.front].sector == 0
+        assert ed.sides[ld.back].sector == 1
     assert ed.sm.find_sector_at(500, 500) == 1, "the room interior"
-    assert ed.sm.find_sector_at(500, 300 + WALL_THICKNESS / 2) == -1, \
-        "the strip between the loops is the wall body"
+    assert ed.sm.find_sector_at(500, 308) == 1, "the room reaches its border"
+    assert ed.sm.find_sector_at(500, 292) == 0, "and the host starts there"
     assert not ed.validate(), ed.validate()
     assert ed.sm.has_polygon(0) and ed.sm.has_polygon(1), "both contours alive"
     scr.draw(surface)

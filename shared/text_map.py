@@ -574,27 +574,13 @@ def _trigger(args: list[str], lineno: int, what: str,
     return special, tag
 
 
-def _contour_key(points: list[tuple[float, float]]) -> tuple:
-    """Cyclic contour identity: rotation- and direction-independent."""
-    pts = list(points)
-    if len(pts) >= 2 and pts[-1] == pts[0]:
-        pts.pop()
-    if not pts:
-        return ()
-
-    def canon(seq: list[tuple[float, float]]) -> tuple:
-        i = min(range(len(seq)), key=lambda k: (seq[k][0], seq[k][1], k))
-        return tuple(seq[i:] + seq[:i])
-
-    return min(canon(pts), canon(list(reversed(pts))))
-
-
 def _check_floating_rooms(doc: _Document) -> None:
     """Validate ``парит да`` rooms before any geometry is built.
 
-    A slab's contour has to be the ``контур`` hole of exactly one carrying
-    room, so the parser turns the border into a two-sided portal instead of a
-    wall ring; thickness is a property of the two heights.
+    Contact is free: a slab may share its contour with a host hole, with
+    another slab, with a wall, or with nothing at all.  The only property the
+    text form still checks is the one the model itself requires — a slab has
+    to be thick enough between its two heights.
     """
     for room in doc.rooms:
         if not room.floating:
@@ -605,24 +591,6 @@ def _check_floating_rooms(doc: _Document) -> None:
                 f"парящая комната «{room.name}»: плита "
                 f"{room.ceil_h}..{room.floor_h} тоньше "
                 f"{MIN_PLATFORM_THICKNESS}")
-        if not room.contours or not room.contours[0]:
-            continue        # the contour check itself reports the real error
-        target = _contour_key(room.contours[0])
-        hosts: list[str] = []
-        for other in doc.rooms:
-            if other is room or other.floating:
-                continue
-            if any(_contour_key(other.contours[ci]) == target
-                   for ci in range(1, len(other.contours))):
-                hosts.append(other.name)
-        if len(hosts) != 1:
-            detail = ("нет несущей комнаты с такой дырой «контур»"
-                      if not hosts else
-                      "несколько несущих комнат: " + ", ".join(hosts))
-            raise TextMapError(
-                room.float_line,
-                f"парящая комната «{room.name}»: контур должен совпадать "
-                f"ровно с одной дырой несущей комнаты ({detail})")
 
 
 # ── geometry build ────────────────────────────────────────────────────────
@@ -864,7 +832,7 @@ def load(path: str | Path, *, validate: bool = True) -> SectorMap:
     except UnicodeDecodeError as exc:
         raise TextMapError(
             0, f"файл не в кодировке UTF-8 ({exc.reason}); сохраните карту "
-               f"в UTF-8, например «Блокнот» → Файл → Сохранить как → "
+               f"в UTF-8, например «Блокнот»: Файл, Сохранить как, "
                f"Кодировка UTF-8") from None
     return parse(text, validate=validate)
 

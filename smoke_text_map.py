@@ -442,8 +442,9 @@ def test_floating_room() -> None:
 
     # The slab does not carve a hole in the host model: the floor under it
     # exists and the slab comes first (smallest loop) when both contain the
-    # point. The *text* still spells the border as the host's `контур` hole,
-    # because that is how the format attaches a slab to its carrier.
+    # point. Canonical text still spells a shared border as the host's `контур`
+    # hole when the loops coincide; the loose slab below shows that a hole is
+    # not required for contact.
     assert len(sm._ensure_polys()[0]) == 1, "у зала нет дыры в модели"
     assert "контур" in text_map.render(sm)
     assert len(text_map._sector_loops(sm, 1)) == 1
@@ -488,13 +489,19 @@ def test_floating_room() -> None:
         assert "тоньше" in str(exc), str(exc)
         assert exc.line == 17, exc.line
 
-    # A slab whose contour is not a hole of another room is rejected too.
-    orphan = FLOATING_ROOM.replace("контур\n", "")
-    try:
-        text_map.parse(orphan)
-        raise AssertionError("orphan slab accepted")
-    except text_map.TextMapError as exc:
-        assert "несущей" in str(exc), str(exc)
+    # A slab may float over a room WITHOUT spelling its border as that room's
+    # `контур` hole: contact is free, the slab sits above the host floor and
+    # the host keeps its full footprint.  The flag alone makes it a plate.
+    orphan = FLOATING_ROOM.replace(
+        "контур\nугол 128 128\nугол 128 384\nугол 384 384\nугол 384 128\n\n",
+        "")
+    loose = text_map.parse(orphan)
+    assert loose.validate() == [], loose.validate()
+    assert [s.floating for s in loose.sectors] == [False, True]
+    assert loose.sectors_at(256, 256) == [1, 0], loose.sectors_at(256, 256)
+    assert not [ld for ld in loose.linedefs if ld.back >= 0], \
+        "an unattached slab adds no portal to the host"
+    assert signature(text_map.parse(text_map.render(loose))) == signature(loose)
 
     # Bad value for the flag is a plain parse error.
     try:

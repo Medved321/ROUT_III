@@ -6,6 +6,7 @@ import sys
 
 sys.path.insert(0, ".")
 
+from server.cli import parse_server_args
 from server.server import GameServer
 from shared.asyncio_util import use_udp_safe_event_loop
 
@@ -16,17 +17,8 @@ logging.basicConfig(
 )
 
 if __name__ == "__main__":
-    host = "0.0.0.0"
-    port = 7777
-
-    if "--port" in sys.argv:
-        idx = sys.argv.index("--port")
-        port = int(sys.argv[idx + 1])
-    if "--host" in sys.argv:
-        idx = sys.argv.index("--host")
-        host = sys.argv[idx + 1]
-
-    server = GameServer(host, port)
+    args = parse_server_args(sys.argv[1:])
+    server = GameServer(args.host, args.port, tick_rate=args.tick_rate)
 
     use_udp_safe_event_loop()
     try:

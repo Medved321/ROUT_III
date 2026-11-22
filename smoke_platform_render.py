@@ -148,6 +148,40 @@ def _plain_room(w=1024, h=512):
     return sm
 
 
+def _slab_map_with_back_room(ceil=64):
+    """Slab map plus an ordinary room behind the host's x=1024 portal.
+
+    The far room has a low ceiling, so its portal tightens ``clip_top`` well
+    past the plate's underside on screen.  Before the fix that erased the
+    plate even though it stands in front of the portal.
+    """
+    sm = _slab_map()
+    right = next(li for li, ld in enumerate(sm.linedefs)
+                 if {int(sm.verts[ld.v1].x), int(sm.verts[ld.v2].x)} == {1024, 1024})
+    sec2 = len(sm.sectors)
+    sm.sectors.append(Sector(floor_h=0, ceil_h=ceil, light=255,
+                             floor_tex="host_floor", ceil_tex="host_ceil"))
+    sm.sidedefs.append(SideDef(sector=sec2, mid="host_side"))
+    sm.linedefs[right].back = len(sm.sidedefs) - 1
+
+    def vid(x, y):
+        for i, v in enumerate(sm.verts):
+            if v.x == x and v.y == y:
+                return i
+        sm.verts.append(Vertex(float(x), float(y)))
+        return len(sm.verts) - 1
+
+    front = len(sm.sidedefs)
+    sm.sidedefs.append(SideDef(sector=sec2, mid="wall"))
+    for (x1, y1), (x2, y2) in zip(
+            ((1024, 0), (2048, 0), (2048, 512)),
+            ((2048, 0), (2048, 512), (1024, 512))):
+        sm.linedefs.append(LineDef(vid(x1, y1), vid(x2, y2), front=front))
+    sm.invalidate()
+    assert sm.validate() == [], sm.validate()
+    return sm
+
+
 def _scene(sm):
     from engine.sector_render import SectorScene
 
@@ -548,23 +582,37 @@ def test_floor_z_moves_only_vertical():
 
 def test_sprite_occlusion_rules():
     from engine import platform_render
+    import pygame
 
     occ = [[(100.0, 300.0, 400.0)] for _ in range(250)]
-    # fully behind the plate and inside its span -> dropped
+    # fully behind the plate and inside its span -> hidden
     assert platform_render.sprite_occluded(occ, 500, 30, 320, 380, 200.0, 1000)
-    # in front of the plate -> drawn
-    assert not platform_render.sprite_occluded(occ, 500, 30, 320, 380, 50.0,
-                                               1000)
-    # taller than the plate (partial cover) -> drawn whole, no clipping
-    assert not platform_render.sprite_occluded(occ, 500, 30, 250, 380, 200.0,
-                                               1000)
-    # one uncovered column is enough to keep the sprite
+    assert platform_render.sprite_visibility(occ, 500, 30, 320, 380, 200.0, 1000) == 'hidden'
+    # in front of the plate -> visible
+    assert not platform_render.sprite_occluded(occ, 500, 30, 320, 380, 50.0, 1000)
+    assert platform_render.sprite_visibility(occ, 500, 30, 320, 380, 50.0, 1000) == 'visible'
+    # taller than the plate (partial cover) -> partially visible, not fully hidden
+    assert not platform_render.sprite_occluded(occ, 500, 30, 250, 380, 200.0, 1000)
+    assert platform_render.sprite_visibility(occ, 500, 30, 250, 380, 200.0, 1000) == 'partial'
+    spans = platform_render.visible_spans(occ, 500, 250, 380, 200.0, 1000)
+    assert spans == [(250, 300)], spans
+    # one uncovered column means not fully hidden (partial overall)
     occ2 = [list(row) for row in occ]
     occ2[120] = []
-    assert not platform_render.sprite_occluded(occ2, 500, 30, 320, 380, 200.0,
-                                               1000)
-    assert not platform_render.sprite_occluded(None, 500, 30, 320, 380, 200.0,
-                                               1000)
+    assert not platform_render.sprite_occluded(occ2, 500, 30, 320, 380, 200.0, 1000)
+    assert platform_render.sprite_visibility(occ2, 500, 30, 320, 380, 200.0, 1000) == 'partial'
+    assert not platform_render.sprite_occluded(None, 500, 30, 320, 380, 200.0, 1000)
+
+    # draw_sprite_clipped restores covered pixels (opaque slab)
+    screen = pygame.Surface((1000, 500))
+    screen.fill((10, 20, 30))
+    rect = (490, 250, 20, 130)
+    def _draw():
+        pygame.draw.rect(screen, (200, 0, 0), rect)
+    platform_render.draw_sprite_clipped(screen, occ, rect, 200.0, _draw, 1000)
+    # covered area (y 300-380) should keep background, uncovered (250-300) red
+    assert screen.get_at((500, 260))[:3] == (200, 0, 0)
+    assert screen.get_at((500, 350))[:3] == (10, 20, 30)
     print("  sprite occlusion  OK")
 
 
@@ -656,6 +704,91 @@ def test_bridge_seam():
     print("  bridge seam       OK")
 
 
+def test_plate_seam_does_not_own_column():
+    """A slab-to-slab seam must not feed the base pass' z-buffer (bug 1)."""
+    from engine import platform_render
+    from engine.bsp import _floating_lines
+    from smoke_sector_model import make_plate_bridge
+
+    sm = make_plate_bridge()
+    seam = next(li for li, ld in enumerate(sm.linedefs)
+                if {sm.sidedefs[s].sector for s in (ld.front, ld.back) if s >= 0}
+                == {1, 2})
+    assert seam in _floating_lines(sm), "the seam is overlay geometry"
+    assert _scene(sm).floating_line[seam], "the scene must skip it too"
+
+    seen = {}
+    real = platform_render.draw_platforms
+
+    def spy(frame, scene, px, py, pa, eye, F, hc, iw, ih, *a, **kw):
+        # draw_platforms(..., iw_f, ih_f, fwidths, clip_top, clip_bot,
+        #                view_buf, ...)
+        seen["view_buf"] = list(a[5])
+        seen["iw"] = iw
+        return real(frame, scene, px, py, pa, eye, F, hc, iw, ih, *a, **kw)
+
+    platform_render.draw_platforms = spy
+    try:
+        _render(sm, px=64.0, py=256.0, pa=0.0, player_z=0)
+    finally:
+        platform_render.draw_platforms = real
+
+    # The seam is at world x=256, 192 px ahead of the camera.  The old
+    # base-pass wall claimed the column there and cut the far plate at the
+    # seam; with the fix the nearest owner is the host's far wall (448 px).
+    col = int(500 * seen["iw"] / const.W)
+    vb = seen["view_buf"][col]
+    assert vb > 192.0 + 1.0, (vb, "the seam must not own the column")
+
+    sc = gs.sec_scene
+    polys = sc.sm._ensure_polys()
+    far = platform_render._ray_intervals(
+        polys[2], 64.0, 256.0, 1.0, 0.0, vb)
+    assert far and far[-1][1] > 192.0 + 1.0, (far, "far plate is cut at seam")
+    print("  plate seam depth  OK")
+
+
+def test_plate_before_far_portal():
+    """A plate in front of a low-ceiling room must not inherit its clip (bug 2)."""
+    from engine import platform_render
+
+    sm = _slab_map_with_back_room(ceil=64)
+    _render(sm, px=128.0, py=256.0, player_z=0)
+    rows = [_sig(_px(500, y)) for y in (260, 280, 300)]
+    assert all(r == "gb" for r in rows), (rows, [_px(500, y) for y in (260, 280, 300)])
+
+    # Teeth: restore the old rule (always apply the final clips) and the very
+    # same rows must lose the plate; otherwise the assertion above is vacuous.
+    real = platform_render._clip_at
+    platform_render._clip_at = lambda col, t, ct, cb, clip_hist, ih: (ct[col], cb[col])
+    try:
+        _render(sm, px=128.0, py=256.0, player_z=0)
+        old = [_sig(_px(500, y)) for y in (260, 280, 300)]
+    finally:
+        platform_render._clip_at = real
+    assert any(r != "gb" for r in old), (old, "the regression is not reproduced")
+    print("  plate before room OK")
+
+
+def test_clip_depth_rule():
+    from engine.platform_render import _clip_at
+
+    ct, cb = [12.0], [200.0]
+    # No history (legacy caller): the final clips are all there is.
+    assert _clip_at(0, 50.0, ct, cb, None, 350) == (12.0, 200.0)
+    # A portal in front of the surface: its snapshot applies.
+    assert _clip_at(0, 50.0, ct, cb, [[(20.0, 12.0, 200.0)]], 350) == (12.0, 200.0)
+    # A portal behind the surface: the column is fully open.
+    assert _clip_at(0, 50.0, ct, cb, [[(80.0, 12.0, 200.0)]], 350) == (0.0, 350.0)
+    # Two doorways around a plate: the near snapshot wins for the plate, and
+    # the far one still applies to geometry beyond it.  Remembering only the
+    # last portal depth would lose the near doorway here.
+    hist = [[(20.0, 12.0, 200.0), (80.0, 30.0, 180.0)]]
+    assert _clip_at(0, 50.0, ct, cb, hist, 350) == (12.0, 200.0)
+    assert _clip_at(0, 100.0, ct, cb, hist, 350) == (30.0, 180.0)
+    print("  clip depth rule   OK")
+
+
 def main():
     _init()
     test_scene_marks_slab()
@@ -669,6 +802,9 @@ def main():
     test_near_wall_keeps_column()
     test_two_plates_depth_order()
     test_bridge_seam()
+    test_plate_seam_does_not_own_column()
+    test_plate_before_far_portal()
+    test_clip_depth_rule()
     test_player_z_raises_camera()
     test_floor_z_moves_only_vertical()
     test_sprite_occlusion_rules()

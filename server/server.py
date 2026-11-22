@@ -14,12 +14,15 @@ from shared.map_data import GameMap
 from shared.sector_map import MAP_FORMAT_SECTOR, SectorMap
 from shared.releases import ReleaseStore, is_newer
 from shared.version import CLIENT_VERSION, PROTOCOL_VERSION
-from shared.combat import normalize_angle, fire_reason_code
+from shared.combat import (
+    DEFAULT_TICK_RATE, fire_reason_code, normalize_angle,
+    tick_interval, validate_tick_rate,
+)
 from shared.protocol import INPUT_FLAG_DASH, INPUT_FLAG_USE
 from server.game_world import GameWorld
 from server.game_data import (
-    MOVE_SPEED_PX, TICK_RATE, TICK_INTERVAL, TICK_DRAIN_MAX,
-    DASH_SPEED_MULT, DASH_TICKS, DASH_COOLDOWN_TICKS, HASTE_SPEED_MULT,
+    MOVE_SPEED_PX, TICK_DRAIN_MAX,
+    DASH_SPEED_MULT, HASTE_SPEED_MULT,
 )
 from server.lobby import Lobby, Party
 from server.network import ServerNetwork
@@ -48,8 +51,17 @@ MAX_PARTY_MEMBERS = 16
 
 
 class GameServer:
-    def __init__(self, host: str = "0.0.0.0", port: int = 7777, releases_dir: str | None = None):
-        self.lobby = Lobby()
+    # Class defaults keep lightweight test doubles made with ``object.__new__``
+    # (and any external embedding that bypasses __init__) on the default rate.
+    tick_rate: int = DEFAULT_TICK_RATE
+    tick_interval: float = 1.0 / DEFAULT_TICK_RATE
+
+    def __init__(self, host: str = "0.0.0.0", port: int = 7777,
+                 releases_dir: str | None = None,
+                 tick_rate: int = DEFAULT_TICK_RATE):
+        self.tick_rate = validate_tick_rate(tick_rate)
+        self.tick_interval = tick_interval(self.tick_rate)
+        self.lobby = Lobby(tick_rate=self.tick_rate)
         self.network = ServerNetwork(host, port)
         if releases_dir is None:
             releases_dir = os.environ.get(
@@ -81,7 +93,7 @@ class GameServer:
         self.network.on_respawn(self._on_player_respawn)
 
         await self.network.start()
-        logger.info(f"Game server started, tick rate: {TICK_RATE}")
+        logger.info(f"Game server started, tick rate: {self.tick_rate}")
 
         await self._game_loop()
 
@@ -92,7 +104,7 @@ class GameServer:
         #
         # 1. `await asyncio.sleep` on Windows quantizes to the system clock tick
         #    (~15.6 ms): sleep(0.05) returns after ~63 ms, not 50. A poll loop
-        #    that re-checks `dt >= TICK_INTERVAL` every 1 ms therefore measures
+        #    that re-checks `dt >= self.tick_interval` every 1 ms therefore measures
         #    a steady 62.5 ms period — 15.8 tps instead of 20, and sleeping
         #    "the right amount" does not help either, it rounds up just the
         #    same.
@@ -100,8 +112,8 @@ class GameServer:
         #    shortfall never compensated: every tick permanently dropped the
         #    ~12.5 ms it woke up late. Fixing only the sleep is not enough.
         #
-        # Why a 21 % slow tick rate breaks firing specifically: TICK_RATE is
-        # what `wpn_cooldown_ticks` converts weapon fire rates with, on BOTH
+        # Why a 21 % slow tick rate breaks firing specifically: the configured
+        # tick rate is what `wpn_cooldown_ticks` converts fire rates with, on BOTH
         # sides of the wire, so the client's fire gate is measured in nominal
         # ticks while the server drains them in real ones. At 15.8 tps a 5-tick
         # pistol cooldown takes 0.32 s of wall time while the gate stays 0.30 s,
@@ -117,8 +129,8 @@ class GameServer:
         while self.running:
             now = time.monotonic()
             ticks = 0
-            while now - deadline >= TICK_INTERVAL:
-                deadline += TICK_INTERVAL
+            while now - deadline >= self.tick_interval:
+                deadline += self.tick_interval
                 # One bad tick must not end the server: an exception here used
                 # to escape `_game_loop`, stop `while self.running` and kill the
                 # process for every connected player.  Simulation and broadcast
@@ -141,14 +153,14 @@ class GameServer:
                 self.network.tick()
             except Exception:
                 logger.exception("Network tick failed; server continues")
-            # Следующий тик наступает в `deadline + TICK_INTERVAL`: на выходе
-            # цикла инвариант `deadline <= now < deadline + TICK_INTERVAL`.
+            # Следующий тик наступает в `deadline + self.tick_interval`: на выходе
+            # цикла инвариант `deadline <= now < deadline + self.tick_interval`.
             # Сон по одному `deadline - now` всегда <= 0 после пробуждения с
             # опозданием меньше тика (а опоздание до тика — норма: asyncio на
             # Windows квантует вверх до ~15.6 мс), и `sleep(0)` превращался в
             # карусель, которая жрала целое ядро между тиками. Тайп от этого
             # не страдал (дедлайн двигался верно), ядро — страдало.
-            left = deadline + TICK_INTERVAL - time.monotonic()
+            left = deadline + self.tick_interval - time.monotonic()
             await asyncio.sleep(left if left > 0.0 else 0.0)
 
     def _broadcast_parties(self) -> None:
@@ -237,6 +249,7 @@ class GameServer:
             update_version=update_version,
             update_size=update_size,
             update_sha256=update_sha256,
+            tick_rate=self.tick_rate,
         )
         if accepted:
             logger.info(
@@ -413,7 +426,8 @@ class GameServer:
             session.last_fire_result = FireResult(False, 'noop', 0)
             return
         apply_weapon_switch(party.world, entity_id, weapon_id)
-        result = weapons_handle_shoot(party.world, entity_id)
+        result = weapons_handle_shoot(
+            party.world, entity_id, tick_rate=party.world.tick_rate)
         if result.fired:
             session.last_fire_seq = fire_seq
         session.last_fire_decided = fire_seq
@@ -472,15 +486,15 @@ class GameServer:
             # a single press keeps dashing for the whole DASH_TICKS window.
             if (flags & INPUT_FLAG_DASH) and (move_x or move_y) \
                     and dash.cooldown <= 0:
-                dash.ticks = DASH_TICKS
-                dash.cooldown = DASH_COOLDOWN_TICKS
+                dash.ticks = world.dash_ticks
+                dash.cooldown = world.dash_cooldown_ticks
             if dash.ticks > 0:
                 dashing = True
 
         if vel:
             cos_a = math.cos(rot.angle)
             sin_a = math.sin(rot.angle)
-            spd = MOVE_SPEED_PX * TICK_INTERVAL
+            spd = MOVE_SPEED_PX * self.tick_interval
             # HASTE and the dash are alternatives, not multipliers of each other:
             # a dash is already DASH_SPEED_MULT (6x), and stacking the buff on
             # top would make it a 9x movement button that trivialises the map

@@ -99,6 +99,6 @@ class PauseScreen:
             )
 
         hint = self.small_font.render(
-            "↑/↓ — выбор | Enter — выбрать | Esc — продолжить", True, MUTED
+            "Стрелки вверх/вниз — выбор | Enter — выбрать | Esc — продолжить", True, MUTED
         )
         surface.blit(hint, ((self.width - hint.get_width()) // 2, self._hint_y))

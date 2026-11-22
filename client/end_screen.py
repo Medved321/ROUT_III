@@ -2,11 +2,13 @@
 
 Two screens share one layout because they are the same kind of thing: a big
 title, a block of results for the local player and a single action.  Death
-offers "Возродиться"; victory offers "В меню".  Everything is laid out on the
-fixed 1000x700 menu canvas -- the same surface ``client/pause_screen.py`` uses --
-so the boxes drawn here are exactly the boxes hit-tested by ``handle``, and the
-caller's ``Renderer.to_canvas_pos`` mapping keeps a click at any window size
-landing where the player pointed.
+offers "Возродиться"; victory offers "В меню".  A networked PvE victory adds a
+roster on the left: arrow keys or a click pick a teammate, and the block on the
+right shows that player's authoritative counters.  Everything is laid out on
+the fixed 1000x700 menu canvas -- the same surface ``client/pause_screen.py``
+uses -- so the boxes drawn here are exactly the boxes hit-tested by ``handle``,
+and the caller's ``Renderer.to_canvas_pos`` mapping keeps a click at any window
+size landing where the player pointed.
 """
 from __future__ import annotations
 
@@ -25,6 +27,12 @@ BTN_H, BTN_GAP, BTN_PAD = 52, 14, 18
 BTN_MIN_W = 260
 ROW_H = 30
 
+# Roster geometry lives next to the hitboxes it feeds: the rectangles built
+# here are the ones ``handle`` tests, so a row cannot drift away from its paint.
+ROSTER_X, ROSTER_W, ROSTER_TOP = 72, 350, 168
+ROSTER_PAGE_ROWS = 11
+STATS_X, STATS_VALUE_W = 470, 400
+
 
 class EndScreen:
     """One overlay, two faces: pass a model to ``set_model`` each frame."""
@@ -35,6 +43,9 @@ class EndScreen:
         self._selected = 0
         self.model: dict | None = None
         self.buttons: list[pygame.Rect] = []
+        self._roster_selected = 0
+        self._roster_key: tuple | None = None
+        self._roster_rects: list[pygame.Rect] = []
 
         self.title_font = pygame.font.SysFont("monospace", 56, bold=True)
         self.font = pygame.font.SysFont("monospace", 22, bold=True)
@@ -47,6 +58,30 @@ class EndScreen:
     def set_model(self, model: dict) -> None:
         self.model = model
         self.buttons = self._build_buttons(model.get("buttons", []))
+        self._sync_roster(model.get("roster") or [])
+
+    def reset_roster(self) -> None:
+        """Forget the previous match's cursor before the next overlay opens."""
+        self._roster_selected = 0
+        self._roster_key = None
+        self._roster_rects = []
+
+    def _sync_roster(self, roster: list[dict]) -> None:
+        if not roster:
+            self.reset_roster()
+            return
+        key = tuple((e.get("id"), e.get("name")) for e in roster)
+        if key != self._roster_key:
+            self._roster_key = key
+            chosen = next((i for i, e in enumerate(roster) if e.get("local")), 0)
+            self._roster_selected = chosen
+        self._roster_selected %= len(roster)
+        page = self._roster_selected // ROSTER_PAGE_ROWS
+        start = page * ROSTER_PAGE_ROWS
+        self._roster_rects = [
+            pygame.Rect(ROSTER_X, ROSTER_TOP + i * ROW_H, ROSTER_W, ROW_H - 2)
+            for i in range(min(ROSTER_PAGE_ROWS, len(roster) - start))
+        ]
 
     def _build_buttons(self, buttons: list[tuple[str, str]]) -> list[pygame.Rect]:
         if not buttons:
@@ -63,11 +98,25 @@ class EndScreen:
         return rects
 
     # ── input ────────────────────────────────────────────────────────
+    def _move_roster(self, step: int) -> None:
+        roster = (self.model or {}).get("roster") or []
+        if roster:
+            self._roster_selected = (self._roster_selected + step) % len(roster)
+            # The visible page is derived from the cursor, so moving across a
+            # page boundary must rebuild the same rectangles that are painted.
+            self._sync_roster(roster)
+
     def handle(self, events) -> str | None:
         buttons = self.model.get("buttons", []) if self.model else []
         primary = self.model.get("primary") if self.model else None
+        roster = (self.model or {}).get("roster") or []
         for event in events:
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for i, rect in enumerate(self._roster_rects):
+                    if rect.collidepoint(event.pos):
+                        page = self._roster_selected // ROSTER_PAGE_ROWS
+                        self._roster_selected = page * ROSTER_PAGE_ROWS + i
+                        return None
                 for i, rect in enumerate(self.buttons):
                     if rect.collidepoint(event.pos):
                         self._selected = i
@@ -81,6 +130,9 @@ class EndScreen:
                     return primary
                 if event.key == pygame.K_ESCAPE and self.model.get("escapable"):
                     return "leave"
+                if roster and event.key in (pygame.K_LEFT, pygame.K_RIGHT):
+                    self._move_roster(1 if event.key == pygame.K_RIGHT else -1)
+                    continue
                 if event.key == pygame.K_UP:
                     self._selected = (self._selected - 1) % max(1, len(buttons))
                 elif event.key == pygame.K_DOWN:
@@ -107,9 +159,20 @@ class EndScreen:
             surface.blit(sub, ((self.width - sub.get_width()) // 2, y))
             y += ROW_H + 16
 
-        y = self._draw_stats(surface, y)
-        y = self._draw_table(surface, y)
+        roster = self.model.get("roster") or []
+        if roster:
+            self._draw_roster(surface, roster, accent)
+        else:
+            y = self._draw_stats(surface, y)
+            y = self._draw_table(surface, y)
+        self._draw_buttons(surface, accent)
 
+        hint = self.model.get("hint", "Enter — выбрать")
+        hint_s = self.small_font.render(hint, True, MUTED)
+        surface.blit(hint_s, ((self.width - hint_s.get_width()) // 2,
+                              self.height - 28))
+
+    def _draw_buttons(self, surface, accent) -> None:
         for i, ((_, label), rect) in enumerate(
                 zip(self.model.get("buttons", []), self.buttons)):
             selected = i == self._selected
@@ -122,17 +185,52 @@ class EndScreen:
             surface.blit(txt, (rect.centerx - txt.get_width() // 2,
                                rect.centery - txt.get_height() // 2))
 
-        hint = self.model.get("hint", "Enter — выбрать")
-        hint_s = self.small_font.render(hint, True, MUTED)
-        surface.blit(hint_s, ((self.width - hint_s.get_width()) // 2,
-                              self.height - 28))
+    def _draw_roster(self, surface, roster: list[dict], accent) -> None:
+        page = self._roster_selected // ROSTER_PAGE_ROWS
+        start = page * ROSTER_PAGE_ROWS
+        shown = roster[start:start + ROSTER_PAGE_ROWS]
+        pygame.draw.rect(
+            surface, PANEL,
+            pygame.Rect(ROSTER_X - 6, ROSTER_TOP - 6,
+                        ROSTER_W + 12, len(shown) * ROW_H + 12),
+            border_radius=8)
+        for i, (entry, rect) in enumerate(zip(shown, self._roster_rects)):
+            index = start + i
+            selected = index == self._roster_selected
+            pygame.draw.rect(surface, SELECT if selected else PANEL, rect,
+                             border_radius=4)
+            label = ellipsize(entry.get("name", ""), self.small_font,
+                              ROSTER_W - 2 * BTN_PAD)
+            col = GOOD if selected else TEXT
+            txt = self.small_font.render(label, True, col)
+            surface.blit(txt, (rect.x + BTN_PAD,
+                               rect.y + (rect.height - txt.get_height()) // 2))
 
-    def _draw_stats(self, surface, y: int) -> int:
+        count = f"Игрок {self._roster_selected + 1} из {len(roster)}"
+        txt = self.small_font.render(count, True, MUTED)
+        surface.blit(txt, (ROSTER_X, ROSTER_TOP + len(shown) * ROW_H + 10))
+
+        current = roster[self._roster_selected]
+        head = self.font.render(
+            ellipsize(current.get("name", ""), self.font, STATS_VALUE_W),
+            True, accent)
+        surface.blit(head, (STATS_X, ROSTER_TOP))
+        self._draw_stats(surface, ROSTER_TOP + ROW_H + 10,
+                         label_x=STATS_X, value_x=STATS_X + STATS_VALUE_W)
+
+    def _draw_stats(self, surface, y: int,
+                    label_x: int | None = None,
+                    value_x: int | None = None) -> int:
         stats = self.model.get("stats", [])
+        if label_x is None:
+            label_x = self.width // 2 - 190
+        if value_x is None:
+            value_x = self.width // 2 + 190
+        roster = self.model.get("roster") or []
+        if roster:
+            stats = roster[self._roster_selected].get("stats", [])
         if not stats:
             return y
-        label_x = self.width // 2 - 190
-        value_x = self.width // 2 + 190
         for label, value in stats:
             lt = self.small_font.render(label, True, MUTED)
             vt = self.small_font.render(str(value), True, TEXT)

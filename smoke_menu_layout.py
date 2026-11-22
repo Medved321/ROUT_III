@@ -29,16 +29,18 @@ pygame.init()
 surface = pygame.display.set_mode((1000, 700))
 
 import client.settings as settings_mod
+from client import map_library
 from client.client import GameClient
 from client.connect_screen import ConnectScreen
-from client.editor_screen import MapEditorScreen
-from client.lobby_screen import LobbyScreen
+from client.lobby_screen import BTN_GAP, NO_MAP, LobbyScreen, ROW_H, TRACTOR_HINTS
 from client.pause_screen import PauseScreen
 from client.end_screen import EndScreen
 from client.renderer import SCREEN_HEIGHT, SCREEN_WIDTH, Renderer
 from client.sector_editor_screen import SectorEditorScreen
 from client.settings import DEFAULTS, Settings, format_value
-from client.settings_screen import CUSTOM_ROW_KEY, SPEC, SettingsScreen
+from client.settings_screen import (
+    CUSTOM_ROW_KEY, REFRESH_LABEL, SPEC, SettingsScreen,
+)
 from client.ui_layout import ellipsize
 
 CANVAS = pygame.Rect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)
@@ -47,10 +49,9 @@ BTN_PAD = 10
 
 tmpdir = tempfile.mkdtemp()
 settings_mod.CONFIG_PATH = os.path.join(tmpdir, "config.json")
-import client.editor_screen as editor_mod
 import client.sector_editor_screen as sector_mod
-editor_mod.MAPS_DIR = os.path.join(tmpdir, "maps")
 sector_mod.MAPS_DIR = os.path.join(tmpdir, "maps")
+map_library.MAPS_DIR = sector_mod.MAPS_DIR
 
 failures: list[str] = []
 
@@ -95,7 +96,7 @@ def elements(name: str, screen) -> list[tuple[str, pygame.Rect]]:
             ("name", screen.name_box), ("connect", screen.connect_btn),
         ]
     if isinstance(screen, LobbyScreen):
-        return [("name", screen.name_box)] + [
+        return [("name", screen.name_box), ("maps", screen.map_btn)] + [
             (k, r) for k, r in screen.buttons.items()
         ]
     if isinstance(screen, PauseScreen):
@@ -103,19 +104,19 @@ def elements(name: str, screen) -> list[tuple[str, pygame.Rect]]:
     if isinstance(screen, EndScreen):
         buttons = (screen.model or {}).get("buttons", [])
         return [(a, r) for (a, _), r in zip(buttons, screen.buttons)]
-    if isinstance(screen, MapEditorScreen):
-        out = [("name", screen.name_box)]
-        return out + [(k, r) for k, r in screen.buttons.items()]
     if isinstance(screen, SectorEditorScreen):
         out = [("name", screen.name_box), ("map_list", screen.map_list_btn)]
         return out + [(k, r) for k, r in screen.buttons.items()]
     if isinstance(screen, SettingsScreen):
-        return [
+        out = [
             ("back", screen.back_btn),
             ("field_label", screen._field_label_rect),
             ("field", screen._field_rect),
             ("error", screen._error_rect),
         ]
+        if screen.refresh_enabled:
+            out.append(("refresh", screen.refresh_btn))
+        return out
     raise AssertionError(f"unknown screen {name}")
 
 
@@ -136,14 +137,13 @@ def button_labels(screen) -> list[tuple[str, str, pygame.Rect]]:
         for (key, label), r in zip((screen.model or {}).get("buttons", []),
                                    screen.buttons):
             out.append((key, label, r))
-    elif isinstance(screen, MapEditorScreen):
-        for k, r in screen.buttons.items():
-            out.append((k, screen._button_labels()[k], r))
     elif isinstance(screen, SectorEditorScreen):
         for k, r in screen.buttons.items():
             out.append((k, screen._button_labels()[k], r))
     elif isinstance(screen, SettingsScreen):
         out.append(("back", "Назад [Esc]", screen.back_btn))
+        if screen.refresh_enabled:
+            out.append(("refresh", REFRESH_LABEL, screen.refresh_btn))
     return out
 
 
@@ -198,10 +198,6 @@ _end.set_model({
 })
 SCREENS.append(("end_victory", _end))
 
-_editor = MapEditorScreen(SCREEN_WIDTH, SCREEN_HEIGHT)
-_editor.map_name = "m" * 60
-SCREENS.append(("editor", _editor))
-
 _sector = SectorEditorScreen(SCREEN_WIDTH, SCREEN_HEIGHT)
 _sector.map_name = "m" * 60
 _sector._map_files = ["очень-длинное-имя-файла.mts" * 2] * 4
@@ -216,6 +212,78 @@ for name, screen in SCREENS:
     screen.draw(surface, settings) if name == "settings" else screen.draw(surface)
     check_geometry(name, screen)
 print("geometry: no overlaps, everything inside the canvas, labels fit")
+
+# The lobby used to paint status, custom map and control hints on one bottom
+# line, each measuring a different slice of it. The three bands are geometry,
+# not formatting: they must sit below the buttons and never share a pixel.
+_lobby_bands = _lobby.bottom_bands()
+check(set(_lobby_bands) == {"status", "map", "hints"},
+      f"lobby: wrong bottom bands {set(_lobby_bands)}")
+for _key, _rect in _lobby_bands.items():
+    check(CANVAS.contains(_rect),
+          f"lobby: band {_key} {_rect} leaves the canvas")
+    check(_rect.y >= _lobby._button_bottom,
+          f"lobby: band {_key} {_rect} runs over the buttons "
+          f"(bottom {_lobby._button_bottom})")
+    check(_rect.height == _lobby.small_font.get_height(),
+          f"lobby: band {_key} was not measured from the font")
+_names = list(_lobby_bands)
+for _i, _an in enumerate(_names):
+    for _bn in _names[_i + 1:]:
+        check(not _lobby_bands[_an].colliderect(_lobby_bands[_bn]),
+              f"lobby: bands {_an} and {_bn} overlap")
+check(_lobby_bands["hints"].y >= _lobby_bands["status"].bottom,
+      "lobby: hints band is not below the status row")
+_map_text = (f"Карта: {_lobby.custom_map_label} "
+             "(при создании партии) [C — сброс]")
+_map_text_w = _lobby_bands["map"].width - _lobby.map_btn.width - BTN_GAP
+check(_lobby_bands["map"].contains(_lobby.map_btn) or
+      _lobby.map_btn.y < _lobby_bands["map"].y,
+      "lobby: picker button left its map band")
+for _key, _text, _width in (("status", _lobby.status,
+                             _lobby_bands["status"].width),
+                            ("map", _map_text, _map_text_w),
+                            ("hints", TRACTOR_HINTS,
+                             _lobby_bands["hints"].width)):
+    _font = _lobby.small_font
+    _shown = ellipsize(_text, _font, _width)
+    check(_font.size(_shown)[0] <= _width,
+          f"lobby: {_key} text {_text!r} does not fit its band")
+print("lobby: status, map and hints hold separate bands below the buttons")
+
+# The mode badge used to be painted at the same y as the player nicknames, so
+# "PvP" sat on top of a long nickname. Every text in a row now owns a band.
+_lobby_rows = LobbyScreen(SCREEN_WIDTH, SCREEN_HEIGHT, "Player", "localhost:7777")
+_party = {"id": 7, "name": "длинное имя партии " * 3, "mode": "pvp",
+          "players": [{"name": "очень-длинный-ник-" * 2}, {"name": "Player"}]}
+_lobby_rows.set_state([_party], "")
+_row = pygame.Rect(_lobby_rows.list_area.x + 4,
+                   _lobby_rows.list_area.top + 4,
+                   _lobby_rows.list_area.width - 8, ROW_H - 4)
+_row_bands = _lobby_rows.party_row_bands(_row, _party)
+check(set(_row_bands) == {"name", "count", "mode", "players"},
+      f"lobby: wrong party row bands {set(_row_bands)}")
+for _key, _rect in _row_bands.items():
+    check(_row.contains(_rect), f"lobby: party {_key} band {_rect} leaves its row")
+_band_names = list(_row_bands)
+for _i, _an in enumerate(_band_names):
+    for _bn in _band_names[_i + 1:]:
+        check(not _row_bands[_an].colliderect(_row_bands[_bn]),
+              f"lobby: party {_an} overlaps {_bn}")
+for _key, _text, _font in (
+        ("name", _party["name"], _lobby_rows.font),
+        ("count", f"{len(_party['players'])} игрок(а)", _lobby_rows.small_font),
+        ("mode", "PvP", _lobby_rows.small_font),
+        ("players", ", ".join(p["name"] for p in _party["players"]),
+         _lobby_rows.small_font)):
+    _shown = ellipsize(_text, _font, _row_bands[_key].width)
+    check(_font.size(_shown)[0] <= _row_bands[_key].width,
+          f"lobby: party {_key} text {_text!r} does not fit its band")
+_lobby_rows.draw(surface)
+_lobby_rows.handle([pygame.event.Event(pygame.MOUSEBUTTONDOWN,
+                                       button=1, pos=_row.center)])
+check(_lobby_rows._selected == 0, "lobby: party row is no longer clickable")
+print("lobby: party badge and nicknames hold separate bands")
 
 # A settings row used to draw an empty panel with a pair of arrows: the caption
 # band was measured from the value band's left edge, which already sat at the
@@ -270,6 +338,26 @@ for i, (rn, rr) in enumerate(_rows):
 check(_map_rows := _dropdown._map_dropdown_geometry()[1] == _rows,
       "sector_editor: dropdown geometry is not stable between calls")
 print("map dropdown: rows fit, do not overlap, geometry is stable")
+
+# The lobby's picker is an upward overlay in the map band. Its rows share one
+# geometry with the hit-test, and a click on a row's visual centre must pick
+# that row at every window size -- including 4K, where the canvas is scaled.
+_lobby_maps = LobbyScreen(SCREEN_WIDTH, SCREEN_HEIGHT, "Player", "localhost:7777")
+_lobby_maps._map_names = ["карта-%02d" % i for i in range(30)]
+_lobby_maps._map_list_open = True
+_mbox, _mrows, _mmore, _mhidden = _lobby_maps._map_dropdown_geometry()
+check(CANVAS.contains(_mbox), f"lobby: map list {_mbox} leaves the canvas")
+check(_mmore is not None and _mhidden > 0,
+      "lobby: an overflowing map list must show the «…ещё N» row")
+for _i, (_mn, _mr) in enumerate(_mrows):
+    check(CANVAS.contains(_mr), f"lobby: map row {_mn} {_mr} leaves the canvas")
+    check(not _mr.colliderect(_lobby_maps.map_btn),
+          f"lobby: map row {_mn} covers the picker button")
+    for _on, _or in _mrows[_i + 1:]:
+        check(not _mr.colliderect(_or),
+              f"lobby: map rows {_mn}/{_on} overlap")
+check(_lobby_maps._map_dropdown_geometry()[1] == _mrows,
+      "lobby: map dropdown geometry is not stable between calls")
 
 # Black bars: a point outside the letterboxed canvas must activate nothing.
 for size in WINDOW_SIZES:
@@ -328,7 +416,8 @@ def expected_action(name: str, key: str) -> object:
     return {
         "connect": "connect", "create": "create", "refresh": "refresh",
         "editor": "editor", "settings": "settings", "quit": "quit",
-        "back": "back", "play": "play", "sector_mode": "sector",
+        "maps": None,  # toggles the dropdown, no client action
+        "back": "back", "play": "play",
         "host": None, "port": None, "name": None, "map_list": None,
         "size_minus": None, "size_plus": None, "new": None, "clear": None,
         "save": None, "load": None, "snap": None, "undo": None,
@@ -336,8 +425,6 @@ def expected_action(name: str, key: str) -> object:
         # "walls" flips the create-time boundary policy and redraws itself.
         "walls": None,
         "field_label": None, "field": None, "error": None,
-        # "mode" switches the sector editor back to the tile editor.
-        "mode": "tile",
         # End-screen buttons: only "В МЕНЮ" is drawn here, so only that action
         # is reachable by a centre click.
         "leave": "leave",
@@ -348,7 +435,6 @@ SKIP_CENTRES = {
     # "Создать" both hits its own box and leaves the party list; the party-list
     # rows are checked separately below.
     "lobby": set(),
-    "editor": {"name"},
 }
 
 for size in WINDOW_SIZES:
@@ -359,6 +445,10 @@ for size in WINDOW_SIZES:
         for key, rect in elements(name, screen):
             if key in SKIP_CENTRES.get(name, set()):
                 continue
+            if name == "lobby":
+                # Each centre click is independent: an open map list from the
+                # previous element would swallow this one as "click outside".
+                screen._map_list_open = False
             if name == "pause":
                 expected = dict(
                     (f"option{i}", opt[0]) for i, opt in enumerate(
@@ -370,6 +460,27 @@ for size in WINDOW_SIZES:
             if err:
                 failures.append(f"{name}: {err}")
 print(f"hit-testing: every element activates at its visual centre, {WINDOW_SIZES}")
+
+# The lobby picker is an overlay: its rows must be clickable at their own
+# visual centre through the real window→canvas mapping, at every window size.
+for size in WINDOW_SIZES:
+    _lobby_maps._map_scroll = 0
+    _box, _mrows, _mmore, _mhidden = _lobby_maps._map_dropdown_geometry()
+    for _mn, _mr in (_mrows[0], _mrows[1]):
+        _want = ("clear_map" if _mn == NO_MAP else f"map:{_mn}")
+        _lobby_maps._map_list_open = True
+        _err = centre_click(_lobby_maps, _mr, size, _want)
+        check(_err is None, f"lobby map row: {_err}")
+    _lobby_maps._map_scroll = 0
+    _lobby_maps._map_list_open = True
+    _err = centre_click(_lobby_maps, _mmore, size, None)
+    check(_err is None, f"lobby «ещё» row: {_err}")
+    check(_lobby_maps._map_list_open, "lobby: «ещё» must keep the list open")
+    _before = _lobby_maps._map_scroll
+    check(_lobby_maps.handle([pygame.event.Event(pygame.MOUSEWHEEL, y=-1)]) is None
+          and _lobby_maps._map_scroll > _before,
+          f"lobby: wheel did not scroll the map list at {size}")
+print("lobby map picker: rows and «ещё» hit at their centres, wheel scrolls")
 
 # The pause overlay in particular must not drift: each option has its own
 # action, so a shifted overlay would hit the neighbour.

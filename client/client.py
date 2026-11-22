@@ -12,8 +12,8 @@ import pygame
 from shared.map_data import GameMap
 from shared.sector_map import MAP_FORMAT_SECTOR, SectorMap
 from shared.combat import (
-    wpn_cooldown_ticks, TICK_INTERVAL, FPS_60, TAU, normalize_angle,
-    FIRE_REASON_CODES, USE_REASON_LOCKED)
+    wpn_cooldown_ticks, FPS_60, TAU, fps60_per_tick, normalize_angle,
+    tick_interval, FIRE_REASON_CODES, USE_REASON_LOCKED)
 from shared.protocol import INPUT_FLAG_DASH, INPUT_FLAG_USE
 from client.raycaster import SCREEN_WIDTH, SCREEN_HEIGHT
 from client.renderer import Renderer
@@ -22,13 +22,13 @@ from client.input_handler import InputHandler, FINGERDOWN, FINGERMOTION, FINGERU
 from client.network_client import NetworkClient
 from client.assets import AssetManager
 from client.lobby_screen import LobbyScreen
+from client.map_library import MapSelection, load as load_map
 from client.connect_screen import ConnectScreen
 from client.settings import (
     Settings, control_hints, save_server_settings, size_text)
 from client.settings_screen import SettingsScreen
 from client.pause_screen import PauseScreen
 from client.end_screen import EndScreen
-from client.editor_screen import MapEditorScreen
 from engine.constants import WPN, INPUT_SEND_INTERVAL
 from client.performance import AdaptiveQuality, input_send_loop
 from client.mobile import UPDATER_ENABLED
@@ -71,7 +71,16 @@ class GameClient:
         self.player_name = player_name
 
         self.network = NetworkClient(host, port)
-        self.renderer = Renderer()
+        # The display must be BORN at the saved size. The old order created a
+        # default-sized window in ``Renderer()`` and only resized it later in
+        # ``_apply_window``: a saved full-screen preset therefore flashed a
+        # small window at every start, and on drivers that ignore a second
+        # ``set_mode`` it stayed small. Settings have no dependency on the
+        # renderer, so load them first and hand their size to the constructor.
+        self.settings = Settings()
+        self.settings.load()
+        initial_size = self.settings.resolution() or (SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.renderer = Renderer(size=initial_size)
         self.renderer.on_resize = self._on_window_resized
         self.input_handler = InputHandler()
         self.assets = AssetManager()
@@ -81,15 +90,11 @@ class GameClient:
         self.lobby_screen = LobbyScreen(
             SCREEN_WIDTH, SCREEN_HEIGHT, player_name, f"{host}:{port}"
         )
-        self.settings = Settings()
-        self.settings.load()
         self.settings_screen = SettingsScreen(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.pause_screen = PauseScreen(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.end_screen = EndScreen(SCREEN_WIDTH, SCREEN_HEIGHT)
-        self.editor_screen = MapEditorScreen(SCREEN_WIDTH, SCREEN_HEIGHT)
         from client.sector_editor_screen import SectorEditorScreen
         self.sector_editor_screen = SectorEditorScreen(SCREEN_WIDTH, SCREEN_HEIGHT)
-        self._editor_kind = "tile"  # 'tile' | 'sector'
         # The resize callback touches ``bridge``, so it must exist before the
         # first ``set_window_size``.
         self.bridge: RenderBridge | None = None
@@ -117,9 +122,9 @@ class GameClient:
         self._paused = False
         self.game_map: GameMap | None = None
         self.sector_map: SectorMap | None = None
-        self.custom_map: GameMap | None = None
-        self.custom_sector_map: SectorMap | None = None
-        self.custom_map_name: str | None = None
+        # One owner of the map for a party we create: a name plus the validated
+        # .mt1 bytes captured at selection time. Session-only, never in config.
+        self.map_selection: MapSelection | None = None
 
         self.player_id: int | None = None
         self.local_x: float = 96.0
@@ -410,10 +415,11 @@ class GameClient:
                 else:
                     await self._lobby_loop()
 
+        # Closing the window with the title-bar X bypasses the settings screen's
+        # Esc/back path, so persist here as well: a changed window_size must not
+        # be lost before the next launch. save() is a no-op when nothing changed.
+        self.settings.save()
         music.stop()
-        self.network.disconnect()
-        self.renderer.cleanup()
-
         self.network.disconnect()
         self.renderer.cleanup()
 
@@ -586,6 +592,17 @@ class GameClient:
             await asyncio.sleep(0.02)
         return False
 
+    def _select_map(self, name: str) -> None:
+        """Validate a saved map now; keep the old choice if it is broken."""
+        _shown, payload, errors = load_map(name)
+        if payload is None:
+            current = self.map_selection.name if self.map_selection else None
+            detail = "; ".join(errors) or "не удалось загрузить карту"
+            self.lobby_screen.set_custom_map(current, error=detail)
+            return
+        self.map_selection = MapSelection(name, payload)
+        self.lobby_screen.set_custom_map(name)
+
     async def _lobby_loop(self) -> None:
         self.input_handler.unlock_mouse()
         while self.running and self.network.state != "game":
@@ -604,18 +621,12 @@ class GameClient:
             if action == "create":
                 name = self.lobby_screen.player_name or "Player"
                 mode = self.lobby_screen.create_mode
-                if self.custom_sector_map is not None:
+                if self.map_selection is not None:
                     self.network.send_create_party(
                         f"{name}'s party", mode,
-                        self.custom_sector_map.to_bytes(),
+                        self.map_selection.payload,
                         0, 0,
                         map_format=MAP_FORMAT_SECTOR,
-                    )
-                elif self.custom_map is not None:
-                    self.network.send_create_party(
-                        f"{name}'s party", mode,
-                        self.custom_map.to_bytes(),
-                        self.custom_map.width, self.custom_map.height,
                     )
                 else:
                     self.network.send_create_party(f"{name}'s party", mode)
@@ -624,10 +635,10 @@ class GameClient:
             elif action == "refresh":
                 self.network.send_get_lobby()
             elif action == "clear_map":
-                self.custom_map = None
-                self.custom_sector_map = None
-                self.custom_map_name = None
+                self.map_selection = None
                 self.lobby_screen.set_custom_map(None)
+            elif action and action.startswith("map:"):
+                self._select_map(action[4:])
             elif action == "editor":
                 self._ui = "editor"
                 return
@@ -645,13 +656,9 @@ class GameClient:
 
             await asyncio.sleep(0.005)
 
-    @property
-    def _active_editor(self):
-        return (self.sector_editor_screen if self._editor_kind == "sector"
-                else self.editor_screen)
-
     async def _editor_loop(self) -> None:
         self.input_handler.unlock_mouse()
+        screen = self.sector_editor_screen
         while self.running and self._ui == "editor":
             events = pygame.event.get()
             for event in events:
@@ -659,36 +666,29 @@ class GameClient:
                     self.running = False
             mevents = self._menu_events(events)
             self._apply_resizes(events)
-            screen = self._active_editor
             action = screen.handle(mevents)
             if action == "back":
                 self._ui = "lobby"
                 return
-            if action == "tile":
-                self._editor_kind = "tile"
-                continue
-            if action == "sector":
-                self._editor_kind = "sector"
-                continue
             if action == "play":
-                if self._editor_kind == "sector":
-                    self.custom_sector_map = self.sector_editor_screen.editor.sm
-                    self.custom_map = None
-                    self.custom_map_name = self.sector_editor_screen.map_name
-                else:
-                    self.custom_map = self.editor_screen.to_game_map()
-                    self.custom_sector_map = None
-                    self.custom_map_name = self.editor_screen.map_name
-                self.lobby_screen.set_custom_map(self.custom_map_name)
+                # F5 saves a validated .mt1 to disk; the party must get those
+                # exact bytes, not a second serialization of the live map.
+                self.map_selection = MapSelection(
+                    screen.map_name, screen.editor.sm.to_bytes())
+                self.lobby_screen.set_custom_map(screen.map_name)
                 self._ui = "lobby"
                 return
-            self._active_editor.draw(self.renderer.ui)
+            screen.draw(self.renderer.ui)
             self.renderer.present()
             pygame.display.flip()
             self.renderer.clock.tick(60)
             await asyncio.sleep(0.005)
 
     async def _settings_loop(self, from_pause: bool) -> None:
+        # Refreshing the party list only makes sense from the lobby.  In a
+        # match the settings screen is reached from the pause menu, so the
+        # button (and its R shortcut) is hidden there.
+        self.settings_screen.set_refresh_enabled(not from_pause)
         if not from_pause:
             self.input_handler.unlock_mouse()
         while self.running:
@@ -696,6 +696,9 @@ class GameClient:
             for event in events:
                 if event.type == pygame.QUIT:
                     self.running = False
+                    # The X button does not go through Esc/back, so save here:
+                    # otherwise a freshly chosen window size is gone on restart.
+                    self.settings.save()
             mevents = self._menu_events(events)
             # The drag is applied immediately (once, the last size of the frame);
             # the screen itself keeps its fixed 1000x700 layout. The new size is
@@ -708,7 +711,8 @@ class GameClient:
                     "window_size",
                     size_text(*self.renderer.window_size),
                 )
-            if self.settings_screen.handle(mevents, self.settings) == "back":
+            action = self.settings_screen.handle(mevents, self.settings)
+            if action in ("back", "refresh"):
                 self.settings.apply_runtime(self.input_handler)
                 self.fps_cap = int(self.settings.get("fps_cap"))
                 # Re-sync the adaptive adapter with the freshly applied config
@@ -723,6 +727,8 @@ class GameClient:
                 self._apply_window()
                 self._sync_control_hints()
                 if not from_pause:
+                    if action == "refresh":
+                        self.network.send_get_lobby()
                     self._ui = "lobby"
                 return
             self.settings_screen.draw(self.renderer.ui, self.settings)
@@ -947,6 +953,7 @@ class GameClient:
         self._paused = False
         self._pause_bg = None
         self.end_screen._selected = 0
+        self.end_screen.reset_roster()
         self.input_handler.unlock_mouse()
         self.input_handler.reset_touch()
         self._menu_touch.clear()
@@ -962,30 +969,44 @@ class GameClient:
         self.input_handler.reset_mouse_position()
         pygame.event.clear()
 
-    def _accuracy_pct(self) -> int:
-        st = self.local_stats or {}
+    @staticmethod
+    def _accuracy_for(st: dict | None) -> int:
+        st = st or {}
         fired = int(st.get('shots_fired', 0))
         if fired <= 0:
             return 0
         return int(round(100.0 * int(st.get('shots_hit', 0)) / fired))
+
+    def _accuracy_pct(self) -> int:
+        return self._accuracy_for(self.local_stats)
 
     @staticmethod
     def _format_time(seconds: int) -> str:
         seconds = max(0, int(seconds))
         return f"{seconds // 60}:{seconds % 60:02d}"
 
-    def _end_model(self) -> dict:
-        st = self.local_stats or {}
-        stats = [
+    def _stat_rows(self, st: dict | None, seconds: int) -> list[tuple[str, str]]:
+        """One formatting rule for the local block and every teammate row.
+
+        All counters come from the snapshot's per-player record; this only
+        turns them into label/value pairs, so the end screen can never show a
+        locally guessed number for somebody else.
+        """
+        st = st or {}
+        return [
             ("Убийства", f"{int(st.get('kills', 0))}"),
             ("Смерти", f"{int(st.get('deaths', 0))}"),
             ("Урон нанесён", f"{int(st.get('damage_dealt', 0))}"),
             ("Урон получен", f"{int(st.get('damage_taken', 0))}"),
-            ("Точность", f"{self._accuracy_pct()}%"),
+            ("Точность", f"{self._accuracy_for(st)}%"),
             ("Предметы", f"{int(st.get('items', 0))}"),
             ("Секреты", f"{int(st.get('secrets', 0))}/{int(self.secrets_total)}"),
-            ("Время", self._format_time(self._match_tick // 20)),
+            ("Время", self._format_time(seconds)),
         ]
+
+    def _end_model(self) -> dict:
+        seconds = self._match_tick // self.network.tick_rate
+        stats = self._stat_rows(self.local_stats, seconds)
         if self.match_phase != 'over':
             return {
                 "kind": "death",
@@ -999,6 +1020,38 @@ class GameClient:
                 "hint": "Enter — возродиться | Esc — в меню",
             }
         if self.mode != 'pvp':
+            # A networked PvE party has more than one record in the snapshot.
+            # On victory the player can browse each teammate's authoritative
+            # counters; a solo run keeps the compact single-player block.
+            if len(self._players_snapshot) > 1:
+                players = sorted(
+                    self._players_snapshot,
+                    key=lambda p: int((p.get('stats') or {}).get('kills', 0)),
+                    reverse=True,
+                )
+                roster = []
+                for p in players:
+                    local = p.get('id') == self.player_id
+                    name = p.get('name', '') or f"ID{p.get('id')}"
+                    if local:
+                        name += " (вы)"
+                    roster.append({
+                        "id": p.get('id'),
+                        "name": name,
+                        "local": local,
+                        "stats": self._stat_rows(p.get('stats'), seconds),
+                    })
+                return {
+                    "kind": "victory",
+                    "title": "УРОВЕНЬ ПРОЙДЕН",
+                    "reason": "",
+                    "tone": "win",
+                    "roster": roster,
+                    "buttons": [("leave", "В МЕНЮ")],
+                    "primary": "leave",
+                    "escapable": True,
+                    "hint": "Стрелки влево/вправо — игрок | Enter — в меню",
+                }
             return {
                 "kind": "victory",
                 "title": "УРОВЕНЬ ПРОЙДЕН",
@@ -1197,7 +1250,7 @@ class GameClient:
         """
         if ticks <= 0:
             return 0
-        return int(ticks * TICK_INTERVAL * FPS_60 + 0.5)
+        return int(fps60_per_tick(ticks, self.network.tick_rate) + 0.5)
 
     def _sync_fire_anim(self, fire_seq: int, fire_ready: int, fire_reason: int,
                         wpn: int, now: float) -> None:
@@ -1229,6 +1282,7 @@ class GameClient:
         left a phantom recoil behind.
         """
         self._server_fire_ready = fire_ready
+        interval = tick_interval(self.network.tick_rate)
         # The refusal first, the acceptance second: decisions arrive in intent
         # order, and the acceptance is authoritative about the recoil's length,
         # so it must be the last word.
@@ -1259,7 +1313,7 @@ class GameClient:
                 # weapon's real cooldown instead of racing the same tick again.
                 self._next_fire_time = max(
                     self._next_fire_time,
-                    now + (fire_ready + 1) * TICK_INTERVAL)
+                    now + (fire_ready + 1) * interval)
         if fire_seq > self._server_fire_seq:
             # Everything the server has accepted is settled; a later refused
             # intent can no longer be charged against it.
@@ -1273,7 +1327,7 @@ class GameClient:
             if self._fire_anim_wpn != -1 and self._fire_anim_wpn != wpn:
                 return
             self._fire_anim_until = max(
-                self._fire_anim_until, now + fire_ready * TICK_INTERVAL)
+                self._fire_anim_until, now + fire_ready * interval)
             self._fire_anim_wpn = wpn
 
     def _process_input(self) -> None:
@@ -1284,6 +1338,8 @@ class GameClient:
             self._dash_pending = True
 
         now = time.monotonic()
+        rate = self.network.tick_rate
+        interval = tick_interval(rate)
 
         # Predicted angle: apply the mouse immediately, without waiting for the
         # server echo; the server receives the absolute angle every packet.
@@ -1328,11 +1384,11 @@ class GameClient:
                 or self.input_handler.shoot_pressed
                 or self._fire_press_buffered
             ):
-                ticks = wpn_cooldown_ticks(int(info['f']))
+                ticks = wpn_cooldown_ticks(int(info['f']), rate)
                 # The +1 tick of slack belongs to the gate only: the animation
                 # must show the real cooldown, so it gets none.
-                self._next_fire_time = now + ticks * TICK_INTERVAL + TICK_INTERVAL
-                self._fire_anim_until = now + ticks * TICK_INTERVAL
+                self._next_fire_time = now + (ticks + 1) * interval
+                self._fire_anim_until = now + ticks * interval
                 self._fire_anim_wpn = fired_wpn
                 # The buffered press has been spent, whatever fired this opening:
                 # a held button does not need it, and it must not survive to give
@@ -1398,7 +1454,13 @@ class GameClient:
         self.match_time_left = int(lm.get('time_left', 0))
         self.secrets_total = int(lm.get('secrets_total', 0))
         self._match_tick = int(_tick)
-        self._players_snapshot = players
+        # Stats ride in the authoritative snapshot. The interpolated `players`
+        # above rebuild remote records for rendering and drop `stats`, so the
+        # results screen must read the original records instead -- otherwise a
+        # teammate's score would silently turn into zeros whenever smoothing
+        # was active.
+        self._players_snapshot = (
+            self.network.latest_state[1] if self.network.latest_state else players)
 
         latest = self.network.latest_state
         if latest is None:

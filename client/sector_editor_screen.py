@@ -16,10 +16,11 @@ import pygame
 from client.sector_editor import (
     STAIR_RISE_DEFAULT, SectorEditor, new_room, save_mt1_with_bsp,
 )
+from client import map_library
 from client.map_editor import ENEMY_NAMES, ITEM_NAMES
 from client.ui_layout import clip_tail, ellipsize, fit_width, layout_row
 from shared import text_map
-from shared.sector_map import KEY_LOCK_BY_ITEM
+from shared.sector_map import KEY_LOCK_BY_ITEM, SectorMap
 from shared.text_map import WALL_TEXTURE_ORDER
 
 # Key things get their own colour on the 2D overlay so a red key does not read
@@ -37,14 +38,14 @@ CYAN = (80, 200, 240)
 GRID_LINE = (52, 55, 70)
 SELECT = (70, 95, 150)
 
-MAPS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "maps"
-)
+# Saving still writes here (tests redirect this attribute); the list and the
+# loader live in map_library so the editor and the lobby share one catalogue.
+MAPS_DIR = map_library.MAPS_DIR
 
 FLAT_PALETTE = ["floor", "ceiling", "lava", "bridge", "platform"]
 THING_SPECIAL = [("player1", (90, 220, 90)), ("exit", (240, 160, 40))]
 TOOL_NAMES = {"select": "Выбор", "vertex": "Вершина", "line": "Линия",
-              "sector": "Сектор", "thing": "Вещь", "stair": "Лестница"}
+              "sector": "Сектор", "thing": "Объект", "stair": "Лестница"}
 # Tool keys are assigned to the first six number keys, so adding a tool must not
 # silently renumber the others: the mapping is explicit for exactly that reason.
 TOOL_KEYS = {pygame.K_1: "select", pygame.K_2: "vertex", pygame.K_3: "line",
@@ -61,7 +62,15 @@ LINE_KINDS = {
 # panel layout rows (the panel must fit any window height, so the thing
 # palette is columnized against the space that is left)
 THING_ROW_H = 20
+# The thing palette is a paged list: a short window has room for one row, and
+# cramming all 32 entries into it made every chip four pixels wide. A chip keeps
+# a readable minimum width, and the wheel moves between pages.
+THING_GAP = 4
+THING_MIN_CHIP_W = 88
 TEX_ROW_H = 15
+TEX_COLS = 4
+CHIP_ROW_H = 22
+FIELD_H = 20
 BASE_CHIPS_H = 48
 HINT_BLOCK_H = 34
 TEX_CHIP_NAMES = {"front": "ПЕРЕД", "back": "ЗАД",
@@ -87,7 +96,7 @@ class SectorEditorScreen:
         self.map_name = "sector1"
         self._name_focused = False
         self._map_list_open = False
-        self._map_files: list[str] = self._scan_map_files()
+        self._map_files: list[str] = map_library.list_map_names()
         self._map_rows: list[tuple[str, pygame.Rect]] = []
         self.status = "ЛКМ — действие | колесо — зум | ПКМ/СКМ — панорама | Ctrl+Z/Y — отмена/повтор"
 
@@ -111,10 +120,16 @@ class SectorEditorScreen:
         self._pan = False
         self._pre: tuple[float, float] = (0.0, 0.0)
         self._prop_text = ""
+        self._prop_text_rects: dict[str, pygame.Rect] = {}
+        self._hint_rects: dict[str, pygame.Rect] = {}
         self._prop_chips: dict[str, pygame.Rect] = {}
         self._height_fields: dict[str, pygame.Rect] = {}
         self._height_edit: str | None = None      # field being typed into
         self._height_buffer = ""
+        self._palette_offset = 0
+        self._palette_entries: list[tuple[str, str]] = []
+        self._palette_page = 0
+        self._palette_area = pygame.Rect(0, 0, 0, 0)
         self._base_chips: dict[str, tuple[pygame.Rect, tuple]] = {}
         # side-texture palette target: which sidedef and which slot it writes
         self._tex_side = "front"
@@ -154,17 +169,17 @@ class SectorEditorScreen:
         self._build_panel()
 
     def _button_labels(self) -> dict[str, str]:
-        return {"mode": "Тайлы ▶", "snap": "Сетка ✓" if self.editor.snap_on else "Сетка",
+        return {"snap": "Сетка вкл" if self.editor.snap_on else "Сетка вык",
                 "undo": "Отмена", "redo": "Повтор", "save": "Сохранить",
-                "load": "Загрузить", "play": "▶ Играть", "back": "Назад",
+                "load": "Загрузить", "play": "Играть", "back": "Назад",
                 "save_mts": "Сохранить .mts", "load_mts": "Открыть .mts"}
 
     def _build_toolbar(self) -> dict[str, pygame.Rect]:
         """Bottom toolbar: one button per action, sized to its own label.
 
-        ``snap`` toggles its label ("Сетка" / "Сетка ✓"), so the row is
-        rebuilt whenever it changes; the widths only ever grow by the tick
-        glyph, and ``_build_toolbar`` is cheap enough to call from the toggle.
+        ``snap`` toggles its label ("Сетка вкл" / "Сетка вык"), both exactly as
+        wide, so the row is rebuilt without moving any neighbour and
+        ``_build_toolbar`` stays cheap enough to call from the toggle.
         """
         labels = self._button_labels()
         items = [(key, fit_width(text, self.tiny_font, TOOLBAR_PAD))
@@ -178,6 +193,30 @@ class SectorEditorScreen:
         # every row onto the same y and stack the buttons on top of each other.
         top = self.height - 8 - self._toolbar_h
         return {key: rect.move(0, top) for key, rect in layout["rects"].items()}
+
+    def _status_rect(self) -> pygame.Rect:
+        """Status band on the strip between the canvas and the toolbar."""
+        h = self.tiny_font.get_height()
+        toolbar_top = min(rect.y for rect in self.buttons.values())
+        bottom = toolbar_top - 6
+        return pygame.Rect(12, bottom - h,
+                           max(120, self.canvas.right - 24), h)
+
+    def _fps_rect(self) -> pygame.Rect:
+        """FPS band just above the status, never over a button."""
+        h = self.tiny_font.get_height()
+        status = self._status_rect()
+        text_w = self.tiny_font.size("FPS: 000.0")[0]
+        return pygame.Rect(status.x, status.y - h - 4, text_w, h)
+
+    def _prop_height(self) -> int:
+        """Reserve room for the worst selection: 9 chips plus two text rows."""
+        h = self.tiny_font.get_height()
+        chip_rows = -(-9 // 2)
+        return (h + 4                      # header, now inside the panel
+                + chip_rows * CHIP_ROW_H   # 9 two-sided-line chips
+                + 6 + FIELD_H + 2 + h      # numeric fields and their hint
+                + 3 + 2 * h + 3 + 4)       # description + contour hint + pad
 
     # ── layout ────────────────────────────────────────────────────────
     def _build_panel(self) -> None:
@@ -196,37 +235,92 @@ class SectorEditorScreen:
         self._tool_buttons = {key: rect.move(x, 0)
                               for key, rect in tlayout["rects"].items()}
         y += tlayout["height"] + 8
-        self._prop_rect = pygame.Rect(x, y, w, 148)
+        self._prop_rect = pygame.Rect(x, y, w, self._prop_height())
         self._palette_label_y = self._prop_rect.y + self._prop_rect.height + 8
         # contextual block: wall textures for a two-sided linedef, otherwise
         # the sector flats. Only one of them is ever useful, so they share the
         # same space and the hint row below keeps a fixed y.
-        self._tex_block_h = 52 + (-(-len(WALL_TEXTURE_ORDER) // 3)) * TEX_ROW_H
+        self._tex_block_h = (52
+                             + (-(-len(WALL_TEXTURE_ORDER) // TEX_COLS)) * TEX_ROW_H)
         self._flat_block_h = 16 + (-(-len(FLAT_PALETTE) // 3)) * 20 + 4
         context_h = max(self._tex_block_h, self._flat_block_h)
+        self._context_h = context_h
         y = self._build_palette(x, self._palette_label_y, w, context_h)
         self._build_base_chips(x, y + 6, w)
         self._context_y = y + 6 + BASE_CHIPS_H
         self._build_tex_palette(x, self._context_y, w)
         self._hint_y = min(self._context_y + context_h, self.panel.bottom - 8)
 
+    def _palette_head_h(self) -> int:
+        """Header strip above the first chip row, measured from the font."""
+        return self.tiny_font.get_height() + 4
+
+    def _max_palette_offset(self) -> int:
+        return max(0, len(self._palette_entries) - self._palette_page)
+
     def _build_palette(self, x: int, y: int, w: int, context_h: int) -> int:
-        """Thing palette: as many columns as the panel height allows."""
+        """Paged thing palette: readable chips, wheel scrolls the leftovers.
+
+        The old layout spent every spare pixel on more columns, so a short
+        window squeezed all 32 entries into 4px chips. Now chip width has a
+        floor, the header owns its own strip (it used to sit on the first row's
+        text), and anything outside the visible page is reached with the wheel.
+        """
         entries = [(name, ch) for ch, name in ENEMY_NAMES.items()]
         entries += [(name, ch) for ch, name in ITEM_NAMES.items()]
+        self._palette_entries = entries
+        head_h = self._palette_head_h()
         # everything below the palette has a reserved height
         bottom = (self.panel.bottom - 8 - HINT_BLOCK_H - BASE_CHIPS_H - 6
                   - context_h)
-        rows = max(1, (bottom - y) // THING_ROW_H)
-        cols = max(1, -(-len(entries) // rows))
-        cw = max(28, (w - (cols - 1) * 4) // cols)
+        rows = max(1, (bottom - y - head_h) // THING_ROW_H)
+        cols = max(1, min(len(entries),
+                          (w + THING_GAP) // (THING_MIN_CHIP_W + THING_GAP)))
+        cw = max(THING_MIN_CHIP_W, (w - (cols - 1) * THING_GAP) // cols)
+        self._palette_page = rows * cols
+        self._palette_offset = min(self._palette_offset, self._max_palette_offset())
+        shown = entries[self._palette_offset:
+                        self._palette_offset + self._palette_page]
         self._palette_items = [[] for _ in range(cols)]
-        for i, (name, ch) in enumerate(entries):
+        for i, (name, ch) in enumerate(shown):
             col = i // rows
             ci = i % rows
-            rect = pygame.Rect(x + col * (cw + 4), y + ci * THING_ROW_H, cw, 20)
+            rect = pygame.Rect(x + col * (cw + THING_GAP),
+                               y + head_h + ci * THING_ROW_H,
+                               cw, THING_ROW_H - 2)
             self._palette_items[col].append((name, rect, ch))
-        return y + min(rows, len(entries)) * THING_ROW_H
+        # The area covers the header too, so a wheel over the caption scrolls
+        # the list instead of zooming the canvas behind the panel.
+        self._palette_area = pygame.Rect(
+            x, y, min(w, cols * cw + (cols - 1) * THING_GAP),
+            head_h + rows * THING_ROW_H)
+        return self._palette_area.bottom + 6
+
+    def _rebuild_palette(self) -> None:
+        """Re-lay the visible page after its offset changes."""
+        self._build_palette(self.panel.x + 6, self._palette_label_y,
+                            self.panel.width - 12, self._context_h)
+
+    def _scroll_palette(self, steps: int) -> None:
+        cols = max(1, len(self._palette_items))
+        self._palette_offset = max(0, min(
+            self._palette_offset - steps * cols, self._max_palette_offset()))
+        self._rebuild_palette()
+
+    def _palette_header_bands(self) -> tuple[pygame.Rect, pygame.Rect, str]:
+        """Caption and page counter never share a pixel."""
+        x = self.panel.x + 6
+        w = self.panel.width - 12
+        h = self.tiny_font.get_height()
+        first = self._palette_offset + 1
+        last = self._palette_offset + sum(len(c) for c in self._palette_items)
+        counter = f"{first}-{last} / {len(self._palette_entries)}"
+        counter_w = self.tiny_font.size(counter)[0]
+        label = pygame.Rect(x, self._palette_label_y,
+                            max(1, w - counter_w - 8), h)
+        page = pygame.Rect(x + w - counter_w, self._palette_label_y,
+                           counter_w, h)
+        return label, page, counter
 
     def _build_base_chips(self, x: int, y: int, w: int) -> None:
         """player1 / exit chips, always visible above the contextual block."""
@@ -281,12 +375,14 @@ class SectorEditorScreen:
         y += 22
         self._tex_value_y = y
         y += 14
-        cw2 = (w - 8) // 3
+        cw2 = max(28, (w - (TEX_COLS - 1) * 4) // TEX_COLS)
         for i, name in enumerate(WALL_TEXTURE_ORDER):
-            rect = pygame.Rect(x + (i % 3) * (cw2 + 4), y + (i // 3) * TEX_ROW_H,
+            rect = pygame.Rect(x + (i % TEX_COLS) * (cw2 + 4),
+                               y + (i // TEX_COLS) * TEX_ROW_H,
                                cw2, TEX_ROW_H - 2)
             self._tex_rects[name] = rect
-        self._tex_block_h = 52 + (-(-len(WALL_TEXTURE_ORDER) // 3)) * TEX_ROW_H
+        tex_rows = -(-len(WALL_TEXTURE_ORDER) // TEX_COLS)
+        self._tex_block_h = 52 + tex_rows * TEX_ROW_H
 
     def _fit(self, text: str, maxw: int) -> str:
         """Trim a label to the chip width so nothing spills over the panel."""
@@ -410,23 +506,33 @@ class SectorEditorScreen:
         return None
 
     # ── input ─────────────────────────────────────────────────────────
-    def _scan_map_files(self) -> list[str]:
-        """Map names available in maps/, each listed once.
-
-        A map can be present as both .mts and .mt1, so the names are collected
-        into a set: without it the picker offered the same map twice.
-        """
-        if not os.path.isdir(MAPS_DIR):
-            return []
-        names = {os.path.splitext(fn)[0] for fn in os.listdir(MAPS_DIR)
-                 if fn.lower().endswith((".mts", ".mt1"))}
-        return sorted(names)
-
     def _load_by_name(self, name: str) -> None:
+        """Open a map by its catalogue name (regardless of file extension)."""
         self.map_name = name
+        self._load_named(name)
+
+    def _load_named(self, name: str) -> None:
         self._name_focused = False
         self._map_list_open = False
-        self._load_mts()
+        shown, payload, errs = map_library.load(name, validate=False)
+        if payload is None:
+            self.status = "; ".join(errs) if errs else f"Не найдено: maps/{name}"
+            return
+        try:
+            # Validation before repair is not the editor's verdict: SectorEditor
+            # repairs a broken front side on load, and the status has to report
+            # what is still wrong AFTER that repair.
+            sm = SectorMap.from_bytes(payload)
+        except Exception as exc:
+            self.status = f"Ошибка загрузки: {exc}"
+            return
+        self.editor = SectorEditor(sm)
+        self._reset_tool_state()
+        self._set_sel()
+        self.frame_around()
+        path = map_library.source_path(shown)
+        self.status = self._loaded_status(
+            f"maps/{os.path.basename(path)}", sm.validate())
 
     def handle(self, events) -> str | None:
         for event in events:
@@ -438,7 +544,7 @@ class SectorEditorScreen:
                 if self.map_list_btn.collidepoint(event.pos):
                     self._map_list_open = not self._map_list_open
                     if self._map_list_open:
-                        self._map_files = self._scan_map_files()
+                        self._map_files = map_library.list_map_names()
                     continue
                 # the open dropdown overlays the canvas, so it is hit-tested
                 # first: its rows must get the click, and a miss closes it
@@ -492,6 +598,9 @@ class SectorEditorScreen:
                 self._drag_v = None
             elif event.type == pygame.MOUSEWHEEL:
                 pos = getattr(event, 'pos', None) or self._last_mouse_canvas
+                if pos is not None and self._palette_area.collidepoint(pos):
+                    self._scroll_palette(event.y)
+                    continue
                 if pos is not None and self.canvas.collidepoint(pos):
                     self.zoom = max(0.05, min(4.0,
                                     self.zoom * (1.2 if event.y > 0 else 1 / 1.2)))
@@ -649,7 +758,7 @@ class SectorEditorScreen:
         self._dirty()
         rails = "проёмы" if info["rails_open"] else "сплошные стены"
         self.status = (f"Лестница: {info['steps']} ступ. по {info['rise']} "
-                       f"({info['low']}→{info['high']}), бок {rails}")
+                       f"({info['low']} до {info['high']}), бок {rails}")
 
     def _panel_down(self, pos) -> str | None:
         for key, rect in self.buttons.items():
@@ -681,26 +790,32 @@ class SectorEditorScreen:
                     self._height_buffer = str(s.floor_h if key == "floor"
                                               else s.ceil_h)
                 return None
-        # flat palette target chips
-        if hasattr(self, '_flat_chips'):
-            for key, rect in self._flat_chips.items():
-                if rect.collidepoint(pos):
-                    self._flat_target = key
-                    return None
-        # flat palette samples
-        if hasattr(self, '_flat_rects'):
-            for name, rect in self._flat_rects.items():
-                if rect.collidepoint(pos):
-                    if self.sel_sector is not None and 0 <= self.sel_sector < len(self.editor.sectors):
-                        if self._flat_target == "floor":
-                            self.editor.set_sector_props(self.sel_sector, floor_tex=name)
-                        else:
-                            self.editor.set_sector_props(self.sel_sector, ceil_tex=name)
-                        self._dirty()
-                    return None
-        # hit-test wall palette only when drawn
+        # The contextual block shows EITHER the wall texture palette (a
+        # linedef is selected) or the sector flats.  The hidden palette's
+        # rects stay in memory, so hit-testing both would let a stale flat
+        # sample swallow a click meant for a wall slot: only the drawn block
+        # is clickable.
         side_idx = self._tex_side_idx()
-        if side_idx is not None:
+        if side_idx is None:
+            # flat palette target chips
+            if hasattr(self, '_flat_chips'):
+                for key, rect in self._flat_chips.items():
+                    if rect.collidepoint(pos):
+                        self._flat_target = key
+                        return None
+            # flat palette samples
+            if hasattr(self, '_flat_rects'):
+                for name, rect in self._flat_rects.items():
+                    if rect.collidepoint(pos):
+                        if self.sel_sector is not None and 0 <= self.sel_sector < len(self.editor.sectors):
+                            if self._flat_target == "floor":
+                                self.editor.set_sector_props(self.sel_sector, floor_tex=name)
+                            else:
+                                self.editor.set_sector_props(self.sel_sector, ceil_tex=name)
+                            self._dirty()
+                        return None
+        else:
+            # hit-test wall palette only when drawn
             for key, rect in self._tex_chips.items():
                 if rect.collidepoint(pos):
                     if key in ("front", "back"):
@@ -728,8 +843,6 @@ class SectorEditorScreen:
         self._dirty()
 
     def _button(self, key: str) -> str | None:
-        if key == "mode":
-            return "tile"
         if key == "snap":
             self.editor.snap_on = not self.editor.snap_on
             self._dirty()
@@ -773,7 +886,7 @@ class SectorEditorScreen:
             return None
         self.contour = []
         self._set_sel(sector=sec)
-        self.status = f"Сектор {sec} создан (толщина стены 16)"
+        self.status = f"Сектор {sec} создан (границы — общие проёмы)"
         self._dirty()
         return None
 
@@ -916,7 +1029,7 @@ class SectorEditorScreen:
         path = self._mts_path("mts")
         try:
             text_map.save(self.editor.sm, path)
-            self._map_files = self._scan_map_files()
+            self._map_files = map_library.list_map_names()
             self.status = f"Сохранено: maps/{os.path.basename(path)}"
         except Exception as exc:
             self.status = f"Ошибка сохранения .mts: {exc}"
@@ -938,21 +1051,9 @@ class SectorEditorScreen:
         return " — ".join(parts)
 
     def _load_mts(self) -> None:
-        path = self._mts_path("mts")
-        if not os.path.exists(path):
-            self.status = f"Не найдено: maps/{os.path.basename(path)}"
-            return
-        try:
-            sm = text_map.load(path, validate=False)
-            self.editor = SectorEditor(sm)
-            self._reset_tool_state()
-            self._set_sel()
-            self.frame_around()
-        except Exception as exc:
-            self.status = f"Ошибка загрузки .mts: {exc}"
-            return
-        self.status = self._loaded_status(f"maps/{os.path.basename(path)}",
-                                          sm.validate())
+        # Kept as the button/direct-test entry point. It no longer reads .mts
+        # itself: a binary-only name in the list must open too.
+        self._load_named(self.map_name or "sector1")
 
     def _load(self) -> None:
         name = self.map_name or "sector1"
@@ -987,8 +1088,10 @@ class SectorEditorScreen:
         self._draw_panel(surface)
         self._draw_buttons(surface)
         self._draw_map_dropdown(surface)
-        status = self.tiny_font.render(self.status, True, GREEN)
-        surface.blit(status, (12, self.height - 22))
+        status_band = self._status_rect()
+        status = self.tiny_font.render(
+            ellipsize(self.status, self.tiny_font, status_band.width), True, GREEN)
+        surface.blit(status, status_band)
 
         self._fps_n += 1
         now = time.time()
@@ -996,8 +1099,11 @@ class SectorEditorScreen:
             self.fps = self._fps_n / (now - self._fps_t0)
             self._fps_n = 0
             self._fps_t0 = now
-        fps_txt = self.tiny_font.render(f"FPS: {self.fps:4.1f}", True, MUTED)
-        surface.blit(fps_txt, (self.canvas.right - 84, self.canvas.bottom - 20))
+        fps_band = self._fps_rect()
+        fps_txt = self.tiny_font.render(
+            ellipsize(f"FPS: {self.fps:4.1f}", self.tiny_font, fps_band.width),
+            True, MUTED)
+        surface.blit(fps_txt, fps_band)
 
     def _draw_map_picker(self, surface) -> None:
         lbl = self.tiny_font.render("Карта:", True, MUTED)
@@ -1015,7 +1121,7 @@ class SectorEditorScreen:
         surface.blit(name_txt, (self.name_box.x + 6, self.name_box.y + 6))
         pygame.draw.rect(surface, PANEL, self.map_list_btn, border_radius=4)
         pygame.draw.rect(surface, MUTED, self.map_list_btn, 1, border_radius=4)
-        btn_txt = self.tiny_font.render("" if self._map_list_open else "Карты ▾",
+        btn_txt = self.tiny_font.render("" if self._map_list_open else "Карты",
                                         True, TEXT)
         surface.blit(btn_txt, (self.map_list_btn.centerx - btn_txt.get_width() // 2,
                                self.map_list_btn.centery - btn_txt.get_height() // 2))
@@ -1267,9 +1373,15 @@ class SectorEditorScreen:
 
     def _draw_props(self, surface) -> None:
         x = self.panel.x + 6
-        head = self.tiny_font.render("СВОЙСТВА — " + self._tool_selection_label(),
+        h = self.tiny_font.get_height()
+        w = self._prop_rect.width
+        rects: dict[str, pygame.Rect] = {}
+        head_text = "СВОЙСТВА — " + self._tool_selection_label()
+        head = self.tiny_font.render(ellipsize(head_text, self.tiny_font, w),
                                      True, ACCENT)
-        surface.blit(head, (x, self._prop_rect.y - 6))
+        head_rect = pygame.Rect(x, self._prop_rect.y, w, h)
+        surface.blit(head, head_rect)
+        rects["header"] = head_rect
         chips: dict[str, str] = {}
         self._prop_text = ""
         self._height_fields = {}
@@ -1296,54 +1408,75 @@ class SectorEditorScreen:
             else:
                 self._prop_text = (f"пол {s.floor_h}  потол {s.ceil_h}  "
                                    f"свет {s.light}  пол:{s.floor_tex}  пот:{s.ceil_tex}")
-            chips = {"floor_up": "пол ▲" if not floating else "верх ▲",
-                     "floor_dn": "пол ▼" if not floating else "верх ▼",
-                     "ceil_up": "потол ▲" if not floating else "подошва ▲",
-                     "ceil_dn": "потол ▼" if not floating else "подошва ▼",
+            chips = {"floor_up": "пол выше" if not floating else "верх выше",
+                     "floor_dn": "пол ниже" if not floating else "верх ниже",
+                     "ceil_up": "потол выше" if not floating else "подошва выше",
+                     "ceil_dn": "потол ниже" if not floating else "подошва ниже",
                      "light": "свет +",
                      "float": "парит" if not floating else "привязан"}
         elif self.sel_thing is not None:
             t = self.editor.things[self.sel_thing]
             self._prop_text = f"{t.type} @ ({t.x:.0f},{t.y:.0f}) угол {t.angle}"
             chips = {"angle": "поворот +45", "del": "удалить"}
-        cy = self._prop_rect.y + 26
-        cw = (self.panel.width - 12 - 8) // 2
+        cy = head_rect.bottom + 4
+        cw = (w - 8) // 2
         self._prop_chips = {}
         for i, (key, label) in enumerate(chips.items()):
-            rect = pygame.Rect(x + (i % 2) * (cw + 8), cy + (i // 2) * 22, cw, 20)
+            rect = pygame.Rect(x + (i % 2) * (cw + 8),
+                               cy + (i // 2) * CHIP_ROW_H, cw, FIELD_H)
             pygame.draw.rect(surface, (40, 44, 62), rect, border_radius=3)
-            txt = self.tiny_font.render(label, True, TEXT)
+            txt = self.tiny_font.render(self._fit(label, rect.width - 8),
+                                        True, TEXT)
             surface.blit(txt, (rect.x + 4, rect.y + 3))
             self._prop_chips[key] = rect
+        chips_bottom = (max(rect.bottom for rect in self._prop_chips.values())
+                        if self._prop_chips else cy)
         # numeric floor/ceiling fields; they show the value actually applied
         if self.sel_sector is not None and self.sel_sector >= 0:
             s = self.editor.sectors[self.sel_sector]
             floating = bool(getattr(s, 'floating', False))
-            fy = cy + ((len(chips) + 1) // 2) * 22 + 6
+            fy = chips_bottom + 6
             floor_label = "верх" if floating else "пол"
             ceil_label = "подошва" if floating else "потол"
             for i, (key, label, value) in enumerate(
                     (("floor", floor_label, s.floor_h), ("ceil", ceil_label, s.ceil_h))):
-                rect = pygame.Rect(x + i * (cw + 8), fy, cw, 20)
+                rect = pygame.Rect(x + i * (cw + 8), fy, cw, FIELD_H)
                 focused = self._height_edit == key
                 pygame.draw.rect(surface, SELECT if focused else (28, 31, 45),
                                  rect, border_radius=3)
                 pygame.draw.rect(surface, MUTED, rect, 1, border_radius=3)
                 shown = (self._height_buffer if focused
                          else f"{label} {value}")
-                txt = self.tiny_font.render(shown + ("▌" if focused else ""),
-                                            True, TEXT)
+                shown += "|" if focused else ""
+                txt = self.tiny_font.render(
+                    ellipsize(shown, self.tiny_font, rect.width - 8), True, TEXT)
                 surface.blit(txt, (rect.x + 4, rect.y + 3))
                 self._height_fields[key] = rect
+            hint_y = fy + FIELD_H + 2
             hint = self.tiny_font.render(
-                "клик по полю — ввод, Enter — применить", True, MUTED)
-            surface.blit(hint, (x, fy + 22))
+                ellipsize("клик по полю — ввод, Enter — применить",
+                          self.tiny_font, w), True, MUTED)
+            surface.blit(hint, (x, hint_y))
+            rects["field_hint"] = pygame.Rect(x, hint_y, w, h)
+        fields_bottom = (rects["field_hint"].bottom
+                         if "field_hint" in rects else chips_bottom)
+        content_bottom = max(chips_bottom, fields_bottom)
+        text_y = content_bottom + 3
         if self._prop_text:
-            extra = self.tiny_font.render(self._prop_text, True, MUTED)
-            surface.blit(extra, (x, self._prop_rect.y + 118))
+            extra = self.tiny_font.render(
+                ellipsize(self._prop_text, self.tiny_font, w), True, MUTED)
+            extra_rect = pygame.Rect(x, text_y, w, h)
+            surface.blit(extra, extra_rect)
+            rects["extra"] = extra_rect
+            text_y = extra_rect.bottom + 3
         if self.tool == "sector" and self.contour:
-            txt = self.tiny_font.render("Enter — создать сектор", True, GREEN)
-            surface.blit(txt, (x, self._prop_rect.y + 134))
+            txt = self.tiny_font.render(
+                ellipsize("Enter — создать сектор", self.tiny_font, w),
+                True, GREEN)
+            contour_rect = pygame.Rect(x, text_y, w, h)
+            surface.blit(txt, contour_rect)
+            rects["contour"] = contour_rect
+        self._prop_text_rects = rects
 
     def _build_flat_palette(self) -> list[tuple[str, pygame.Rect]]:
         x = self.panel.x + 6
@@ -1371,8 +1504,13 @@ class SectorEditorScreen:
 
     def _draw_palette(self, surface) -> None:
         x = self.panel.x + 6
-        hdr = self.tiny_font.render("ВЕЩИ — ВРАГИ / ПРЕДМЕТЫ / БАЗА", True, ACCENT)
-        surface.blit(hdr, (x, self._palette_label_y - 4))
+        label_band, counter_band, counter = self._palette_header_bands()
+        hdr = self.tiny_font.render(
+            self._fit("ОБЪЕКТЫ — ВРАГИ / ПРЕДМЕТЫ/СПАВН ИГРОКА", label_band.width), True, ACCENT)
+        surface.blit(hdr, label_band)
+        page = self.tiny_font.render(counter, True, MUTED)
+        surface.blit(page, (counter_band.x + counter_band.width - page.get_width(),
+                            counter_band.y))
         for items in self._palette_items:
             for name, rect, ch in items:
                 bg = SELECT if self.thing_type == name else (40, 44, 62)
@@ -1405,12 +1543,20 @@ class SectorEditorScreen:
                 pygame.draw.rect(surface, MUTED, rect, 1, border_radius=3)
                 txt = self.tiny_font.render(self._fit(name, rect.width - 4), True, TEXT)
                 surface.blit(txt, (rect.x + 2, rect.y + 1))
+        w = self.panel.width - 12
+        h = self.tiny_font.get_height()
+        hint_text = (f"1-{len(TOOL_NAMES)} — инструменты | G — сетка | F — кадр | "
+                     "F5 — играть")
         hint = self.tiny_font.render(
-            f"1-{len(TOOL_NAMES)} — инструменты | G — сетка | F — кадр | "
-            "F5 — играть", True, MUTED)
-        surface.blit(hint, (x, self._hint_y))
-        hint2 = self.tiny_font.render("CTRL+Z/Y отмена/повтор | ESC назад", True, MUTED)
-        surface.blit(hint2, (x, self._hint_y + 14))
+            ellipsize(hint_text, self.tiny_font, w), True, MUTED)
+        hint_rect = pygame.Rect(x, self._hint_y, w, h)
+        surface.blit(hint, hint_rect)
+        hint2 = self.tiny_font.render(
+            ellipsize("CTRL+Z/Y отмена/повтор | ESC назад", self.tiny_font, w),
+            True, MUTED)
+        hint2_rect = pygame.Rect(x, hint_rect.bottom + 2, w, h)
+        surface.blit(hint2, hint2_rect)
+        self._hint_rects = {"tools": hint_rect, "undo": hint2_rect}
 
     def _tex_side_idx(self) -> int | None:
         """Sidedef index the texture palette currently writes to.

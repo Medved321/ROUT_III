@@ -3,17 +3,59 @@
 See the hitscan-hit-registration change: the client and the server must agree
 on the fire-rate cooldown so a shot shown on the client is never rejected by
 the server's cooldown gate.  ``wpn_cooldown_ticks`` converts a 60 fps weapon
-frame count into server ticks (20 tps) — the one function both sides use.
+frame count into server ticks at the tick rate agreed for the connection —
+the one function both sides use.  The default is 20 tps, but the server may
+run at any rate in ``MIN_TICK_RATE..MAX_TICK_RATE`` and publishes it in
+``HELLO_ACK``.
 """
 from __future__ import annotations
 
 import math
 
-TICK_RATE = 20
-TICK_INTERVAL = 1.0 / TICK_RATE
+DEFAULT_TICK_RATE = 20
+MIN_TICK_RATE = 5
+MAX_TICK_RATE = 120
+# Legacy aliases: imported all over the tree, still equal to the default.
+TICK_RATE = DEFAULT_TICK_RATE
+TICK_INTERVAL = 1.0 / DEFAULT_TICK_RATE
 FPS_60 = 60.0
 
 TAU = 2.0 * math.pi
+
+
+def validate_tick_rate(value) -> int:
+    """Return ``value`` as a tick rate, or raise for an unusable one."""
+    if isinstance(value, bool):
+        raise ValueError("tick rate must be an integer from 5 to 120")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError("tick rate must be an integer from 5 to 120")
+    try:
+        rate = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("tick rate must be an integer from 5 to 120") from None
+    if not MIN_TICK_RATE <= rate <= MAX_TICK_RATE:
+        raise ValueError("tick rate must be an integer from 5 to 120")
+    return rate
+
+
+def tick_interval(tick_rate: int = DEFAULT_TICK_RATE) -> float:
+    """Seconds per tick at the given rate."""
+    return 1.0 / validate_tick_rate(tick_rate)
+
+
+def fps60_per_tick(px_per_frame: float, tick_rate: int = DEFAULT_TICK_RATE) -> float:
+    """ROUT_II_III speed (px/frame @60fps) -> px/tick."""
+    return px_per_frame * FPS_60 / validate_tick_rate(tick_rate)
+
+
+def ticks_for_seconds(seconds: float, tick_rate: int = DEFAULT_TICK_RATE) -> int:
+    """Duration in seconds -> at least one tick at the given rate."""
+    return max(1, round(float(seconds) * validate_tick_rate(tick_rate)))
+
+
+def ms_to_ticks(milliseconds: float, tick_rate: int = DEFAULT_TICK_RATE) -> int:
+    """Millisecond cooldown -> ticks at the given rate."""
+    return ticks_for_seconds(float(milliseconds) / 1000.0, tick_rate)
 
 
 def normalize_angle(angle: float) -> float:
@@ -21,9 +63,11 @@ def normalize_angle(angle: float) -> float:
     return angle % TAU
 
 
-def wpn_cooldown_ticks(frames: int, tick_rate: int = TICK_RATE, fps: float = FPS_60) -> int:
-    """fire-rate frames (60fps) -> server ticks (20 tps)."""
-    return max(1, round(frames * tick_rate / fps))
+def wpn_cooldown_ticks(
+    frames: int, tick_rate: int = DEFAULT_TICK_RATE, fps: float = FPS_60,
+) -> int:
+    """Fire-rate frames (60fps) -> server ticks at ``tick_rate``."""
+    return max(1, round(frames * validate_tick_rate(tick_rate) / fps))
 
 
 # Wire codes for the server's decision about one fire intent.

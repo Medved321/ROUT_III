@@ -32,7 +32,14 @@ import client.client as cc  # noqa: E402
 import engine.game_state as gs  # noqa: E402
 import engine.rendering as er  # noqa: E402
 from engine.constants import WPN  # noqa: E402
-from shared.combat import wpn_cooldown_ticks, TICK_INTERVAL, FPS_60  # noqa: E402
+from shared.combat import (  # noqa: E402
+    DEFAULT_TICK_RATE, wpn_cooldown_ticks, tick_interval, FPS_60,
+)
+
+# Gameplay runs at every server tick rate: the cooldown, the fire gate and the
+# 60 fps frame budget are all derived from it, so a fixed-20 regression cannot
+# hide behind the default.
+RATES = (20, 30, 40)
 
 AMMO = {'pstl': 10, 'shl': 10, 'slg': 10, 'rck': 10, 'BFG': 10}
 
@@ -82,7 +89,8 @@ class FakeInput:
 
 
 class FakeNet:
-    def __init__(self):
+    def __init__(self, tick_rate=DEFAULT_TICK_RATE):
+        self.tick_rate = tick_rate
         self.fired = []
         self._seq = 0
 
@@ -95,7 +103,7 @@ class FakeNet:
 
 
 def make_client(weapon_id=0, shoot=False, pressed=False, anim_until=0.0,
-                anim_wpn=-1, gate=0.0):
+                anim_wpn=-1, gate=0.0, tick_rate=DEFAULT_TICK_RATE):
     """A GameClient with only the input/clock surface replaced.
 
     ``__init__`` is skipped on purpose (it opens sockets and a window); every
@@ -111,7 +119,7 @@ def make_client(weapon_id=0, shoot=False, pressed=False, anim_until=0.0,
     c._server_fire_ready = 0
     c.local_weapon = weapon_id
     c.input_handler = FakeInput(weapon_id, shoot, pressed)
-    c.network = FakeNet()
+    c.network = FakeNet(tick_rate)
     c.local_angle = 0.0
     c.local_ammo = dict(AMMO)
     return c
@@ -128,56 +136,68 @@ def frames_at(c, elapsed, cooldown):
 
 
 # ── timing: length == server cooldown, identical at every frame rate ────────
-for idx, name in ((0, 'CHAINSAW'), (1, 'PISTOL'), (2, 'SHOTGUN'),
-                  (5, 'SSG')):
-    info = WPN[idx]
-    ticks = wpn_cooldown_ticks(int(info['f']))
-    cooldown = ticks * TICK_INTERVAL
+# Every server rate gets its own run. The cooldown, the gate and the 60 fps frame
+# budget all come from the tick rate, so a regression that silently reads a
+# fixed 20 tps shows up as a wrong deadline or a wrong frame count at 30/40.
+for tick_rate in RATES:
+    interval = tick_interval(tick_rate)
+    for idx, name in ((0, 'CHAINSAW'), (1, 'PISTOL'), (2, 'SHOTGUN'),
+                      (5, 'SSG')):
+        info = WPN[idx]
+        ticks = wpn_cooldown_ticks(int(info['f']), tick_rate)
+        cooldown = ticks * interval
 
-    c = make_client(weapon_id=idx, shoot=True, pressed=True)
-    t0 = time.monotonic()
-    c._process_input()
-    cooldown_wall = cooldown
+        c = make_client(weapon_id=idx, shoot=True, pressed=True,
+                        tick_rate=tick_rate)
+        t0 = time.monotonic()
+        c._process_input()
 
-    # the animation deadline is the cooldown, without the gate's +1 tick
-    assert c.network.fired == [idx], f"{name}: shot not sent"
-    assert abs(c._fire_anim_until - (t0 + cooldown_wall)) < 0.02, (
-        name, c._fire_anim_until - t0, cooldown_wall)
-    assert abs(c._next_fire_time - c._fire_anim_until - TICK_INTERVAL) < 1e-9, (
-        name, "gate slack must be exactly one tick and belong to the gate only")
+        # the animation deadline is the cooldown, without the gate's +1 tick
+        assert c.network.fired == [idx], (tick_rate, name, "shot not sent")
+        assert abs(c._fire_anim_until - (t0 + cooldown)) < 0.02, (
+            tick_rate, name, c._fire_anim_until - t0, cooldown)
+        assert abs(c._next_fire_time - c._fire_anim_until - interval) < 1e-9, (
+            tick_rate, name,
+            "gate slack must be exactly one tick and belong to the gate only")
 
-    # starts at the weapon's full 60 fps frame budget
-    assert frames_at(c, 0.0, cooldown_wall) == ticks * 3, (
-        name, frames_at(c, 0.0, cooldown_wall), ticks * 3)
-    # still alive one frame before the cooldown is over, over on it
-    assert frames_at(c, cooldown_wall - 1.0 / FPS_60, cooldown_wall) >= 1, (
-        name, "animation ended before the cooldown did")
-    assert frames_at(c, cooldown_wall, cooldown_wall) == 0, name
+        # starts at the weapon's full 60 fps frame budget for this tick rate
+        # (3 frames per tick only at 20 tps -- ask the shipped conversion).
+        expected_frames = c._fire_anim_frames_from_server(ticks)
+        assert frames_at(c, 0.0, cooldown) == expected_frames, (
+            tick_rate, name, frames_at(c, 0.0, cooldown), expected_frames)
+        # still alive one frame before the cooldown is over, over on it
+        assert frames_at(c, cooldown - 1.0 / FPS_60, cooldown) >= 1, (
+            tick_rate, name, "animation ended before the cooldown did")
+        assert frames_at(c, cooldown, cooldown) == 0, (tick_rate, name)
 
-    # walking the animation at a fixed step (= emulating a frame rate) has to
-    # consume it in `cooldown` seconds at 30, 60 and 144 fps alike. The frame is
-    # the quantum of the 60 fps convention, so the deadline is allowed to be
-    # hit within one frame -- but never a whole frame of drift.
-    for fps in (30.0, 60.0, 144.0):
-        step = 1.0 / fps
-        t = 0.0
-        while frames_at(c, t, cooldown_wall) > 0:
-            t += step
-            assert t < 5 * cooldown_wall, f"{name}@{fps:g}fps: animation never ends"
-        assert cooldown_wall - 1.0 / FPS_60 <= t <= cooldown_wall + step, (
-            f"{name}@{fps:g}fps: ended at {t:.4f}s, cooldown {cooldown_wall:.4f}s")
-print("animation duration == cooldown at 30/60/144 fps OK")
+        # walking the animation at a fixed step (= emulating a frame rate) has to
+        # consume it in `cooldown` seconds at 30, 60 and 144 fps alike. The frame
+        # is the quantum of the 60 fps convention, so the deadline is allowed to
+        # be hit within one frame -- but never a whole frame of drift.
+        for fps in (30.0, 60.0, 144.0):
+            step = 1.0 / fps
+            t = 0.0
+            while frames_at(c, t, cooldown) > 0:
+                t += step
+                assert t < 5 * cooldown, (
+                    f"{tick_rate} tps {name}@{fps:g}fps: animation never ends")
+            assert cooldown - 1.0 / FPS_60 <= t <= cooldown + step, (
+                f"{tick_rate} tps {name}@{fps:g}fps: ended at {t:.4f}s, "
+                f"cooldown {cooldown:.4f}s")
+    print(f"animation duration == cooldown at 30/60/144 fps, {tick_rate} tps OK")
 
 
 # ── timing: the +1 tick gate slack never lengthens the animation ────────────
-idx = 1  # PISTOL
-c = make_client(weapon_id=idx, shoot=True, pressed=True)
-c._process_input()
-t0 = time.monotonic()
-gate_free = c._next_fire_time - t0
-anim_left = c._fire_anim_frames(t0)
-assert gate_free > anim_left / FPS_60, (
-    "the gate must stay open later than the animation finishes")
+for tick_rate in RATES:
+    idx = 1  # PISTOL
+    c = make_client(weapon_id=idx, shoot=True, pressed=True,
+                    tick_rate=tick_rate)
+    c._process_input()
+    t0 = time.monotonic()
+    gate_free = c._next_fire_time - t0
+    anim_left = c._fire_anim_frames(t0)
+    assert gate_free > anim_left / FPS_60, (
+        tick_rate, "the gate must stay open later than the animation finishes")
 print("gate slack is not folded into the animation OK")
 
 

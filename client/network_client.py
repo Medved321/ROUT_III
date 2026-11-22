@@ -17,6 +17,7 @@ from shared.protocol import (
     encode_file_request, encode_file_complete,
     encode_fire, encode_player_respawn,
 )
+from shared.combat import DEFAULT_TICK_RATE, validate_tick_rate
 from shared.reliability import ReliableEndpoint
 from shared.version import CLIENT_VERSION, PROTOCOL_VERSION
 
@@ -24,9 +25,11 @@ logger = logging.getLogger(__name__)
 
 RELIABLE_TICK = 0.02
 
-# Snapshot smoothing: remote entities render with a small fixed delay and are
+# Snapshot smoothing: remote entities render with a small delay and are
 # linearly interpolated between the last two snapshots with receive time.
-INTERP_DELAY = 0.04  # ~1 server tick (50 ms)
+# The default is one tick at the default rate; a connected client uses
+# ``1.0 / self.tick_rate`` from HELLO_ACK instead.
+INTERP_DELAY = 1.0 / DEFAULT_TICK_RATE
 MAX_EXTRAPOLATION = 0.12  # bounded extrapolation after a lost snapshot
 SNAP_DISTANCE = 96.0  # px: larger moves (teleports) are applied instantly
 
@@ -74,6 +77,9 @@ class NetworkClient:
 
         self.protocol_ok: bool = False
         self.hello_ack: dict | None = None
+        # Standalone smoke tests have no HELLO_ACK; a live connection overwrites
+        # this from the server's advertised rate.
+        self.tick_rate: int = DEFAULT_TICK_RATE
         self.update_offer: UpdateOffer | None = None
         self.update_data: bytes | None = None
         self.update_complete: bool = False
@@ -101,6 +107,7 @@ class NetworkClient:
                 lambda ptype, seq, payload: self._send(Packet(ptype, seq, payload))
             )
         self.hello_ack = None
+        self.tick_rate = DEFAULT_TICK_RATE
         self.update_offer = None
         self.update_data = None
         self.update_complete = False
@@ -352,6 +359,11 @@ class NetworkClient:
 
     def _handle_hello_ack(self, payload: bytes) -> None:
         self.hello_ack = decode_hello_ack(payload)
+        try:
+            self.tick_rate = validate_tick_rate(
+                self.hello_ack.get('tick_rate', DEFAULT_TICK_RATE))
+        except ValueError:
+            self.tick_rate = DEFAULT_TICK_RATE
         if self._hello_event is not None:
             self._hello_event.set()
 
@@ -513,7 +525,7 @@ class NetworkClient:
         if len(snaps) == 1:
             return snaps[0][1]
 
-        target = now - INTERP_DELAY
+        target = now - 1.0 / self.tick_rate
         newest_t, newest_state = snaps[-1]
         if target >= newest_t:
             t0, st0 = snaps[-2]

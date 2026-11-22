@@ -14,6 +14,14 @@ still in this repository and can be wrong in ways that only show up after a
   (``music/``, tests, specs, the desktop updater);
 * ``main.py`` (the p4a entrypoint) disables SDL's synthetic touch mouse *before*
   pygame is imported, works without argv, and requires numpy;
+* a startup failure is never silent: the entry point logs a stage-by-stage
+  file next to the app (mirrored into its external files dir) and leaves the
+  traceback on screen, because p4a's ``start.c`` would otherwise just
+  ``exit()`` the activity;
+* the window *before* Python -- native library load, SDL surface, even the
+  activity's own class loading -- is covered by ``tools/android/java``, whose
+  wiring (``android.entrypoint``, ``android.add_src``, the ``<application>``
+  hook) only the APK build exercises;
 * on Android the settings file lives in the app-private directory (survives an
   APK update), while the program tree is replaced on update;
 * a fullscreen renderer ignores the saved window preset, and the client does not
@@ -137,6 +145,21 @@ def section_recipes():
     pg_text = (base / "pygame" / "__init__.py").read_text(encoding="utf-8")
     check("files.pythonhosted.org" in pg_text,
           "pygame recipe must use the sdist (the tag tarball has no generated C)")
+
+    # CPython 3.12's grpmodule.c calls setgrent()/getgrent()/endgrent()
+    # unconditionally; bionic only declares them from API 26 while the APK is
+    # built against API 24, so the module fails with "call to undeclared
+    # function".  A project patch must exist and be wired into the recipe.
+    patch = base / "python3" / "patches" / "grp-no-group-enumeration.patch"
+    check(patch.is_file(), "CPython grpmodule build patch is missing")
+    ptext = patch.read_text(encoding="utf-8")
+    check("--- a/Modules/grpmodule.c" in ptext
+          and "+++ b/Modules/grpmodule.c" in ptext,
+          "grp patch must be a -p1 diff of Modules/grpmodule.c")
+    check("__ANDROID_API__ < 26" in ptext and "setgrent" in ptext,
+          "grp patch must gate the group enumeration on the API level")
+    check("_LOCAL_PATCHES" in text and "join(here, name)" in text,
+          "python3 recipe must apply the project patch from its own directory")
     print("recipes: pygame 2.6.1 (sdist), python/hostpython 3.12 agree OK")
 
 
@@ -155,7 +178,27 @@ def section_entrypoint():
     check("launch_config([])" in src, "Android has no CLI arguments")
     check("require_numpy()" in src, "the APK must refuse to run without numpy")
     check("asyncio.run(client.run())" in src, "the entrypoint must run the client")
-    print("main.py: env before pygame, no argv, numpy required OK")
+
+    # p4a's start.c ends with exit(ret): anything that escapes closes the app
+    # with no dialog.  A missing numpy used to ``raise SystemExit(1)``, which
+    # on a phone is indistinguishable from a native crash.
+    check("raise SystemExit" not in src, "nothing may exit on the way out")
+    check("sys.exit(main())" not in src,
+          "SystemExit escaping the entrypoint is a silent close on the phone")
+    check(re.search(r"try:\s*\n\s*shown = show_fatal\(", src) is not None,
+          "the crash reporter itself must be guarded; it is the last line of defence")
+    check("except BaseException" in src,
+          "startup failures, SystemExit included, must be reported")
+    check("show_fatal(" in src, "a failure must leave its traceback on screen")
+    check("startup.stage(" in src, "stage markers are the only clue for a native crash")
+    check(src.index("def _startup(") < src.index("from client.client import"),
+          "the client import must sit inside the guarded startup")
+
+    fatal_src = (ROOT / "client/fatal.py").read_text(encoding="utf-8")
+    head = fatal_src.split("def show_fatal", 1)[0]
+    check(re.search(r"^import pygame", head, re.M) is None,
+          "the reporter must not import pygame at module level (that may be the bug)")
+    print("main.py: env before pygame, no argv, numpy required, failures visible OK")
 
 
 # ── 4. writable config location ──────────────────────────────────
@@ -274,6 +317,18 @@ def section_workflow():
     check("tee buildozer.log" in flow, "a failed build must leave a log to read")
     check("report_build_log.py" in flow, "the log must reach the check annotations")
     check("rout3-buildozer-log" in flow, "the raw log must be downloadable")
+    # A change to the reporter itself must rebuild too; otherwise the next
+    # failure is still diagnosed by the previous script.
+    check('".github/scripts/**"' in flow,
+          "editing the failure reporter must trigger a build")
+    # An apt mirror can stall for tens of minutes on a hosted runner, and
+    # without a token the job log cannot be read afterwards: every apt call is
+    # bounded (``timeout`` + IPv4), retried once, and the final failure must
+    # publish its own tail as annotations, which *are* readable.
+    check("timeout -k 10" in flow and "Acquire::ForceIPv4=true" in flow,
+          "a stalled mirror must not consume the build window")
+    check("for attempt in 1 2" in flow and "tail -n 60 /tmp/apt.log" in flow,
+          "the host-dependency step must retry and publish its own failure")
     print("CI workflow builds and uploads the debug APK OK")
 
 
@@ -282,15 +337,27 @@ def section_failure_log():
     script = ROOT / ".github/scripts/report_build_log.py"
     check(script.is_file(), "the failure reporter is missing")
 
-    log = "\n".join([
-        "Running 'make'",
-        "  CC  Modules/posixmodule.c",
-        "patch: **** Only garbage was found in the patch input.",
-        "Error: one of the patches failed to apply",
-        "Traceback (most recent call last):",
-        '  File "toolchain.py", line 1, in <module>',
-        "BuildInterruptingException: python3 failed",
-        *(f"line {i} of ordinary build chatter" for i in range(400)),
+    # ``[DEBUG]`` lines are long.  With a tail window of 150 lines that is far
+    # more than four annotations hold, so the chunks must be taken from the
+    # *end* of the window; otherwise the verdict below is never reached.
+    chatter = "".join(f"[DEBUG]   [arm64-v8a] Compile : thing{i}.c" + " " * 400
+                      + "x\n" for i in range(400))
+    log = "".join([
+        "Running 'make'\n",
+        "  CC  Modules/posixmodule.c\n",
+        "patch: **** Only garbage was found in the patch input.\n",
+        "Error: one of the patches failed to apply\n",
+        chatter,
+        "Exception in thread background thread for pid 42:\n",
+        "Traceback (most recent call last):\n",
+        '  File "toolchain.py", line 1, in <module>\n',
+        "BuildInterruptingException: python3 failed\n",
+        # The marker sits past the old 300-char cut, so the annotation only
+        # reaches it when long lines keep enough of themselves.
+        ("E" * 650) + "TAIL_MARKER\n",
+        # buildozer dumps its environment on failure; all of it is noise.
+        "".join(f"#     ENV_VAR_{i} = 'value'\n" for i in range(150)),
+        "# Command failed: buildozer -v android debug",
     ])
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -314,20 +381,251 @@ def section_failure_log():
               "the annotation must quote the failure, not just say it failed")
         check("BuildInterruptingException: python3 failed" in out,
               "the tail of the traceback must survive")
+        check("TAIL_MARKER" in out,
+              "long lines must keep enough to hold the failing command")
+        check("ENV_VAR_0" not in out,
+              "the environment dump must not push the traceback out")
+        check("# Command failed: buildozer" in out,
+              "the final verdict must survive the tail window")
+        tail_cmds = [line for line in out.splitlines()
+                     if line.startswith("::error title=buildozer tail::")]
+        check(any("Command failed: buildozer" in line for line in tail_cmds),
+              "the tail must reach the verdict, not stop in the middle of the log")
         check("%0A" in out,
               "a multiline annotation must be escaped, not dropped")
+        check(len(out.splitlines()) <= 10,
+              "GitHub stores ten annotations per step; emitting more loses the tail")
         check(all(line.startswith("::error") for line in out.splitlines()),
               "every emitted line must be a workflow command")
-        check(summary.is_file() and "line 399 of ordinary build chatter"
-              in summary.read_text(encoding="utf-8"),
-              "a human reading the run needs the tail in the step summary")
+        summary_text = summary.read_text(encoding="utf-8") if summary.is_file() else ""
+        check("BuildInterruptingException: python3 failed" in summary_text,
+              "a human reading the run needs the traceback in the step summary")
     print("a failed cloud build publishes its own diagnosis OK")
+
+
+# ── 4. on-device crash reporting ─────────────────────────────────
+CRASH_SCRIPT = r'''
+import os, sys
+from client import fatal
+
+# The external mirror is derived from ANDROID_PRIVATE, not asked of Java.
+assert fatal.external_files_dir("/data/user/0/org.rout3.rout3/files") == \
+    "/storage/emulated/0/Android/data/org.rout3.rout3/files"
+assert fatal.external_files_dir("") is None
+assert fatal.external_files_dir(None) is None
+
+log = fatal.StartupLog()
+assert log.path, "the startup log was not created anywhere"
+assert log.paths[0].startswith(os.environ["ANDROID_PRIVATE"]), log.paths
+log.stage("numpy import")
+try:
+    raise ImportError("boom-numpy")
+except ImportError as exc:
+    text = log.crash(exc)
+log.close()
+
+data = open(log.path, encoding="utf-8").read()
+assert "stage: numpy import" in data, data
+assert "ImportError: boom-numpy" in data, data
+assert "Этап: numpy import" in text, text
+
+# The failed run leaves a boot marker, and the next launch sees the stage even
+# when the traceback never reached the screen (a native crash closes the app
+# before any Python can draw).
+again = fatal.StartupLog()
+assert again.previous, "the next launch must see the failed run"
+assert again.previous["stage"] == "numpy import", again.previous
+assert again.previous["status"] == "failed", again.previous
+# The traceback travels with the marker: when the exception *is* the display,
+# the current run cannot draw it and only the next launch can.
+tail = "\n".join(again.previous.get("tail") or [])
+assert "ImportError: boom-numpy" in tail, again.previous
+assert again.previous.get("python"), "the marker names the interpreter that died"
+# Once startup completes, a later normal close is not a crash.
+again.mark_running()
+again.close()
+third = fatal.StartupLog()
+assert third.previous is None, third.previous
+third.clear_boot()
+third.close()
+fourth = fatal.StartupLog()
+assert fourth.previous is None, fourth.previous
+fourth.close()
+
+# An unwritable candidate set must degrade to memory, never raise.
+ro = fatal.StartupLog(private="/proc/definitely-not-here", app_root="/proc/nope")
+ro.write("still fine")
+ro.stage("numpy import")
+ro.clear_boot()
+ro.close()
+
+# The screen itself must draw with whatever driver the device has.
+assert fatal.show_fatal(text, log=log, interactive=False) is True
+import pygame
+raw = pygame.image.tobytes(pygame.display.get_surface(), "RGB")
+total = len(raw) // 3
+ink = total - raw.count(b"\x08\x08\x0c")
+assert ink > 2000, f"the report screen is blank ({total} px, {ink} ink)"
+print("CRASH REPORTER OK")
+'''
+
+
+def section_crash_reporter():
+    with tempfile.TemporaryDirectory() as tmp:
+        private = os.path.join(tmp, "files")
+        app_root = os.path.join(private, "app")
+        os.makedirs(app_root)
+        env = dict(os.environ)
+        env.update({
+            "ANDROID_ARGUMENT": app_root,
+            "ANDROID_APP_PATH": app_root,
+            "ANDROID_UNPACK": app_root,
+            "ANDROID_PRIVATE": private,
+            "P4A_BOOTSTRAP": "sdl2",
+            "PYTHONPATH": str(ROOT),
+            "SDL_VIDEODRIVER": "dummy",
+            "SDL_AUDIODRIVER": "dummy",
+        })
+        proc = subprocess.run([sys.executable, "-c", CRASH_SCRIPT], cwd=tmp,
+                              env=env, capture_output=True, text=True, timeout=180)
+        check(proc.returncode == 0,
+              f"crash reporter failed:\n{proc.stdout}\n{proc.stderr}")
+        check("CRASH REPORTER OK" in proc.stdout, proc.stdout)
+    print("startup crash: log mirror, stage markers, on-screen traceback OK")
+
+
+# ── 4a. the Java reporter that covers the pre-Python window ──────
+def section_java_reporter():
+    """The first frames of an APK launch exist only in Java.
+
+    ``PythonActivity.onCreate`` loads the native libraries and builds the SDL
+    surface *before* the presplash is shown, so a failure there closes the
+    window with no splash -- and ``client/fatal.py`` has not started, so the
+    boot marker does not exist either.  ``tools/android/java`` wraps that window;
+    these assertions keep the wiring (which is invisible to a desktop run)
+    from rotting between CI builds.
+    """
+    cfg = read_spec()
+    app = cfg["app"]
+
+    # p4a's own documentation calls --android-entrypoint "usually a subclass of
+    # PythonActivity", so the wiring is supported rather than a hack.
+    entry = app["android.entrypoint"]
+    check(entry == "org.rout3.DiagActivity", entry)
+    cls_path = ROOT / "tools/android/java" / (entry.replace(".", "/") + ".java")
+    check(cls_path.is_file(), f"entrypoint class is missing: {cls_path}")
+
+    sources = {p.stem: p.read_text(encoding="utf-8")
+               for p in (ROOT / "tools/android/java").rglob("*.java")}
+    check({"DiagActivity", "DiagApp", "DiagLog"} <= set(sources), sorted(sources))
+
+    diag = sources["DiagActivity"]
+    check("extends org.kivy.android.PythonActivity" in diag,
+          "the launcher must keep PythonActivity's behaviour")
+    check(f"public class {cls_path.stem}" in diag,
+          "the public class name must match the file name")
+    # The failure this exists for is thrown by code we do not own, including
+    # Errors (UnsatisfiedLinkError, ExceptionInInitializerError).
+    check("catch (Throwable failure)" in diag, "a startup failure must be caught")
+    check("super.onCreate(state)" in diag, "the wrapped call is super.onCreate")
+    check("setTextIsSelectable(true)" in diag,
+          "the traceback must be copyable, not just readable")
+    check("mBrokenLibraries" in diag,
+          "SDL's own broken-library verdict must be reported by name")
+    check("System.loadLibrary" in diag,
+          "a broken library must be named, not left as a raw linker message")
+    check(diag.index("preloadLibraries();") < diag.index("super.onCreate(state)"),
+          "libs must be loaded before the activity so a native crash names one")
+    check('DiagLog.mark("native: loading " + name)' in diag,
+          "the library name must reach the disk before the library is loaded")
+
+    # Only platform and p4a APIs: the Java sources are compiled by the APK build
+    # alone, so a dependency on a jar that is not in the bootstrap is invisible
+    # until a 40-minute CI run fails.
+    for name, text in sources.items():
+        imports = re.findall(r"^import\s+([\w.]+);", text, re.M)
+        allowed = ("android.", "java.", "org.kivy.android.")
+        bad = [i for i in imports if not i.startswith(allowed)]
+        check(not bad, f"{name}.java imports outside the bootstrap: {bad}")
+
+    # The application class runs before any activity exists: that is the only
+    # place that can record a failure inside the activity's own class loading.
+    diag_app = sources["DiagApp"]
+    check("extends Application" in diag_app, "the earliest hook is an Application")
+    manifest_attr = app["android.extra_manifest_application_arguments"]
+    attr_path = ROOT / manifest_attr
+    check(attr_path.is_file(), f"application arguments file is missing: {attr_path}")
+    check('android:name="org.rout3.DiagApp"' in attr_path.read_text(encoding="utf-8"),
+          "the Application subclass must be selected in the manifest")
+    check("DiagLog.installHandler" in diag_app,
+          "class-loading failures need the handler installed before the activity")
+
+    # Both sinks and the durability of every line: the process may die on the
+    # next statement, so a buffered last marker is the same as no marker.
+    log = sources["DiagLog"]
+    check("getExternalFilesDir(null)" in log,
+          "the journal must be reachable over USB, without adb")
+    check("getFilesDir()" in log, "app-private storage is the fallback")
+    check("out.getFD().sync()" in log, "every marker must survive the next line")
+    check("setDefaultUncaughtExceptionHandler" in log,
+          "an uncaught exception must leave a trace")
+    check("previous.uncaughtException" in log,
+          "the platform handler must still run: the process has to die normally")
+
+    print("Java startup reporter: entrypoint, application hook, journal OK")
+
+
+# ── 4b. the desktop end of the same trail ────────────────────────
+def section_device_tool():
+    import importlib.util
+
+    path = ROOT / "tools" / "android_log.py"
+    spec = importlib.util.spec_from_file_location("android_log", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    # The one fact that makes an installed APK close before Python runs: its
+    # ABI is not on the device.  Naming it saves a whole build/test cycle.
+    arm64 = "ro.product.cpu.abi = arm64-v8a\nro.product.cpu.abilist = arm64-v8a,armeabi-v7a"
+    only32 = "ro.product.cpu.abi = armeabi-v7a\nro.product.cpu.abilist = armeabi-v7a"
+    check(module.arch_warning(["arm64-v8a"], arm64) is None,
+          "an arm64 APK on an arm64 phone must not warn")
+    warning = module.arch_warning(["arm64-v8a"], only32)
+    check(warning is not None and "arm64-v8a" in warning,
+          "a 64-bit-only APK on a 32-bit phone must be named as the cause")
+    check(module.arch_warning([], arm64) is None, "an unknown APK must stay quiet")
+
+    apk = ROOT / "releases" / "rout3-1.2.0-arm64-v8a-debug.apk"
+    if apk.is_file():
+        check(module.apk_archs(str(apk)) == ["arm64-v8a"],
+              "the shipped APK must declare exactly the arm64 ABI")
+
+    # The log lives in app-private storage and in the separate crash buffer;
+    # both are invisible to a file manager on Android 11+.
+    script = path.read_text(encoding="utf-8")
+    check("run-as" in script and "rout3-startup.log" in script,
+          "the tool must read the app-private startup log")
+    check("rout3-java.log" in script,
+          "the pre-Python journal is the only record of an early crash")
+    check("-b\", \"crash\"" in script or "-b crash" in script,
+          "the native crash buffer is separate from the main logcat buffer")
+    check(module.summary("I/x: hello\nE/PythonActivity: boom\nI/y: ok") ==
+          ["E/PythonActivity: boom"], "the summary must keep only relevant lines")
+
+    proc = subprocess.run([sys.executable, str(path), "--help"],
+                          capture_output=True, text=True, timeout=60)
+    check(proc.returncode == 0 and "--no-launch" in proc.stdout,
+          f"the tool must document its flags:\n{proc.stdout}\n{proc.stderr}")
+    print("device tool: ABI mismatch, crash buffer, app-private log OK")
 
 
 def main():
     section_spec()
     section_recipes()
     section_entrypoint()
+    section_crash_reporter()
+    section_java_reporter()
+    section_device_tool()
     section_writable_root()
     section_fullscreen()
     section_workflow()

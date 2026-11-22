@@ -156,10 +156,10 @@ def control_hints(mode) -> str:
     """Control layout shown in the lobby and in the party-start log."""
     if is_touch(mode):
         return ("Левый стик — движение | Правый стик — обзор | "
-                "Огонь | Дэш | Использовать | ⇄ — оружие")
+                "Огонь | Дэш | Использовать | Смена оружия")
     if is_tractor(mode):
-        return ("WASD — движение | ←/→ — обзор | Пробел — огонь | "
-                "Левый Shift — дэш | E — использовать")
+        return ("WASD — движение | Стрелки влево/вправо — обзор | "
+                "Пробел — огонь | Левый Shift — дэш | E — использовать")
     return ("WASD — движение | Мышь — обзор | ЛКМ — огонь | Пробел — дэш | "
             "E — использовать")
 
@@ -302,7 +302,7 @@ def format_value(key: str, value) -> str:
         return f"{float(value):.1f} рад/с"
     if key == "window_size":
         text = str(value)
-        return text if text in WINDOW_SIZE_PRESETS else f"Другое → {text}"
+        return text if text in WINDOW_SIZE_PRESETS else f"Другое: {text}"
     if isinstance(value, bool):
         return "ВКЛ" if value else "ВЫКЛ"
     return str(int(value)) if isinstance(value, float) else str(value)
@@ -427,7 +427,7 @@ class Settings:
         """Store a list-kind setting as the *label* of its entry.
 
         All ``list`` settings store the entry label, so a value typed by hand
-        (window size) simply is not in the list and reads as «Другое → …».
+        (window size) simply is not in the list and reads as «Другое: …».
         """
         spec = SPEC_BY_KEY.get(key)
         if spec is None or spec.get("kind") != "list":

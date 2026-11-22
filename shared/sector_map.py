@@ -48,6 +48,9 @@ MIN_PLATFORM_THICKNESS = 8
 # property of the geometry that the editor must show and the server enforce —
 # not a balance number.
 ACTOR_HEIGHT = 56
+# Eye/shoot origin height above the actor's support surface. Matches
+# engine.constants.CAM_Z so server traces and rendering agree on height.
+EYE_HEIGHT = 41.0
 
 # Linedef special: a door. The number matches ``SPECIAL_NAMES["дверь"]`` in
 # ``shared/text_map.py``. A door is an ordinary two-sided linedef that blocks
@@ -171,11 +174,26 @@ def _orient(ax: float, ay: float, bx: float, by: float,
 
 def _segments_cross(ax: float, ay: float, bx: float, by: float,
                     cx: float, cy: float, dx: float, dy: float) -> bool:
+    return _segment_cross_t(ax, ay, bx, by, cx, cy, dx, dy) is not None
+
+
+def _segment_cross_t(ax: float, ay: float, bx: float, by: float,
+                     cx: float, cy: float, dx: float, dy: float) -> float | None:
+    """Param t on AB where AB crosses CD, or None."""
     o1 = _orient(ax, ay, bx, by, cx, cy)
     o2 = _orient(ax, ay, bx, by, dx, dy)
     o3 = _orient(cx, cy, dx, dy, ax, ay)
     o4 = _orient(cx, cy, dx, dy, bx, by)
-    return o1 != o2 and o3 != o4
+    if o1 == o2 or o3 == o4:
+        return None
+    rpx, rpy = bx - ax, by - ay
+    spx, spy = dx - cx, dy - cy
+    rxs = rpx * spy - rpy * spx
+    if abs(rxs) < 1e-12:
+        return None
+    q_p_x, q_p_y = cx - ax, cy - ay
+    t = (q_p_x * spy - q_p_y * spx) / rxs
+    return t
 
 
 class SectorMap:
@@ -489,7 +507,7 @@ class SectorMap:
                   if 0 <= ld.back < n_sides else -1)
             f_float = 0 <= fs < n_secs and self.sectors[fs].floating
             b_float = 0 <= bs < n_secs and self.sectors[bs].floating
-            if (f_float or b_float) and ld.solid:
+            if (f_float != b_float) and ld.solid:
                 errs.append(
                     f"linedef {i}: solid flag on a floating sector border")
 
@@ -562,18 +580,19 @@ class SectorMap:
         ld = self.linedefs[li]
         n_sides = len(self.sidedefs)
         n_secs = len(self.sectors)
-        # A slab border is not a wall — not even a one-sided one: whether an
-        # actor fits under it or can step onto it is a question about the
-        # actor, answered by ``support_at``, not a property of the line
-        # (design §3).
+        # An ordinary<->floating border is not a wall: whether an actor fits
+        # under/onto a slab is answered by ``support_at``. Floating-floating
+        # borders are normal connections between slabs.
+        f_float = False
+        b_float = False
         if 0 <= ld.front < n_sides:
-            fs = self.sidedefs[ld.front].sector
-            if 0 <= fs < n_secs and self.sectors[fs].floating:
-                return False
+            fs0 = self.sidedefs[ld.front].sector
+            f_float = 0 <= fs0 < n_secs and self.sectors[fs0].floating
         if 0 <= ld.back < n_sides:
-            bs = self.sidedefs[ld.back].sector
-            if 0 <= bs < n_secs and self.sectors[bs].floating:
-                return False
+            bs0 = self.sidedefs[ld.back].sector
+            b_float = 0 <= bs0 < n_secs and self.sectors[bs0].floating
+        if f_float != b_float:
+            return False
         if ld.back < 0:
             return True
         if not (0 <= ld.front < n_sides and 0 <= ld.back < n_sides):
@@ -1010,9 +1029,13 @@ class SectorMap:
                             checked.append(li)
         return checked
 
-    def is_wall_px(self, x: float, y: float) -> bool:
-        """True if the point is solid (void or outside all sectors)."""
-        return self.find_sector_at(x, y) < 0
+    def is_wall_px(self, x: float, y: float, z: float | None = None) -> bool:
+        """True if the point is solid (void, outside sectors, or inside slab)."""
+        if self.find_sector_at(x, y) < 0:
+            return True
+        if z is not None and self._point_in_slab(x, y, z):
+            return True
+        return False
 
     def can_move_px(self, x: float, y: float, r: float,
                     extra_blocked: set[int] | None = None) -> bool:
@@ -1157,17 +1180,88 @@ class SectorMap:
                 return True
         return False
 
-    def has_los_px(self, x1: float, y1: float, x2: float, y2: float,
-                   extra_blocked: set[int] | None = None) -> bool:
-        """True if no one-sided linedef crosses the segment.
+    def _has_floating(self) -> bool:
+        return any(getattr(s, "floating", False) for s in self.sectors)
 
-        ``extra_blocked`` adds shut doors to the blocking set.
+    @staticmethod
+    def _seg_z(z1: float, z2: float, t: float) -> float:
+        return z1 + (z2 - z1) * t
+
+    def _slab_interval_at(self, x: float, y: float) -> list[tuple[float, float]]:
+        """Solid vertical intervals of floating slabs containing (x, y)."""
+        out: list[tuple[float, float]] = []
+        for si in self.sectors_at(x, y):
+            s = self.sectors[si]
+            if getattr(s, "floating", False):
+                lo, hi = float(s.ceil_h), float(s.floor_h)
+                if hi > lo:
+                    out.append((lo, hi))
+        return out
+
+    def _point_in_slab(self, x: float, y: float, z: float) -> bool:
+        for lo, hi in self._slab_interval_at(x, y):
+            if lo < z < hi:
+                return True
+        return False
+
+    def _segment_hits_slab(self, x1: float, y1: float, z1: float,
+                           x2: float, y2: float, z2: float) -> bool:
+        """True when 3D segment intersects any floating slab volume."""
+        if not self._has_floating():
+            return False
+        if self._point_in_slab(x1, y1, z1) or self._point_in_slab(x2, y2, z2):
+            return True
+        verts = self.verts
+        n_sides = len(self.sidedefs)
+        n_secs = len(self.sectors)
+        for ld in self.linedefs:
+            if not (0 <= ld.front < n_sides):
+                continue
+            fs = self.sidedefs[ld.front].sector
+            bs = (self.sidedefs[ld.back].sector
+                  if 0 <= ld.back < n_sides else -1)
+            f_float = 0 <= fs < n_secs and getattr(self.sectors[fs], "floating", False)
+            b_float = 0 <= bs < n_secs and getattr(self.sectors[bs], "floating", False)
+            if not f_float and not b_float:
+                continue
+            if not (0 <= ld.v1 < len(verts) and 0 <= ld.v2 < len(verts)):
+                continue
+            ax, ay = verts[ld.v1].x, verts[ld.v1].y
+            bx, by = verts[ld.v2].x, verts[ld.v2].y
+            hit = _segment_cross_t(x1, y1, x2, y2, ax, ay, bx, by)
+            if hit is None:
+                continue
+            t = hit
+            z = self._seg_z(z1, z2, t)
+            for sec_idx, is_float in ((fs, f_float), (bs, b_float)):
+                if not is_float:
+                    continue
+                s = self.sectors[sec_idx]
+                if float(s.ceil_h) < z < float(s.floor_h):
+                    return True
+        # Sample along the segment to catch top/bottom face pierce cases.
+        for i in range(1, 8):
+            t = i / 8.0
+            if self._point_in_slab(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t,
+                                   z1 + (z2 - z1) * t):
+                return True
+        return False
+
+    def has_los_px(self, x1: float, y1: float, x2: float, y2: float,
+                   extra_blocked: set[int] | None = None,
+                   z1: float | None = None, z2: float | None = None) -> bool:
+        """True if no blocking wall/slab volume crosses the segment.
+
+        ``extra_blocked`` adds shut doors to the blocking set. When ``z1`` and
+        ``z2`` are provided, floating slab volumes are treated as 3D blockers.
         """
         if math.hypot(x2 - x1, y2 - y1) < 1.0:
+            if z1 is not None and z2 is not None and self._point_in_slab(x1, y1, (z1 + z2) * 0.5):
+                return False
             return True
         if self._reject is not None:
             reject, n = self._reject
-            if reject:
+            if reject and z1 is None and z2 is None:
                 sa = self.find_sector_at(x1, y1)
                 sb = self.find_sector_at(x2, y2)
                 if sa >= 0 and sb >= 0 and mt1.reject_test(reject, n, sa, sb):
@@ -1192,8 +1286,31 @@ class SectorMap:
             ld = self.linedefs[li]
             ax, ay = verts[ld.v1].x, verts[ld.v1].y
             bx, by = verts[ld.v2].x, verts[ld.v2].y
-            if _segments_cross(x1, y1, x2, y2, ax, ay, bx, by):
-                return False
+            if z1 is not None and z2 is not None:
+                hit = _segment_cross_t(x1, y1, x2, y2, ax, ay, bx, by)
+                if hit is None:
+                    continue
+                if self.line_blocks(li):
+                    return False
+                # floating border: blocks only inside slab z interval
+                z = self._seg_z(z1, z2, hit)
+                n_sides = len(self.sidedefs)
+                n_secs = len(self.sectors)
+                if 0 <= ld.front < n_sides:
+                    fs = self.sidedefs[ld.front].sector
+                    if 0 <= fs < n_secs and getattr(self.sectors[fs], "floating", False):
+                        s = self.sectors[fs]
+                        if float(s.ceil_h) < z < float(s.floor_h):
+                            return False
+                if 0 <= ld.back < n_sides:
+                    bs = self.sidedefs[ld.back].sector
+                    if 0 <= bs < n_secs and getattr(self.sectors[bs], "floating", False):
+                        s = self.sectors[bs]
+                        if float(s.ceil_h) < z < float(s.floor_h):
+                            return False
+            else:
+                if _segments_cross(x1, y1, x2, y2, ax, ay, bx, by):
+                    return False
         if extra_blocked:
             for li in extra_blocked:
                 if not (0 <= li < len(self.linedefs)):
@@ -1201,8 +1318,15 @@ class SectorMap:
                 ld = self.linedefs[li]
                 ax, ay = verts[ld.v1].x, verts[ld.v1].y
                 bx, by = verts[ld.v2].x, verts[ld.v2].y
-                if _segments_cross(x1, y1, x2, y2, ax, ay, bx, by):
-                    return False
+                if z1 is not None and z2 is not None:
+                    hit = _segment_cross_t(x1, y1, x2, y2, ax, ay, bx, by)
+                    if hit is not None:
+                        return False
+                else:
+                    if _segments_cross(x1, y1, x2, y2, ax, ay, bx, by):
+                        return False
+        if z1 is not None and z2 is not None and self._segment_hits_slab(x1, y1, z1, x2, y2, z2):
+            return False
         return True
 
     def spawn_px(self) -> list[tuple[float, float]]:

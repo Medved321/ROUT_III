@@ -15,7 +15,10 @@ GREEN = (90, 210, 120)
 SELECT = (70, 95, 150)
 WARN = (240, 170, 60)
 ROW_H = 46
-HINTS = "↑/↓ — выбор | ←/→ — изменить | Enter — переключить | Esc — назад"
+HINTS = ("Стрелки вверх/вниз — выбор | Стрелки влево/вправо — изменить | "
+         "Enter — переключить | Esc — назад")
+HINTS_REFRESH = HINTS + " | R — обновить партии"
+REFRESH_LABEL = "Обновить [R]"
 # Row that owns a free-text field (the window size): the field is the only way
 # to a resolution that is not in the preset list, e.g. 4K on an odd monitor.
 CUSTOM_ROW_KEY = "window_size"
@@ -36,6 +39,8 @@ FIELD_LABEL_BAND = 20
 FIELD_W = 420
 ERROR_BAND = 18
 BACK_H = 42
+ACTION_BTN_W = 200
+ACTION_BTN_GAP = 16
 HINT_BAND = 34
 BTN_PAD = 12
 VALUE_GAP = 12
@@ -79,7 +84,11 @@ class SettingsScreen:
         self.small_font = pygame.font.SysFont("monospace", 14)
 
         self.field_h = 34
-        self.back_btn = pygame.Rect(0, 0, 200, 42)
+        # The lobby refresh action lives here now, beside "Назад".  Pausing an
+        # active match turns it off (there is no lobby list to refresh then).
+        self.refresh_enabled = True
+        self.refresh_btn = pygame.Rect(0, 0, 0, 0)
+        self.back_btn = pygame.Rect(0, 0, ACTION_BTN_W, BACK_H)
         # Measured once from the row font (see ``_label_needed``).
         self._label_needed_px = None
         self._layout()
@@ -111,9 +120,28 @@ class SettingsScreen:
         self._error_rect = pygame.Rect(
             self._field_x(), self._field_rect.bottom + GAP, FIELD_W, ERROR_BAND
         )
-        self.back_btn = pygame.Rect(
-            (self.width - 200) // 2, self._error_rect.bottom + GAP, 200, BACK_H
-        )
+        action_y = self._error_rect.bottom + GAP
+        if self.refresh_enabled:
+            total = 2 * ACTION_BTN_W + ACTION_BTN_GAP
+            left = (self.width - total) // 2
+            self.refresh_btn = pygame.Rect(left, action_y, ACTION_BTN_W, BACK_H)
+            self.back_btn = pygame.Rect(
+                left + ACTION_BTN_W + ACTION_BTN_GAP, action_y,
+                ACTION_BTN_W, BACK_H,
+            )
+        else:
+            self.refresh_btn = pygame.Rect(0, 0, 0, 0)
+            self.back_btn = pygame.Rect(
+                (self.width - ACTION_BTN_W) // 2, action_y,
+                ACTION_BTN_W, BACK_H,
+            )
+
+    def set_refresh_enabled(self, enabled: bool) -> None:
+        """Show/hide the lobby refresh action and rebuild the action row."""
+        if self.refresh_enabled == bool(enabled):
+            return
+        self.refresh_enabled = bool(enabled)
+        self._layout()
 
     def _field_x(self) -> int:
         return (self.width - FIELD_W) // 2
@@ -291,6 +319,10 @@ class SettingsScreen:
         self._last_typed = None
         for event in events:
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self.refresh_enabled and self.refresh_btn.collidepoint(event.pos):
+                    self._stop_editing()
+                    settings.save()
+                    return "refresh"
                 if self.back_btn.collidepoint(event.pos):
                     self._stop_editing()
                     settings.save()
@@ -332,7 +364,10 @@ class SettingsScreen:
                     elif event.unicode:
                         self._append_typed(event.unicode, "key")
                     continue
-                if event.key == pygame.K_ESCAPE:
+                if self.refresh_enabled and event.key == pygame.K_r:
+                    settings.save()
+                    return "refresh"
+                elif event.key == pygame.K_ESCAPE:
                     settings.save()
                     return "back"
                 elif event.key == pygame.K_UP:
@@ -408,14 +443,27 @@ class SettingsScreen:
                     )
 
         if self._scroll > 0:
-            up = self.small_font.render("\u25b2", True, MUTED)
+            up = self.small_font.render("^", True, MUTED)
             surface.blit(up, (self._rows_rect.right + 6, top))
         if self._scroll < self._max_scroll:
-            down = self.small_font.render("\u25bc", True, MUTED)
+            down = self.small_font.render("v", True, MUTED)
             surface.blit(down, (self._rows_rect.right + 6,
                                 self._rows_rect.bottom - 14))
 
         self._draw_field(surface, settings)
+
+        if self.refresh_enabled:
+            pygame.draw.rect(surface, PANEL, self.refresh_btn, border_radius=6)
+            pygame.draw.rect(surface, GREEN, self.refresh_btn, 2, border_radius=6)
+            refresh = self.font.render(
+                ellipsize(REFRESH_LABEL, self.font,
+                          self.refresh_btn.width - 2 * BTN_PAD),
+                True, TEXT)
+            surface.blit(
+                refresh,
+                (self.refresh_btn.centerx - refresh.get_width() // 2,
+                 self.refresh_btn.centery - refresh.get_height() // 2),
+            )
 
         pygame.draw.rect(surface, PANEL, self.back_btn, border_radius=6)
         pygame.draw.rect(surface, ACCENT, self.back_btn, 2, border_radius=6)
@@ -428,7 +476,8 @@ class SettingsScreen:
              self.back_btn.centery - back.get_height() // 2),
         )
 
-        hint = self.small_font.render(HINTS, True, MUTED)
+        hint_text = HINTS_REFRESH if self.refresh_enabled else HINTS
+        hint = self.small_font.render(hint_text, True, MUTED)
         surface.blit(hint, ((self.width - hint.get_width()) // 2, self.height - 28))
 
     def _draw_field(self, surface, settings) -> None:

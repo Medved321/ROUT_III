@@ -337,18 +337,21 @@ def _initial_segs(sm: SectorMap) -> list:
 
 
 def _floating_lines(sm: SectorMap) -> set[int]:
-    """Linedefs that border a floating slab (design §2).
+    """Linedefs that touch a floating slab (host border or slab-to-slab seam).
 
-    The BSP is the flat world of *host* sectors.  A slab's border is not a
-    partition: splitting the plane along it would hand the area under the slab
-    to the slab's own subsector, and the host's floor — which by
+    The BSP is the flat world of *host* sectors.  Any slab border is not a
+    partition: splitting the plane along it would hand the area under the
+    slab to the slab's own subsector, and the host's floor — which by
     ``_ensure_polys`` still spans the footprint — would have nothing left to
-    draw it.  The slab is painted as an overlay by ``engine.platform_render``
-    from its polygon instead.  Maps without slabs get an empty set, so their
-    tree is bit-for-bit the one they had before this change.
-    """
-    from shared.sector_map import SPECIAL_DOORS
+    draw it.  A seam between two plates is the same overlay geometry: the
+    base pass must not turn it into a solid wall that owns the column in
+    ``view_buf`` and hides the far plate (change
+    ``floating-sector-overlay-clip-fix``).  The height step, when there is
+    one, is painted by ``platform_render._side_bands``.
 
+    Maps without slabs get an empty set, so their tree is bit-for-bit the one
+    they had before this change.
+    """
     sectors = sm.sectors
     floating = [bool(getattr(s, "floating", False)) for s in sectors]
     if not any(floating):
@@ -362,13 +365,6 @@ def _floating_lines(sm: SectorMap) -> set[int]:
     out = set()
     for li, ld in enumerate(sm.linedefs):
         if _is_float(ld.front) or _is_float(ld.back):
-            # Allow doors between floating sectors to be partitioned
-            fs_sec = side_sec[ld.front] if 0 <= ld.front < len(side_sec) else -1
-            bs_sec = side_sec[ld.back] if ld.back >= 0 and ld.back < len(side_sec) else -1
-            both_floating = (0 <= fs_sec < len(floating) and floating[fs_sec] and
-                            0 <= bs_sec < len(floating) and floating[bs_sec])
-            if both_floating and getattr(ld, "special", 0) == SPECIAL_DOORS:
-                continue
             out.add(li)
     return out
 

@@ -58,6 +58,38 @@ VIEW_CONE = 1.0
 _FONT_SIZES = (34, 18)
 _font_cache: dict[tuple[int, int], tuple] = {}
 
+#: Character used when a HUD label has to be shortened.  The engine cannot
+#: import ``client.ui_layout`` (standalone-engine boundary), so the one piece of
+#: text fitting the HUD needs lives here next to the metrics that size it.
+ELLIPSIS = "…"
+
+
+def fit_text(text: str, font: pygame.font.Font, max_width: int) -> str:
+    """Shorten ``text`` with an ellipsis until it fits ``max_width``.
+
+    ``font.size`` measures without allocating a throwaway surface, so this is
+    safe to call on every HUD frame.  A binary search keeps it logarithmic in
+    the length of the label; on a tie the longest fitting prefix wins.
+    """
+    if max_width <= 0:
+        return ""
+    if font.size(text)[0] <= max_width:
+        return text
+    if font.size(ELLIPSIS)[0] > max_width:
+        return ""
+
+    lo, hi = 0, len(text)
+    best = ""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = text[:mid].rstrip() + ELLIPSIS
+        if font.size(candidate)[0] <= max_width:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
 
 def ui_scale(width: int | None = None, height: int | None = None) -> float:
     """Factor for interface sizes at the current window.

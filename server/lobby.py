@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from shared.combat import DEFAULT_TICK_RATE, validate_tick_rate
 from server.game_world import GameWorld
 from server.player import PlayerSession
 
@@ -9,11 +10,12 @@ logger = logging.getLogger(__name__)
 
 
 class Party:
-    def __init__(self, party_id: int, name: str, mode: str = 'pve', game_map=None):
+    def __init__(self, party_id: int, name: str, mode: str = 'pve', game_map=None,
+                 tick_rate: int = DEFAULT_TICK_RATE):
         self.id = party_id
         self.name = name
         self.mode = mode  # 'pve' or 'pvp'
-        self.world = GameWorld(mode=mode, game_map=game_map)
+        self.world = GameWorld(mode=mode, game_map=game_map, tick_rate=tick_rate)
         self.members: dict[int, PlayerSession] = {}  # player_id -> session
 
     def add_member(self, session: PlayerSession) -> int:
@@ -38,7 +40,8 @@ class Party:
 
 
 class Lobby:
-    def __init__(self):
+    def __init__(self, tick_rate: int = DEFAULT_TICK_RATE):
+        self.tick_rate = validate_tick_rate(tick_rate)
         self.parties: dict[int, Party] = {}
         self._next_party_id: int = 1
 
@@ -56,7 +59,8 @@ class Lobby:
         raise RuntimeError("party id space exhausted")
 
     def create_party(self, name: str, mode: str = 'pve', game_map=None) -> Party:
-        party = Party(self._allocate_party_id(), name, mode, game_map=game_map)
+        party = Party(self._allocate_party_id(), name, mode, game_map=game_map,
+                      tick_rate=self.tick_rate)
         self.parties[party.id] = party
         logger.info(f"Party created: {name} (id={party.id}, mode={mode})")
         return party

@@ -32,18 +32,27 @@ from __future__ import annotations
 import math
 from collections import deque
 
-from shared.combat import wpn_cooldown_ticks, TICK_INTERVAL
+from shared.combat import (
+    DEFAULT_TICK_RATE, wpn_cooldown_ticks, tick_interval, fps60_per_tick, FPS_60,
+)
 
-PISTOL = 1          # f=16 -> 5 тиков -> врата 0.30 с
-RIFLE = 3           # f=8  -> 3 тика  -> врата 0.20 с
-SSG = 5             # f=75 -> 25 тиков -> врата 1.30 с
+# Scenario rates: every gameplay scenario below runs at each of them. The gate,
+# the cooldown and the client clock are derived from the rate, not from a fixed
+# 20 tps constant, so a regression that ignores HELLO_ACK shows up as a refusal
+# or a stretched interval at 30/40.
+RATES = (20, 30, 40)
+
+PISTOL = 1          # f=16 -> 5 тиков @20 -> врата 0.30 с
+RIFLE = 3           # f=8  -> 3 тика  @20 -> врата 0.20 с
+SSG = 5             # f=75 -> 25 тиков @20 -> врата 1.30 с
 
 
-def _gate_seconds(weapon_id: int) -> float:
+def _gate_seconds(weapon_id: int, tick_rate: int = DEFAULT_TICK_RATE) -> float:
     """Ширина клиентских врат темпа: кулдаун в секундах + один тик запаса."""
     from engine.constants import WPN
-    ticks = wpn_cooldown_ticks(int(WPN[weapon_id]['f']))
-    return ticks * TICK_INTERVAL + TICK_INTERVAL
+    iv = tick_interval(tick_rate)
+    ticks = wpn_cooldown_ticks(int(WPN[weapon_id]['f']), tick_rate)
+    return ticks * iv + iv
 
 
 class _Clock:
@@ -89,7 +98,8 @@ class _StubInput:
 
 
 class _StubNet:
-    def __init__(self) -> None:
+    def __init__(self, tick_rate: int = DEFAULT_TICK_RATE) -> None:
+        self.tick_rate = tick_rate
         self.fires: list[int] = []
         self._seq = 0
 
@@ -101,7 +111,8 @@ class _StubNet:
         return self._seq
 
 
-def _client_stub(ammo: int = 200, weapon_id: int = PISTOL):
+def _client_stub(ammo: int = 200, weapon_id: int = PISTOL,
+                 tick_rate: int = DEFAULT_TICK_RATE):
     """GameClient без конструктора: только поля, которые читает цикл огня."""
     from client.client import GameClient
 
@@ -118,8 +129,18 @@ def _client_stub(ammo: int = 200, weapon_id: int = PISTOL):
     c._server_fire_seq = 0
     c._server_fire_ready = 0
     c.local_weapon = weapon_id
-    c.network = _StubNet()
+    c.network = _StubNet(tick_rate)
     return c
+
+
+def _server_stub(tick_rate: int = DEFAULT_TICK_RATE):
+    """GameServer without a socket: the stubbed methods read self.tick_rate."""
+    from server.server import GameServer as _GameServer
+
+    server = _GameServer.__new__(_GameServer)
+    server.tick_rate = tick_rate
+    server.tick_interval = tick_interval(tick_rate)
+    return server
 
 
 def _run_frames(c, clock, times_and_presses):
@@ -196,7 +217,8 @@ def _run_server_loop(server, clock: _WindowsClock) -> None:
         asyncio.sleep, ss.time = real_sleep, real_time
 
 
-def test_client_press_on_a_closed_gate_is_remembered_once():
+def test_client_press_on_a_closed_gate_is_remembered_once(
+        tick_rate: int = DEFAULT_TICK_RATE):
     """1.1 Клик по горячему оружию запоминается РОВНО на одно открытие врат.
 
     Без памяти клик в закрытые врата просто пропадает, а у дробовика (врата
@@ -205,9 +227,9 @@ def test_client_press_on_a_closed_gate_is_remembered_once():
     скоростью кулдауна. Поэтому память ровно на одно нажатие: клик не теряется,
     и расти нечему.
     """
-    c = _client_stub()
+    c = _client_stub(tick_rate=tick_rate)
     clock = _Clock()
-    gate = _gate_seconds(PISTOL)
+    gate = _gate_seconds(PISTOL, tick_rate)
 
     # первый клик: врата открыты -> интент уходит
     _run_frames(c, clock, [(0.10, True, True)])
@@ -238,11 +260,11 @@ def test_client_press_on_a_closed_gate_is_remembered_once():
     print("1.1 a press on a closed gate fires on the next opening, once OK")
 
 
-def test_client_held_fire_sends_every_gate():
+def test_client_held_fire_sends_every_gate(tick_rate: int = DEFAULT_TICK_RATE):
     """1.1 Удержание кнопки = интент на каждом открытии врат."""
-    c = _client_stub()
+    c = _client_stub(tick_rate=tick_rate)
     clock = _Clock()
-    gate = _gate_seconds(PISTOL)
+    gate = _gate_seconds(PISTOL, tick_rate)
 
     # Кнопка нажата все 4 окна подряд, фронт только на самом первом кадре.
     # Кадры идут чаще открытия врат (шаг gate/4), поэтому охват не зависит от
@@ -260,21 +282,20 @@ def test_client_held_fire_sends_every_gate():
     print("1.1 held fire sends one intent per gate OK")
 
 
-def test_input_does_not_shoot_on_server():
+def test_input_does_not_shoot_on_server(tick_rate: int = DEFAULT_TICK_RATE):
     """1.2 PLAYER_INPUT только удержание: сервер из него не стреляет."""
     from server.game_world import GameWorld
-    from server.server import GameServer
     from server.weapons import apply_weapon_switch
     from shared.components import Position, WeaponComponent, Player
 
-    w = GameWorld(mode='pve')
+    w = GameWorld(mode='pve', tick_rate=tick_rate)
     eid = w.add_player(1, 'A')
     wp = w.entities.get_component(eid, WeaponComponent)
     pl = w.entities.get_component(eid, Player)
     wp.ammo['pstl'] = 50
     apply_weapon_switch(w, eid, PISTOL)
 
-    server = object.__new__(GameServer)
+    server = _server_stub(tick_rate)
     for _ in range(5):
         server._apply_input(w, eid, None, 0, 0, 0.0, True, PISTOL)
 
@@ -285,13 +306,13 @@ def test_input_does_not_shoot_on_server():
     print("1.2 PLAYER_INPUT does not fire on the server OK")
 
 
-def test_handle_shoot_reports_decision():
+def test_handle_shoot_reports_decision(tick_rate: int = DEFAULT_TICK_RATE):
     """1.2 Отказ возвращается, а не теряется молча."""
     from server.game_world import GameWorld
     from server.weapons import handle_shoot, apply_weapon_switch
     from shared.components import WeaponComponent, Player
 
-    w = GameWorld(mode='pve')
+    w = GameWorld(mode='pve', tick_rate=tick_rate)
     eid = w.add_player(1, 'A')
     wp = w.entities.get_component(eid, WeaponComponent)
     pl = w.entities.get_component(eid, Player)
@@ -302,7 +323,7 @@ def test_handle_shoot_reports_decision():
     assert res is not None, "handle_shoot() не вернул решение"
     assert res.fired is True, res
     assert wp.ammo['pstl'] == 9, wp.ammo['pstl']
-    assert wp.fire_cooldown == wpn_cooldown_ticks(16), wp.fire_cooldown
+    assert wp.fire_cooldown == wpn_cooldown_ticks(16, tick_rate), wp.fire_cooldown
     assert pl.state == 2, "принятый выстрел не выставил state=2"
 
     # тик: пульс стрельбы гаснет, кулдаун уменьшается
@@ -328,7 +349,8 @@ def test_handle_shoot_reports_decision():
     print("1.2 handle_shoot reports fired/refused OK")
 
 
-def test_clicks_on_a_hot_weapon_never_reach_the_server():
+def test_clicks_on_a_hot_weapon_never_reach_the_server(
+        tick_rate: int = DEFAULT_TICK_RATE):
     """1.3 Клик по горячему оружию не доходит до сети, а дошедший интент стреляет.
 
     Две стороны одного контракта. Первая: клиент отсекает клик сам, поэтому в сеть
@@ -339,19 +361,18 @@ def test_clicks_on_a_hot_weapon_never_reach_the_server():
     хранить, и хранилище отдавало их пачками уже после кулдауна.
     """
     from server.game_world import GameWorld
-    from server.server import GameServer
     from server.weapons import apply_weapon_switch
     from server.player import PlayerSession
     from shared.components import Position, WeaponComponent
 
     ammo = 50
-    w = GameWorld(mode='pve')
+    w = GameWorld(mode='pve', tick_rate=tick_rate)
     eid = w.add_player(1, 'A')
     wp = w.entities.get_component(eid, WeaponComponent)
     wp.ammo['pstl'] = ammo
     apply_weapon_switch(w, eid, PISTOL)
 
-    server = object.__new__(GameServer)
+    server = _server_stub(tick_rate)
 
     class _Party:
         def __init__(self, world):
@@ -364,12 +385,12 @@ def test_clicks_on_a_hot_weapon_never_reach_the_server():
     server.lobby = _Lobby()
     session = PlayerSession(1, 'A', ('127.0.0.1', 1))
 
-    c = _client_stub()
+    c = _client_stub(tick_rate=tick_rate)
     clock = _Clock()
-    gate = _gate_seconds(PISTOL)
+    gate = _gate_seconds(PISTOL, tick_rate)
 
     # 6 кликов с интервалом gate/3 (заведомо быстрее кулдауна) + ввод удержания
-    ticks = wpn_cooldown_ticks(16)
+    ticks = wpn_cooldown_ticks(16, tick_rate)
     step = gate / 3.0
     frames = []
     t = 0.10
@@ -378,6 +399,11 @@ def test_clicks_on_a_hot_weapon_never_reach_the_server():
         frames.append((t + step / 2.0, True, False))
         frames.append((t + step, False, False))
         t += step
+    # One drain frame at the next opening: float drift can push the second
+    # opening just past its nominal boundary, which cascades and leaves the
+    # final buffered press unserved inside the click window. The drain frame
+    # serves it, keeping the exact "three intents" count at every tick rate.
+    frames.append((t + gate, False, False))
     _run_frames(c, clock, frames)
 
     # каждый интент клиента доигрываем на сервере, прогоняя тики
@@ -400,13 +426,13 @@ def test_clicks_on_a_hot_weapon_never_reach_the_server():
           f"clicks on a hot weapon never left the client OK")
 
 
-def test_shooting_flag_is_one_tick():
+def test_shooting_flag_is_one_tick(tick_rate: int = DEFAULT_TICK_RATE):
     """1.3 Признак стрельбы живёт ровно один тик и не задевает дэш."""
     from server.game_world import GameWorld
     from server.weapons import handle_shoot, apply_weapon_switch
     from shared.components import WeaponComponent, Player
 
-    w = GameWorld(mode='pve')
+    w = GameWorld(mode='pve', tick_rate=tick_rate)
     eid = w.add_player(1, 'A')
     wp = w.entities.get_component(eid, WeaponComponent)
     pl = w.entities.get_component(eid, Player)
@@ -426,15 +452,14 @@ def test_shooting_flag_is_one_tick():
     print("1.3 shooting flag is a one-tick pulse, dash untouched OK")
 
 
-def test_fire_seq_only_advances_on_accept():
+def test_fire_seq_only_advances_on_accept(tick_rate: int = DEFAULT_TICK_RATE):
     """1.4 last_fire_seq двигается только принятым интентом."""
-    from server.server import GameServer
     from server.lobby import Party
     from server.player import PlayerSession
     from server.weapons import apply_weapon_switch
     from shared.components import WeaponComponent
 
-    party = Party(1, 'p', 'pve')
+    party = Party(1, 'p', 'pve', tick_rate=tick_rate)
     session = PlayerSession(1, 'A', ('127.0.0.1', 1))
     party.add_member(session)
     eid = party.world.get_player_entity(1)
@@ -442,7 +467,7 @@ def test_fire_seq_only_advances_on_accept():
     wp.ammo['pstl'] = 3
     apply_weapon_switch(party.world, eid, PISTOL)
 
-    server = object.__new__(GameServer)
+    server = _server_stub(tick_rate)
 
     class _Lobby:
         def find_party_of(self, s):
@@ -470,15 +495,14 @@ def test_fire_seq_only_advances_on_accept():
     print("1.4 last_fire_seq advances only on an accepted intent OK")
 
 
-def test_decision_reaches_every_client():
+def test_decision_reaches_every_client(tick_rate: int = DEFAULT_TICK_RATE):
     """1.4 Решение публикуется всем клиентам партии, у каждого своё."""
-    from server.server import GameServer
     from server.lobby import Party
     from server.player import PlayerSession
     from server.weapons import FireResult
     from shared.combat import fire_reason_code
 
-    party = Party(1, 'p', 'pve')
+    party = Party(1, 'p', 'pve', tick_rate=tick_rate)
     a = PlayerSession(1, 'A', ('127.0.0.1', 1))
     b = PlayerSession(2, 'B', ('127.0.0.1', 2))
     party.add_member(a)
@@ -494,7 +518,7 @@ def test_decision_reaches_every_client():
             captured['addresses'] = addresses
             captured['players'] = players
 
-    server = object.__new__(GameServer)
+    server = _server_stub(tick_rate)
     server.network = _Net()
     server.lobby = type('_L', (), {'parties': {1: party}})()
 
@@ -514,7 +538,7 @@ def test_decision_reaches_every_client():
     print("1.4 fire decision is broadcast to every client OK")
 
 
-def test_fire_decision_in_snapshot():
+def test_fire_decision_in_snapshot(tick_rate: int = DEFAULT_TICK_RATE):
     """1.4 Решение сервера едет в снимке мира."""
     from shared.protocol import encode_world_state, decode_world_state
     from shared.combat import fire_reason_code
@@ -543,21 +567,21 @@ def test_fire_decision_in_snapshot():
     print("1.4 fire decision survives the WORLD_STATE round-trip OK")
 
 
-def test_local_weapon_timer_comes_from_server():
+def test_local_weapon_timer_comes_from_server(tick_rate: int = DEFAULT_TICK_RATE):
     """1.5 Таймер локального оружия — из серверного решения, не из нажатия."""
-    from client.client import GameClient, TICK_INTERVAL, FPS_60
-
-    c = _client_stub()
+    c = _client_stub(tick_rate=tick_rate)
 
     def expected(ticks):
-        # A tick is a 50 ms server tick, the renderer counts frames at 60 fps,
-        # so the conversion is ticks * TICK_INTERVAL * FPS_60 — NOT ticks * 60,
-        # which would silently claim a tick is a frame and stretch every recoil
-        # by 20x.
-        return int(ticks * TICK_INTERVAL * FPS_60 + 0.5)
+        # A tick lasts tick_interval(rate) seconds and the renderer counts 60
+        # fps frames, so the conversion is fps60_per_tick(ticks, rate) — NOT
+        # ticks * 60, which would silently claim a tick is a frame and stretch
+        # every recoil by tick_rate times.
+        return int(fps60_per_tick(ticks, tick_rate) + 0.5)
 
     assert c._fire_anim_frames_from_server(5) == expected(5)
-    assert c._fire_anim_frames_from_server(5) == 15, c._fire_anim_frames_from_server(5)
+    if tick_rate == DEFAULT_TICK_RATE:
+        assert c._fire_anim_frames_from_server(5) == 15, \
+            c._fire_anim_frames_from_server(5)
 
     # сервер отказал (0 тиков) -> анимации нет
     assert c._fire_anim_frames_from_server(0) == 0
@@ -568,11 +592,11 @@ def test_local_weapon_timer_comes_from_server():
     print("1.5 local weapon timer is derived from the server decision OK")
 
 
-def test_recoil_follows_server_decision():
+def test_recoil_follows_server_decision(tick_rate: int = DEFAULT_TICK_RATE):
     """1.5 Отдача сверяется с решением сервера, а не с нажатием."""
     from shared.combat import fire_reason_code
 
-    c = _client_stub()
+    c = _client_stub(tick_rate=tick_rate)
     clock = _Clock()
     clock.t = now = 1000.0
     c.local_weapon = 1
@@ -588,13 +612,16 @@ def test_recoil_follows_server_decision():
     c._sync_fire_anim(1, 4, 0, 1, now + 0.01)
     # серверные тики — пол: меньше предсказания отдача не укорачивается
     # (снимок может прийти на тик позже, и кулдаун уже отсчитан)
-    assert c._fire_anim_until >= now + 0.01 + 4 * TICK_INTERVAL, c._fire_anim_until
+    assert c._fire_anim_until >= now + 0.01 + 4 * tick_interval(tick_rate), c._fire_anim_until
     assert c._fire_anim_until == predicted, c._fire_anim_until
     assert c._server_fire_seq == 1 and c._fire_undecided == 0
 
-    # сервер, сообщивший БОЛЬШЕ тиков, чем предсказание, выигрывает
-    c._sync_fire_anim(2, 9, 0, 1, now + 0.02)
-    assert c._fire_anim_until == now + 0.02 + 9 * TICK_INTERVAL, c._fire_anim_until
+    # сервер, сообщивший БОЛЬШЕ тиков, чем предсказание, выигрывает. Число тиков
+    # считается от частоты: при 20 tps это 9, как и в исходной проверке.
+    ready_ticks = wpn_cooldown_ticks(16, tick_rate) + 4
+    c._sync_fire_anim(2, ready_ticks, 0, 1, now + 0.02)
+    assert c._fire_anim_until == now + 0.02 + ready_ticks * tick_interval(tick_rate), \
+        c._fire_anim_until
     assert c._server_fire_seq == 2 and c._fire_undecided == 0
 
     # повторный снимок с тем же решением не перезапускает анимацию
@@ -627,15 +654,16 @@ def test_recoil_follows_server_decision():
     # потерянный снимок: скачок fire_seq всё равно означает выстрел
     c._fire_anim_wpn = -1
     c._sync_fire_anim(9, 4, 0, 1, now)
-    assert c._fire_anim_until == now + 4 * TICK_INTERVAL, c._fire_anim_until
+    assert c._fire_anim_until == now + 4 * tick_interval(tick_rate), c._fire_anim_until
     print("1.5 recoil is reconciled from the server decision OK")
 
 
-def test_in_flight_intent_is_not_mistaken_for_refusal():
+def test_in_flight_intent_is_not_mistaken_for_refusal(
+        tick_rate: int = DEFAULT_TICK_RATE):
     """1.5 Решение, ещё не дошедшее, не обрывает настоящий выстрел."""
     from shared.combat import fire_reason_code
 
-    c = _client_stub()
+    c = _client_stub(tick_rate=tick_rate)
     clock = _Clock()
     clock.t = now = 1000.0
     c.local_weapon = 1
@@ -659,7 +687,7 @@ def test_in_flight_intent_is_not_mistaken_for_refusal():
     assert c._fire_anim_until == predicted_next, c._fire_anim_until
     print("1.5 an in-flight intent does not cancel a real shot OK")
 
-def test_gate_tempo_follows_the_server_weapon():
+def test_gate_tempo_follows_the_server_weapon(tick_rate: int = DEFAULT_TICK_RATE):
     """1.6 Темп врат — по оружию сервера, а не по локально выбранному.
 
     Локальный выбор — только запрос на смену: сервер применяет его лишь для
@@ -673,11 +701,11 @@ def test_gate_tempo_follows_the_server_weapon():
     окно, поэтому темп виден как число открытий, а клики по горячему оружию
     теперь просто съедаются (1.7).
     """
-    c = _client_stub()
+    c = _client_stub(tick_rate=tick_rate)
     clock = _Clock()
     c.input_handler.weapon_id = SSG      # игрок выбрал SSG локально...
     c.local_weapon = PISTOL              # ...а сервер держит пистолет
-    fast_gate = _gate_seconds(PISTOL)
+    fast_gate = _gate_seconds(PISTOL, tick_rate)
 
     # Кнопка нажата 6 пистолетных окон подряд: ровно 6 интентов.
     # Время кадра в окне считается от якоря, а не накапливается (`t += step`):
@@ -696,11 +724,11 @@ def test_gate_tempo_follows_the_server_weapon():
 
     # Обратный рассинхрон: локально пистолет, на сервере SSG. Врата обязаны
     # стать длинными, иначе интенты сыплются в отказ по cooldown.
-    c2 = _client_stub()
+    c2 = _client_stub(tick_rate=tick_rate)
     c2.input_handler.weapon_id = PISTOL
     c2.local_weapon = SSG
     clock2 = _Clock()
-    slow_gate = _gate_seconds(SSG)
+    slow_gate = _gate_seconds(SSG, tick_rate)
     step = slow_gate / 4.0
     frames = []
     for k in range(2):
@@ -713,7 +741,8 @@ def test_gate_tempo_follows_the_server_weapon():
     print("1.6 gate tempo follows the server's weapon OK")
 
 
-def test_a_burst_of_presses_becomes_one_shot_per_opening():
+def test_a_burst_of_presses_becomes_one_shot_per_opening(
+        tick_rate: int = DEFAULT_TICK_RATE):
     """1.7 Серия нажатий = выстрел на открытие, а не очередь выстрелов.
 
     Было: очередь нажатий копилась со скоростью кликов и расходовалась со
@@ -722,9 +751,9 @@ def test_a_burst_of_presses_becomes_one_shot_per_opening():
     нажатие: клик не теряется (иначе дробовик «стреляет раз в 10 кликов»), но и
     не копится.
     """
-    c = _client_stub()
+    c = _client_stub(tick_rate=tick_rate)
     clock = _Clock()
-    gate = _gate_seconds(PISTOL)
+    gate = _gate_seconds(PISTOL, tick_rate)
     presses = 10
 
     # десять нажатий за 0.2 с — все в первом закрытом окне врат
@@ -749,22 +778,23 @@ def test_a_burst_of_presses_becomes_one_shot_per_opening():
     # Открытия врат — на 0.05 и на 1.45, то есть два интента, а не двадцать.
     # На втором открытии приходит свой клик, поэтому он и стреляет, а
     # запомненное нажатие просто погашается вместе с ним.
-    c2 = _client_stub()
+    c2 = _client_stub(tick_rate=tick_rate)
     c2.local_weapon = SSG
     clock2 = _Clock()
     _run_frames(c2, clock2, [(0.05 + 0.10 * i, True, True) for i in range(20)])
     assert len(c2.network.fires) == 2, c2.network.fires
-    slow = _gate_seconds(SSG)
+    slow = _gate_seconds(SSG, tick_rate)
     _run_frames(c2, clock2, [(0.05 + slow + 0.01, False, False)])
     assert len(c2.network.fires) == 2, c2.network.fires
     print("1.7 a burst of clicks fires once per opening, nothing queues up OK")
 
 
-def test_held_fire_is_the_only_way_to_keep_shooting():
+def test_held_fire_is_the_only_way_to_keep_shooting(
+        tick_rate: int = DEFAULT_TICK_RATE):
     """1.7 Удержание — единственный способ стрелять чаще, чем открываются врата."""
-    c = _client_stub()
+    c = _client_stub(tick_rate=tick_rate)
     clock = _Clock()
-    gate = _gate_seconds(PISTOL)
+    gate = _gate_seconds(PISTOL, tick_rate)
 
     # удержание: интент на каждом открытии врат, темп оружия соблюдён
     frames = []
@@ -786,16 +816,16 @@ def test_held_fire_is_the_only_way_to_keep_shooting():
     print("1.7 held fire shoots per gate, release stops it dead OK")
 
 
-def test_a_stall_produces_one_shot_not_a_burst():
+def test_a_stall_produces_one_shot_not_a_burst(tick_rate: int = DEFAULT_TICK_RATE):
     """1.7 После фриза — ровно один выстрел, а не залп.
 
     Запомненное нажатие переживает простой (оно и предназначено следующему
     открытию), но переживает РОВНО ОДНО. Восемь нажатий, фриз на 5 с, и на
     первом открытии после фриза стреляет одно — из восьми, а не из восьми.
     """
-    c = _client_stub()
+    c = _client_stub(tick_rate=tick_rate)
     clock = _Clock()
-    gate = _gate_seconds(PISTOL)
+    gate = _gate_seconds(PISTOL, tick_rate)
 
     # нажатия идут, потом клиент подвисает (alt-tab / длинный кадр)
     _run_frames(c, clock, [(0.05 + 0.02 * i, True, True) for i in range(8)])
@@ -814,7 +844,8 @@ def test_a_stall_produces_one_shot_not_a_burst():
     print("1.7 a stall yields one shot, not a burst OK")
 
 
-def test_cooldown_refusal_waits_the_weapon_out():
+def test_cooldown_refusal_waits_the_weapon_out(
+        tick_rate: int = DEFAULT_TICK_RATE):
     """1.8 Отказ по кулдауну отодвигает врата и НЕ порождает повторных интентов.
 
     Возвращать нажатие было можно только потому, что оно хранилось. Хранилища
@@ -824,21 +855,24 @@ def test_cooldown_refusal_waits_the_weapon_out():
     """
     from shared.combat import fire_reason_code
 
-    c = _client_stub()
+    c = _client_stub(tick_rate=tick_rate)
     clock = _Clock()
-    gate = _gate_seconds(PISTOL)
+    gate = _gate_seconds(PISTOL, tick_rate)
 
     _run_frames(c, clock, [(0.10, True, True)])
     assert len(c.network.fires) == 1
     assert c._fire_undecided == 1, c._fire_pending
 
-    # сервер отказал: ствол был горячий, и остаток кулдауна больше локальных врат
-    c._sync_fire_anim(0, 8, fire_reason_code('cooldown'), PISTOL, 0.11)
+    # сервер отказал: ствол был горячий, и остаток кулдауна больше локальных врат.
+    # Три тика сверх кулдауна пистолета дают запас над локальными вратами на всех
+    # частотах: при 20 tps это те же 8 тиков, что и в исходной проверке.
+    fire_ready = wpn_cooldown_ticks(16, tick_rate) + 3
+    c._sync_fire_anim(0, fire_ready, fire_reason_code('cooldown'), PISTOL, 0.11)
     assert c._fire_undecided == 0, c._fire_pending
     assert c._fire_anim_until == 0.0, c._fire_anim_until
 
     # остаток кулдауна отодвинул врата, поэтому мгновенный повтор не бьёт снова
-    ready_gate = 0.11 + (8 + 1) * TICK_INTERVAL
+    ready_gate = 0.11 + (fire_ready + 1) * tick_interval(tick_rate)
     assert c._next_fire_time == ready_gate, (c._next_fire_time, ready_gate)
     _run_frames(c, clock, [(0.10 + gate + 0.01, True, True)])
     assert len(c.network.fires) == 1, "повтор ушёл в горячий ствол"
@@ -865,7 +899,8 @@ def test_cooldown_refusal_waits_the_weapon_out():
     print("1.8 a cooldown refusal waits the weapon out, nothing retries OK")
 
 
-def test_refusal_does_not_cut_the_confirmed_shot():
+def test_refusal_does_not_cut_the_confirmed_shot(
+        tick_rate: int = DEFAULT_TICK_RATE):
     """1.9 Отказ списывается со СВОЕГО интента, а не с чужого.
 
     Снимок «fire_seq прыгнул И пришла причина» — это ровно «#1 принят, #2 отказ,
@@ -876,9 +911,9 @@ def test_refusal_does_not_cut_the_confirmed_shot():
     """
     from shared.combat import fire_reason_code
 
-    c = _client_stub()
+    c = _client_stub(tick_rate=tick_rate)
     clock = _Clock()
-    gate = _gate_seconds(PISTOL)
+    gate = _gate_seconds(PISTOL, tick_rate)
 
     # три интента в полёте: клик, удержание, удержание — на трёх открытиях врат
     first = 0.10
@@ -887,7 +922,7 @@ def test_refusal_does_not_cut_the_confirmed_shot():
                             (first + 2 * gate + 0.02, True, True)])
     assert list(c._fire_pending) == [1, 2, 3], c._fire_pending
 
-    ready = wpn_cooldown_ticks(16)
+    ready = wpn_cooldown_ticks(16, tick_rate)
     now = first + 2 * gate + 0.04
     c._sync_fire_anim(1, ready, fire_reason_code('cooldown'), PISTOL, now)
 
@@ -896,7 +931,7 @@ def test_refusal_does_not_cut_the_confirmed_shot():
     assert c._fire_undecided == 1, c._fire_pending
     # отказ достался не новейшему (#3), поэтому отдача принятого выстрела выжила:
     # сервер прямо говорит, что ствол горячий, то есть выстрел был
-    assert c._fire_anim_until >= now + ready * TICK_INTERVAL, c._fire_anim_until
+    assert c._fire_anim_until >= now + ready * tick_interval(tick_rate), c._fire_anim_until
 
     # тот же снимок повторно: липкая причина всё ещё приходит, и пока в полёте
     # есть интент выше fire_seq, отказ достаётся ему — единственный случай, где
@@ -912,20 +947,20 @@ def test_refusal_does_not_cut_the_confirmed_shot():
     print("1.9 a refusal is charged to its own intent, not to a confirmed shot OK")
 
 
-def test_stale_refusal_does_not_shadow_a_later_shot():
+def test_stale_refusal_does_not_shadow_a_later_shot(
+        tick_rate: int = DEFAULT_TICK_RATE):
     """1.9 Поздняя повторная доставка отказа не затирает более новое решение.
 
     Надёжный канал передоставляет пакеты. Старый код решал отказ заново, если его
     номер просто не совпадал с последним принятым, — и поздняя копия отказа №6
     публиковала ложный «cooldown» поверх принятого выстрела №7.
     """
-    from server.server import GameServer
     from server.lobby import Party
     from server.player import PlayerSession
     from server.weapons import apply_weapon_switch
     from shared.components import WeaponComponent
 
-    party = Party(1, 'p', 'pve')
+    party = Party(1, 'p', 'pve', tick_rate=tick_rate)
     session = PlayerSession(1, 'A', ('127.0.0.1', 1))
     party.add_member(session)
     eid = party.world.get_player_entity(1)
@@ -933,7 +968,7 @@ def test_stale_refusal_does_not_shadow_a_later_shot():
     wp.ammo['pstl'] = 50
     apply_weapon_switch(party.world, eid, PISTOL)
 
-    server = object.__new__(GameServer)
+    server = _server_stub(tick_rate)
     server.lobby = type('_L', (), {'find_party_of': lambda self, s: party})()
 
     server._on_player_fire(session, 5, PISTOL)      # принят
@@ -955,18 +990,17 @@ def test_stale_refusal_does_not_shadow_a_later_shot():
     print("1.9 a late duplicate refusal never overwrites a newer decision OK")
 
 
-def test_unhandled_intent_is_answered():
+def test_unhandled_intent_is_answered(tick_rate: int = DEFAULT_TICK_RATE):
     """1.9 Интент, который сервер не может разобрать, всё равно получает ответ.
 
     Молчание по интенту оставляло его в полёте навсегда: счётчик нерешённых
     интентов рос, и поверх него копилась очередь нажатий. Теперь это решение
     `noop`, и очередь нерешённых интентов опустошается.
     """
-    from server.server import GameServer
     from server.player import PlayerSession
 
     session = PlayerSession(1, 'A', ('127.0.0.1', 1))
-    server = object.__new__(GameServer)
+    server = _server_stub(tick_rate)
     server.lobby = type('_L', (), {'find_party_of': lambda self, s: None})()
 
     server._on_player_fire(session, 4, PISTOL)
@@ -977,7 +1011,8 @@ def test_unhandled_intent_is_answered():
     print("1.9 an unhandled intent is answered with noop OK")
 
 
-def test_redelivered_refusal_is_not_decided_twice():
+def test_redelivered_refusal_is_not_decided_twice(
+        tick_rate: int = DEFAULT_TICK_RATE):
     """1.9 Передоставленный ОТКАЗ решается один раз, а не два.
 
     Надёжный канал передоставляет, и rto растёт экспоненциально — так что
@@ -991,13 +1026,12 @@ def test_redelivered_refusal_is_not_decided_twice():
     Отдельно проверяется, что отказ не «съедает» номер: после него обычный
     следующий интент (номер выше) по-прежнему принимается.
     """
-    from server.server import GameServer
     from server.lobby import Party
     from server.player import PlayerSession
     from server.weapons import apply_weapon_switch
     from shared.components import WeaponComponent
 
-    party = Party(1, 'p', 'pve')
+    party = Party(1, 'p', 'pve', tick_rate=tick_rate)
     session = PlayerSession(1, 'A', ('127.0.0.1', 1))
     party.add_member(session)
     eid = party.world.get_player_entity(1)
@@ -1005,7 +1039,7 @@ def test_redelivered_refusal_is_not_decided_twice():
     wp.ammo['pstl'] = 50
     apply_weapon_switch(party.world, eid, PISTOL)
 
-    server = object.__new__(GameServer)
+    server = _server_stub(tick_rate)
     server.lobby = type('_L', (), {'find_party_of': lambda self, s: party})()
 
     server._on_player_fire(session, 1, PISTOL)        # принят -> кулдаун
@@ -1031,14 +1065,15 @@ def test_redelivered_refusal_is_not_decided_twice():
     print("1.9 a redelivered refusal is decided once OK")
 
 
-def test_server_tick_loop_holds_the_rate_the_fire_gate_is_built_on():
-    """1.10 Тиковый цикл держит TICK_RATE — на котором стоят врата выстрела.
+def test_server_tick_loop_holds_the_rate_the_fire_gate_is_built_on(
+        tick_rate: int = DEFAULT_TICK_RATE):
+    """1.10 Тиковый цикл держит заданную частоту — на ней стоят врата выстрела.
 
     Симптом: при долгой стрельбе «через раз» — отдача начинается, патрон
     пропадает, анимация обрывается, урона нет. Это отказ по cooldown, и он
     возникал систематически из-за частоты тиков, а не из-за клика.
 
-    `TICK_RATE` — это то, чем `wpn_cooldown_ticks` переводит темп оружия, и
+    `tick_rate` — это то, чем `wpn_cooldown_ticks` переводит темп оружия, и
     переводят ОБЕ стороны, поэтому врата клиента посчитаны в номинальных тиках,
     а сервер сливает их в настоящих. Старый цикл делал `last_tick = now` и
     просыпался через `asyncio.sleep(0.001)` — на Windows это 15.8 tps вместо 20,
@@ -1056,8 +1091,7 @@ def test_server_tick_loop_holds_the_rate_the_fire_gate_is_built_on():
     нет.
     """
     import asyncio
-    from server.server import GameServer
-    from server.game_data import TICK_RATE, WPN
+    from server.game_data import WPN
     from server.game_world import GameWorld
     from server.player import PlayerSession
     from server.weapons import apply_weapon_switch
@@ -1068,17 +1102,17 @@ def test_server_tick_loop_holds_the_rate_the_fire_gate_is_built_on():
     latency = 0.060           # 3 тика пути туда-обратно — обычная локальная сеть
 
     for wpn in (PISTOL, 2, SSG):
-        ticks = wpn_cooldown_ticks(int(WPN[wpn]['f']))
-        gate = ticks * TICK_INTERVAL + TICK_INTERVAL
+        ticks = wpn_cooldown_ticks(int(WPN[wpn]['f']), tick_rate)
+        gate = ticks * tick_interval(tick_rate) + tick_interval(tick_rate)
 
-        world = GameWorld(mode='pve')
+        world = GameWorld(mode='pve', tick_rate=tick_rate)
         eid = world.add_player(1, 'A')
         comp = world.entities.get_component(eid, WeaponComponent)
         comp.ammo['pstl'] = 9999
         comp.ammo['shl'] = 9999
         apply_weapon_switch(world, eid, wpn)
 
-        server = object.__new__(GameServer)
+        server = _server_stub(tick_rate)
         server.running = False
         session = PlayerSession(1, 'A', ('127.0.0.1', 1))
         fired = refused = 0
@@ -1124,8 +1158,13 @@ def test_server_tick_loop_holds_the_rate_the_fire_gate_is_built_on():
         _run_server_loop(server, clock)
 
         rate = n_ticks / seconds
-        assert abs(rate - TICK_RATE) <= TICK_RATE * 0.1, \
-            f"{WPN[wpn]['n']}: {rate:.2f} tps вместо {TICK_RATE}"
+        # Absolute deadlines mean the count over a fixed window is the nominal
+        # rate to within the tick in which the window ends -- not 10 % off.
+        expected_ticks = round(seconds * tick_rate)
+        assert abs(n_ticks - expected_ticks) <= 1, (
+            f"{WPN[wpn]['n']}: {n_ticks} тиков ({rate:.2f} tps) вместо "
+            f"{expected_ticks} ({tick_rate} tps)"
+        )
         # Карусель — это именно ПОДРЯД идущие sleep(0): цикл проспал меньше
         # тика, спит по deadline - now (<= 0), и так до следующего тика.
         # Единичный <= 0 на самой границе допустим (сон на ~0 перед тиком).
@@ -1145,27 +1184,68 @@ def test_server_tick_loop_holds_the_rate_the_fire_gate_is_built_on():
     _ = asyncio  # импорт нужен ради единообразия прогона
 
 
+def test_gate_and_cooldown_keep_real_time_across_rates():
+    """4.3 Реальное время кулдауна и врат не зависит от частоты тика.
+
+    `wpn_cooldown_ticks` округляет темп оружия до тика, поэтому на 20/30/40 tps
+    число тиков разное, а длительность в секундах обязана оставаться той же
+    с точностью до кванта. Каждая отдельная проверка выше считает ожидание от
+    частоты и потому не поймала бы систематический сдвиг темпа сразу на всех
+    частотах; эта проверка сравнивает их между собой.
+    """
+    from engine.constants import WPN
+
+    widest_tick = max(tick_interval(rate) for rate in RATES)
+    for wpn in (PISTOL, 2, SSG):
+        frames = int(WPN[wpn]['f'])
+        nominal = frames / FPS_60
+        cooldowns: list[float] = []
+        gates: list[float] = []
+        for rate in RATES:
+            iv = tick_interval(rate)
+            ticks = wpn_cooldown_ticks(frames, rate)
+            cooldown = ticks * iv
+            gate = cooldown + iv
+            # округление до ближайшего тика даёт не больше половины тика
+            assert abs(cooldown - nominal) <= 0.5 * iv + 1e-9, \
+                (WPN[wpn]['n'], rate, cooldown, nominal, iv)
+            # врата — это ровно кулдаун плюс один тик запаса, не больше
+            assert 0.5 * iv - 1e-9 <= gate - nominal <= 1.5 * iv + 1e-9, \
+                (WPN[wpn]['n'], rate, gate, nominal, iv)
+            cooldowns.append(cooldown)
+            gates.append(gate)
+        # между частотами реальные интервалы расходятся не больше чем на тик
+        assert max(cooldowns) - min(cooldowns) <= widest_tick + 1e-9, \
+            (WPN[wpn]['n'], cooldowns)
+        assert max(gates) - min(gates) <= widest_tick + 1e-9, \
+            (WPN[wpn]['n'], gates)
+    print("4.3 gate and cooldown keep real time across rates OK")
+
+
 if __name__ == '__main__':
-    test_client_press_on_a_closed_gate_is_remembered_once()
-    test_client_held_fire_sends_every_gate()
-    test_input_does_not_shoot_on_server()
-    test_handle_shoot_reports_decision()
-    test_clicks_on_a_hot_weapon_never_reach_the_server()
-    test_shooting_flag_is_one_tick()
-    test_fire_seq_only_advances_on_accept()
-    test_decision_reaches_every_client()
-    test_fire_decision_in_snapshot()
-    test_local_weapon_timer_comes_from_server()
-    test_recoil_follows_server_decision()
-    test_in_flight_intent_is_not_mistaken_for_refusal()
-    test_gate_tempo_follows_the_server_weapon()
-    test_a_burst_of_presses_becomes_one_shot_per_opening()
-    test_held_fire_is_the_only_way_to_keep_shooting()
-    test_a_stall_produces_one_shot_not_a_burst()
-    test_cooldown_refusal_waits_the_weapon_out()
-    test_refusal_does_not_cut_the_confirmed_shot()
-    test_stale_refusal_does_not_shadow_a_later_shot()
-    test_redelivered_refusal_is_not_decided_twice()
-    test_unhandled_intent_is_answered()
-    test_server_tick_loop_holds_the_rate_the_fire_gate_is_built_on()
+    for rate in RATES:
+        print(f"--- tick rate {rate} ---")
+        test_client_press_on_a_closed_gate_is_remembered_once(rate)
+        test_client_held_fire_sends_every_gate(rate)
+        test_input_does_not_shoot_on_server(rate)
+        test_handle_shoot_reports_decision(rate)
+        test_clicks_on_a_hot_weapon_never_reach_the_server(rate)
+        test_shooting_flag_is_one_tick(rate)
+        test_fire_seq_only_advances_on_accept(rate)
+        test_decision_reaches_every_client(rate)
+        test_fire_decision_in_snapshot(rate)
+        test_local_weapon_timer_comes_from_server(rate)
+        test_recoil_follows_server_decision(rate)
+        test_in_flight_intent_is_not_mistaken_for_refusal(rate)
+        test_gate_tempo_follows_the_server_weapon(rate)
+        test_a_burst_of_presses_becomes_one_shot_per_opening(rate)
+        test_held_fire_is_the_only_way_to_keep_shooting(rate)
+        test_a_stall_produces_one_shot_not_a_burst(rate)
+        test_cooldown_refusal_waits_the_weapon_out(rate)
+        test_refusal_does_not_cut_the_confirmed_shot(rate)
+        test_stale_refusal_does_not_shadow_a_later_shot(rate)
+        test_redelivered_refusal_is_not_decided_twice(rate)
+        test_unhandled_intent_is_answered(rate)
+        test_server_tick_loop_holds_the_rate_the_fire_gate_is_built_on(rate)
+    test_gate_and_cooldown_keep_real_time_across_rates()
     print("ALL FIRE INTENT SMOKE TESTS PASSED")

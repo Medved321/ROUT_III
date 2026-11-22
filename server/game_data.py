@@ -5,10 +5,18 @@ client package.  The server operates in pixel coordinates (TILE = 64), same
 as the ROUT_II_III port and renderer.
 """
 
+from shared.combat import (  # noqa: F401  (re-exports for legacy imports)
+    DEFAULT_TICK_RATE, FPS_60, MAX_TICK_RATE, MIN_TICK_RATE,
+    fps60_per_tick, ms_to_ticks, tick_interval, ticks_for_seconds,
+    validate_tick_rate, wpn_cooldown_ticks,
+)
+
 TILE = 64.0
-TICK_RATE = 20
-TICK_INTERVAL = 1.0 / TICK_RATE
-FPS_60 = 60.0
+# Legacy names stay as the DEFAULT values for imports that do not need runtime
+# frequency. The authoritative rate lives on GameServer and is threaded into
+# GameWorld; never use these aliases for a live tick conversion.
+TICK_RATE = DEFAULT_TICK_RATE
+TICK_INTERVAL = tick_interval()
 
 # How many ticks the game loop may run back-to-back inside one wake-up to catch
 # up on missed periods (see GameServer._game_loop). Bounded, because draining
@@ -17,30 +25,36 @@ FPS_60 = 60.0
 # and answering the current one.
 TICK_DRAIN_MAX = 4
 
-
-def fps60_per_tick(px_per_frame: float) -> float:
-    """ROUT_II_III speed (px/frame @60fps) -> px/tick."""
-    return px_per_frame * FPS_60 / TICK_RATE
-
-
-# Canonical fire-rate cooldown shared with the client (hitscan change).
-from shared.combat import wpn_cooldown_ticks  # noqa: F401  (re-export)
-
 # --- player ---------------------------------------------------------------
 PLAYER_RADIUS = 16
 PLAYER_MAX_HP = 200
 MOVE_SPEED_PX = 250.0   # 3.0 tiles/s * 64  (per-second speed)
 # Dash (player dash change): a burst of speed along the current movement input.
-# All in server ticks, so the dash needs no network timer -- the world already
-# ticks at TICK_RATE. 2.5x for 5 ticks covers ~120 px (~1.9 tiles) in 250 ms.
+# Durations are declared in real seconds and converted to ticks at the running
+# rate; the constants below are only the default-rate view for legacy imports.
 DASH_SPEED_MULT = 6
-DASH_TICKS = 7
-DASH_COOLDOWN_TICKS = 15
+DASH_SECONDS = 0.35
+DASH_COOLDOWN_SECONDS = 0.75
+DASH_TICKS = ticks_for_seconds(DASH_SECONDS)
+DASH_COOLDOWN_TICKS = ticks_for_seconds(DASH_COOLDOWN_SECONDS)
 # Longest step a single can_move_px() call may take. Equals the walking step, so
 # ordinary movement is never sub-stepped (and pays no extra collision checks),
 # while a dash step is split into pieces small enough not to cross a solid
 # sector linedef (linedefs have zero thickness).
 MAX_MOVE_STEP_PX = MOVE_SPEED_PX * TICK_INTERVAL
+
+
+def dash_ticks(tick_rate: int = DEFAULT_TICK_RATE) -> int:
+    return ticks_for_seconds(DASH_SECONDS, tick_rate)
+
+
+def dash_cooldown_ticks(tick_rate: int = DEFAULT_TICK_RATE) -> int:
+    return ticks_for_seconds(DASH_COOLDOWN_SECONDS, tick_rate)
+
+
+def max_move_step_px(tick_rate: int = DEFAULT_TICK_RATE) -> float:
+    # MOVE_SPEED_PX is px per SECOND (3 tiles/s * 64), not px/frame@60.
+    return MOVE_SPEED_PX * tick_interval(tick_rate)
 SPEED_FACTOR = PLAYER_RADIUS * 0.01  # reserve, unused for now
 START_PISTOL_AMMO = 50
 START_SHELLS = 15
@@ -74,9 +88,11 @@ ITEM_PICKUP_DIST = 32.0
 # second number nobody displays.
 ARMOR_MAX = 200
 # HASTE multiplies walking speed, BERSERK doubles damage and makes shots free,
-# INVULN refuses damage outright. Durations are in ticks.
+# INVULN refuses damage outright. Durations are declared in seconds and become
+# ticks at the running rate.
 HASTE_SPEED_MULT = 1.5
 BERSERK_DMG_MULT = 20
+POWERUP_SECONDS = {'BERSERK': 60.0, 'HASTE': 20.0, 'INVULN': 30.0}
 
 # Every placeable item type, keyed by the name the editor palette writes.
 # ``wpn_1`` is absent on purpose: the pistol is the starting weapon, so there is
@@ -91,9 +107,11 @@ ITEM_DB = {
     'armor_green': {'kind': 'armor',   'points': 100, 'armor_type': 'green'},
     'armor_blue':  {'kind': 'armor',   'points': 200, 'armor_type': 'blue'},
     'berserk':     {'kind': 'powerup', 'pu': 'BERSERK',
-                     'ticks': TICK_RATE * 60},
-    'haste':       {'kind': 'powerup', 'pu': 'HASTE', 'ticks': TICK_RATE * 20},
-    'invuln':      {'kind': 'powerup', 'pu': 'INVULN', 'ticks': TICK_RATE * 30},
+                     'ticks': ticks_for_seconds(POWERUP_SECONDS['BERSERK'])},
+    'haste':       {'kind': 'powerup', 'pu': 'HASTE',
+                     'ticks': ticks_for_seconds(POWERUP_SECONDS['HASTE'])},
+    'invuln':      {'kind': 'powerup', 'pu': 'INVULN',
+                     'ticks': ticks_for_seconds(POWERUP_SECONDS['INVULN'])},
     'key_red':     {'kind': 'key', 'lock': 'red'},
     'key_yellow':  {'kind': 'key', 'lock': 'yellow'},
     'key_blue':    {'kind': 'key', 'lock': 'blue'},
@@ -104,15 +122,43 @@ ITEM_DB = {
     'wpn_5':       {'kind': 'weapon',  'wpn': 5, 'ammo': 10},
 }
 
+
+def item_spec(itype: str, tick_rate: int = DEFAULT_TICK_RATE) -> dict | None:
+    """Item description with powerup durations converted to runtime ticks."""
+    spec = ITEM_DB.get(itype)
+    if spec is None:
+        return None
+    seconds = POWERUP_SECONDS.get(spec.get('pu'))
+    if seconds is None:
+        return spec
+    out = dict(spec)
+    out['ticks'] = ticks_for_seconds(seconds, tick_rate)
+    return out
+
 # --- doors -----------------------------------------------------------------
 # A door is a two-sided linedef whose ``special`` marks it (SPECIAL_DOORS) and
 # whose middle texture names its lock.  The runtime state (phase / how far open /
 # hold timer) lives on GameWorld, never on the immutable map data (design D2).
 # A door blocks movement, sight, hitscans and projectiles until it is fully open.
-DOOR_OPEN_TICKS = 20     # 1.0 s at TICK_RATE = 20
-DOOR_HOLD_TICKS = 100    # 5.0 s fully open before it closes again
-DOOR_CLOSE_TICKS = 20    # 1.0 s to shut; reverses if the gap is occupied
+DOOR_OPEN_SECONDS = 1.0
+DOOR_HOLD_SECONDS = 5.0
+DOOR_CLOSE_SECONDS = 1.0
+DOOR_OPEN_TICKS = ticks_for_seconds(DOOR_OPEN_SECONDS)
+DOOR_HOLD_TICKS = ticks_for_seconds(DOOR_HOLD_SECONDS)
+DOOR_CLOSE_TICKS = ticks_for_seconds(DOOR_CLOSE_SECONDS)
 DOOR_USE_DIST = 64.0     # one tile: how far ahead "use" reaches for a door
+
+
+def door_open_ticks(tick_rate: int = DEFAULT_TICK_RATE) -> int:
+    return ticks_for_seconds(DOOR_OPEN_SECONDS, tick_rate)
+
+
+def door_hold_ticks(tick_rate: int = DEFAULT_TICK_RATE) -> int:
+    return ticks_for_seconds(DOOR_HOLD_SECONDS, tick_rate)
+
+
+def door_close_ticks(tick_rate: int = DEFAULT_TICK_RATE) -> int:
+    return ticks_for_seconds(DOOR_CLOSE_SECONDS, tick_rate)
 
 # --- combat ---------------------------------------------------------------
 MELEE_RANGE = 35
@@ -121,12 +167,22 @@ MELEE_ANGLE_THRESHOLD = 1.3
 
 # Bullet / projectile (enemy projectiles + player plasma balls are server-side)
 BULLET_HIT_RADIUS = 30
-ENEMY_PROJ_SPEED = 9.0 * TICK_INTERVAL * FPS_60  # px/frame@60 -> px/tick
+ENEMY_PROJ_FRAME_SPEED = 9.0  # px/frame@60 -> px/tick at the running rate
+ENEMY_PROJ_SPEED = fps60_per_tick(ENEMY_PROJ_FRAME_SPEED)
 BULLET_SPAWN_OFFSET = 20
 BALL_SUB_STEP = 4.0
 
 # Player projectile (RIFLE plasma ball): server-authoritative, damage on hit.
-PLAYER_PROJ_SPEED = fps60_per_tick(32.0)   # ~12 px/frame@60 -> px/tick
+PLAYER_PROJ_FRAME_SPEED = 32.0
+PLAYER_PROJ_SPEED = fps60_per_tick(PLAYER_PROJ_FRAME_SPEED)
+
+
+def enemy_proj_speed(tick_rate: int = DEFAULT_TICK_RATE) -> float:
+    return fps60_per_tick(ENEMY_PROJ_FRAME_SPEED, tick_rate)
+
+
+def player_proj_speed(tick_rate: int = DEFAULT_TICK_RATE) -> float:
+    return fps60_per_tick(PLAYER_PROJ_FRAME_SPEED, tick_rate)
 PLAYER_PROJ_MAX_DIST = 900.0
 MAX_PLAYER_PROJ = 32
 # Enemy projectiles had no budget: on an enemy-dense map every shooter could add
@@ -135,8 +191,13 @@ MAX_PLAYER_PROJ = 32
 MAX_ENEMY_PROJ = 48
 
 # Impact events (wall/enemy hit tracers) — short-lived, capped per world.
-IMPACT_TTL = 12          # ticks (0.6 s at 20 tps)
+IMPACT_SECONDS = 0.6
+IMPACT_TTL = ticks_for_seconds(IMPACT_SECONDS)
 MAX_IMPACTS = 64
+
+
+def impact_ttl(tick_rate: int = DEFAULT_TICK_RATE) -> int:
+    return ticks_for_seconds(IMPACT_SECONDS, tick_rate)
 
 # shots: hitscan is resolved instantly server-side; spread supported
 WPN = [
@@ -154,6 +215,11 @@ ENEMY_DETECT_RANGE = 500
 ENEMY_ALERT_AOE = 300
 # infighting: how many ticks a hurt enemy keeps the attacker as its target
 INFIGHT_TICKS = 99999   # ~83 min at 20 tps: effectively "until it dies"
+INFIGHT_SECONDS = INFIGHT_TICKS / TICK_RATE
+
+
+def infight_ticks(tick_rate: int = DEFAULT_TICK_RATE) -> int:
+    return ticks_for_seconds(INFIGHT_SECONDS, tick_rate)
 ENEMY_SEPARATION_RANGE = 40
 SEPARATION_FORCE = 0.8
 MELEE_PREFER_DIST = 45
@@ -170,6 +236,11 @@ STRAFE_FACTOR = 0.6
 WANDER_SPEED_FACTOR = 0.4
 DIAGONAL_COST = 1.414
 CORPSE_LIFETIME = 6000       # ticks (5 min at 20 tps)
+CORPSE_LIFETIME_SECONDS = 300.0
+
+
+def corpse_lifetime(tick_rate: int = DEFAULT_TICK_RATE) -> int:
+    return ticks_for_seconds(CORPSE_LIFETIME_SECONDS, tick_rate)
 # --- match end ------------------------------------------------------------
 # How close a live player must get to the map's `exit` thing to finish the
 # level.  Three quarters of a tile: reaching the marker, not merely its cell,
@@ -179,7 +250,12 @@ EXIT_RADIUS = 48.0
 # with the most frags wins (a tie is a draw); `time_left` is published in
 # seconds. A dead player has no timer of its own any more: respawn is a client
 # request (_respawn_player), not a countdown (match-end design D4).
-PVP_MATCH_TICKS = TICK_RATE * 180   # 3 minutes
+PVP_MATCH_SECONDS = 180.0   # 3 minutes
+PVP_MATCH_TICKS = ticks_for_seconds(PVP_MATCH_SECONDS)
+
+
+def pvp_match_ticks(tick_rate: int = DEFAULT_TICK_RATE) -> int:
+    return ticks_for_seconds(PVP_MATCH_SECONDS, tick_rate)
 
 CORPSE_COLORS = {
     'soldier': (160, 80, 80), 'shotgunguy': (180, 120, 50), 'chaingunner': (130, 130, 140),
@@ -221,17 +297,31 @@ SPAWN_POOL = [
     'spectre', 'lost_soul', 'hell_knight', 'revenant', 'arachnotron','healer','archvile','artillery','archvile','archvile','archvile','archvile',
 ]
 
-# ranged attackers per enemy type -> fire off screen-tracer bullets
+# ranged attackers per enemy type -> fire off screen-tracer bullets.
+# ``spd_frames`` is the authored px/frame@60 speed; runtime speed is derived
+# from it with the active tick rate, so the default table stays intact.
 RANGED_DB = {
-    'shotgunguy': {'proj': True, 'dmg': 15, 'cd': 2000, 'spd': ENEMY_PROJ_SPEED, 'cone': 0.10, 'n': 6},
-    'imp':        {'proj': True, 'dmg': 12, 'cd': 1500, 'spd': 7.0 * TICK_INTERVAL * FPS_60, 'cone': 0.06, 'n': 1},
-    'hell_knight':{'proj': True, 'dmg': 20, 'cd': 2000, 'spd': 8.0 * TICK_INTERVAL * FPS_60, 'cone': 0.05, 'n': 1},
-    'revenant':   {'proj': True, 'dmg': 15, 'cd': 2200, 'spd': 6.0 * TICK_INTERVAL * FPS_60, 'cone': 0.04, 'n': 2},
-    'mancubus':   {'proj': True, 'dmg': 15, 'cd': 2000, 'spd': 8.0 * TICK_INTERVAL * FPS_60, 'cone': 0.10, 'n': 6},
-    'cacodemon':  {'proj': True, 'dmg': 10, 'cd': 1500, 'spd': 8.0 * TICK_INTERVAL * FPS_60, 'cone': 0.05, 'n': 1},
-    'boss_baron': {'proj': True, 'dmg': 25, 'cd': 2500, 'spd': 8.0 * TICK_INTERVAL * FPS_60, 'cone': 0.06, 'n': 2},
-    'boss_spider':{'proj': True, 'dmg': 20, 'cd': 900,  'spd': 10.0 * TICK_INTERVAL * FPS_60, 'cone': 0.03, 'n': 1},
+    'shotgunguy': {'proj': True, 'dmg': 15, 'cd': 2000, 'spd_frames': 9.0,  'spd': ENEMY_PROJ_SPEED, 'cone': 0.10, 'n': 6},
+    'imp':        {'proj': True, 'dmg': 12, 'cd': 1500, 'spd_frames': 7.0,  'spd': fps60_per_tick(7.0), 'cone': 0.06, 'n': 1},
+    'hell_knight':{'proj': True, 'dmg': 20, 'cd': 2000, 'spd_frames': 8.0,  'spd': fps60_per_tick(8.0), 'cone': 0.05, 'n': 1},
+    'revenant':   {'proj': True, 'dmg': 15, 'cd': 2200, 'spd_frames': 6.0,  'spd': fps60_per_tick(6.0), 'cone': 0.04, 'n': 2},
+    'mancubus':   {'proj': True, 'dmg': 15, 'cd': 2000, 'spd_frames': 8.0,  'spd': fps60_per_tick(8.0), 'cone': 0.10, 'n': 6},
+    'cacodemon':  {'proj': True, 'dmg': 10, 'cd': 1500, 'spd_frames': 8.0,  'spd': fps60_per_tick(8.0), 'cone': 0.05, 'n': 1},
+    'boss_baron': {'proj': True, 'dmg': 25, 'cd': 2500, 'spd_frames': 8.0,  'spd': fps60_per_tick(8.0), 'cone': 0.06, 'n': 2},
+    'boss_spider':{'proj': True, 'dmg': 20, 'cd': 900,  'spd_frames': 10.0, 'spd': fps60_per_tick(10.0), 'cone': 0.03, 'n': 1},
 }
+
+
+def ranged_db(tick_rate: int = DEFAULT_TICK_RATE) -> dict:
+    """Ranged enemy table with projectile speeds and cooldowns at ``tick_rate``."""
+    rate = validate_tick_rate(tick_rate)
+    out = {}
+    for etype, spec in RANGED_DB.items():
+        item = dict(spec)
+        item['spd'] = fps60_per_tick(spec['spd_frames'], rate)
+        item['cd_ticks'] = ms_to_ticks(spec['cd'], rate)
+        out[etype] = item
+    return out
 
 # map tiles treated as solid by the server (mirror of BLOCK_TILES)
 SOLID_TILES = {1, 2, 3, 4, 5, 6, 7, 8, 9,

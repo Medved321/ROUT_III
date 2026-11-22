@@ -6,6 +6,10 @@ from enum import IntEnum
 from dataclasses import dataclass
 from typing import Optional
 
+from shared.combat import (
+    DEFAULT_TICK_RATE, MAX_TICK_RATE, MIN_TICK_RATE, validate_tick_rate,
+)
+
 # ---------------------------------------------------------------------------
 # Text sanitation.
 #
@@ -190,6 +194,7 @@ def encode_hello_ack(
     update_version: str = "",
     update_size: int = 0,
     update_sha256: str = "",
+    tick_rate: int = DEFAULT_TICK_RATE,
 ) -> bytes:
     out = bytearray(struct.pack("!BB", server_protocol & 0xFF, 1 if accepted else 0))
     out += _encode_string(latest_client_version, 64)
@@ -200,6 +205,13 @@ def encode_hello_ack(
         out += _encode_string(update_sha256, 64)
     else:
         out += struct.pack("!B", 0)
+    # Appended, never inserted: update-field offsets must stay where old clients
+    # and existing tests expect them.
+    try:
+        tick_rate = validate_tick_rate(tick_rate)
+    except ValueError:
+        tick_rate = DEFAULT_TICK_RATE
+    out += struct.pack("!B", tick_rate)
     return bytes(out)
 
 
@@ -216,12 +228,19 @@ def decode_hello_ack(data: bytes) -> dict:
         "update_version": "",
         "update_size": 0,
         "update_sha256": "",
+        "tick_rate": DEFAULT_TICK_RATE,
     }
     if has_update:
         result["update_version"], offset = _decode_string(data, offset)
         result["update_size"] = struct.unpack("!I", data[offset:offset + 4])[0]
         offset += 4
         result["update_sha256"], offset = _decode_string(data, offset)
+    # A datagram from an older server simply ends after the update block; the
+    # default keeps standalone clients and legacy test payloads working.
+    if offset < len(data):
+        rate = data[offset]
+        if MIN_TICK_RATE <= rate <= MAX_TICK_RATE:
+            result["tick_rate"] = rate
     return result
 
 
@@ -373,7 +392,7 @@ def encode_world_state(
             # state with no other source in the snapshot.
             # h: height of the support under the player (int16).  Appended to
             # the tail so every previous field keeps its offset; the server
-            # computes it, the client only displays it (PROTOCOL_VERSION 14).
+            # computes it, the client only displays it (PROTOCOL_VERSION 15).
             "!HfffBBBBBBBBIBBBBBBBHHIIHHHHh",
             p["id"] & 0xFFFF,
             p["x"], p["y"], p["angle"],
@@ -410,9 +429,10 @@ def encode_world_state(
         if isinstance(etype, str):
             etype = ENEMY_TYPES.index(etype) if etype in ENEMY_TYPES else 0
         body += struct.pack(
-            "!HfffBHB",
+            "!HffffBHB",
             e["id"] & 0xFFFF,
             e["x"], e["y"], e.get("angle", 0.0),
+            float(e.get("z", 0.0)),
             etype & 0xFF,
             max(0, int(e.get("hp", 0))) & 0xFFFF,
             e.get("state", 0) & 0xFF,
@@ -422,7 +442,7 @@ def encode_world_state(
     body += struct.pack("!H", len(bullets))
     for b in bullets:
         body += struct.pack(
-            "!ffBBBB", b["x"], b["y"],
+            "!fffBBBB", b["x"], b["y"], float(b.get("z", 0.0)),
             *(b.get("col", (200, 200, 200))[:3]),
             1 if b.get("from_player") else 0,
         )
@@ -525,10 +545,10 @@ def decode_world_state(data: bytes) -> tuple[int, list[dict], list[dict], list[d
     offset += 2
     enemies = []
     for _ in range(e_count):
-        eid, ex, ey, ea, etype, ehp, est = struct.unpack("!HfffBHB", data[offset:offset + 18])
-        offset += 18
+        eid, ex, ey, ea, ez, etype, ehp, est = struct.unpack("!HffffBHB", data[offset:offset + 22])
+        offset += 22
         enemies.append({
-            "id": eid, "x": ex, "y": ey, "angle": ea, "type": etype,
+            "id": eid, "x": ex, "y": ey, "z": ez, "angle": ea, "type": etype,
             "hp": ehp, "state": est,
         })
     # Bullets (x, y, r, g, b, from_player)
@@ -536,9 +556,9 @@ def decode_world_state(data: bytes) -> tuple[int, list[dict], list[dict], list[d
     offset += 2
     bullets = []
     for _ in range(b_count):
-        bx, by, r, g, b, from_player = struct.unpack("!ffBBBB", data[offset:offset + 12])
-        offset += 12
-        bullets.append({"x": bx, "y": by, "col": (r, g, b), "from_player": bool(from_player)})
+        bx, by, bz, r, g, b, from_player = struct.unpack("!fffBBBB", data[offset:offset + 16])
+        offset += 16
+        bullets.append({"x": bx, "y": by, "z": bz, "col": (r, g, b), "from_player": bool(from_player)})
     # Corpses
     c_count = struct.unpack("!H", data[offset:offset + 2])[0]
     offset += 2

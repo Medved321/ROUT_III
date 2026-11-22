@@ -48,6 +48,10 @@ def normalize_size(width, height) -> tuple[int, int]:
 class Renderer:
     def __init__(self, size=None, fullscreen: bool | None = None):
         pygame.init()
+        # Renderer is the single owner of the game window, so this is the one
+        # place the caption is set. Both entry points (desktop run_client and
+        # Android main.py) reach set_mode through here.
+        pygame.display.set_caption("ROUT III")
         self.on_resize = None  # set by the client; called after the window changed
         # Android has no draggable window: the surface is the device screen and
         # the saved ``window_size`` preset is meaningless there (it would make

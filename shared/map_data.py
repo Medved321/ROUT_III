@@ -125,7 +125,7 @@ class GameMap:
         return True
 
     # --- pixel-space helpers (ported from ROUT_II_III map_utils.py) ----------
-    def is_wall_px(self, x: float, y: float) -> bool:
+    def is_wall_px(self, x: float, y: float, z: float | None = None) -> bool:
         tx, ty = int(x) // TILE, int(y) // TILE
         return self.get_tile(tx, ty) != TILE_EMPTY
 
@@ -150,11 +150,12 @@ class GameMap:
         return True
 
     def has_los_px(self, x1: float, y1: float, x2: float, y2: float,
-                   extra_blocked=None) -> bool:
+                   extra_blocked=None, z1: float | None = None,
+                   z2: float | None = None) -> bool:
         """Pixel-space LOS (sampling every 8 px), ported from ROUT_II_III.
 
-        ``extra_blocked`` is accepted for interface parity with
-        ``SectorMap.has_los_px``; tile maps have no dynamic blockers.
+        ``extra_blocked``/``z1``/``z2`` are accepted for interface parity with
+        ``SectorMap.has_los_px``; tile maps have no dynamic blockers or slabs.
         """
         dx_ = x2 - x1
         dy_ = y2 - y1

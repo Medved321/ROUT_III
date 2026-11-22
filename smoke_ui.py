@@ -1,8 +1,11 @@
+import ast
 import os
 import sys
 import tempfile
+import unicodedata
+from pathlib import Path
 
-sys.stdout.reconfigure(encoding="utf-8")  # labels contain arrows
+sys.stdout.reconfigure(encoding="utf-8")
 os.environ['SDL_VIDEODRIVER'] = 'dummy'
 import pygame
 pygame.init()
@@ -12,13 +15,77 @@ import client.settings as settings_mod
 from client.settings import Settings
 from client.settings_screen import SettingsScreen
 from client.pause_screen import PauseScreen
-from client.editor_screen import MapEditorScreen
+from client.sector_editor_screen import SectorEditorScreen
 from client.lobby_screen import LobbyScreen
 
 tmpdir = tempfile.mkdtemp()
 settings_mod.CONFIG_PATH = os.path.join(tmpdir, 'config.json')
-import client.editor_screen as editor_mod
-editor_mod.MAPS_DIR = os.path.join(tmpdir, 'maps')
+import client.sector_editor_screen as sector_mod
+from client import map_library
+sector_mod.MAPS_DIR = os.path.join(tmpdir, 'maps')
+map_library.MAPS_DIR = sector_mod.MAPS_DIR
+
+# ── no decorative glyphs in user-visible strings ────────────────
+# Comments and docstrings are developer text, not labels. Every other string
+# literal in a UI module must be made of letters, digits, punctuation and
+# ordinary whitespace. Arrows, ticks and box-drawing glyphs are symbols (Sm/So)
+# and are rejected by the whitelist below; the in-memory mutation proves the
+# scanner is not a no-op.
+ROOT = Path(__file__).resolve().parent
+UI_TEXT_FILES = (
+    'client/lobby_screen.py', 'client/settings.py', 'client/settings_screen.py',
+    'client/pause_screen.py', 'client/end_screen.py', 'client/connect_screen.py',
+    'client/sector_editor_screen.py', 'client/renderer.py', 'client/ui_layout.py',
+    'shared/text_map.py', 'engine/rendering.py',
+)
+_ASCII = frozenset(chr(c) for c in range(0x20, 0x7F))
+_EXTRA = frozenset('\n\r\t×°№\ufeff')
+
+
+def _allowed_char(ch):
+    if ch in _ASCII or ch in _EXTRA:
+        return True
+    return unicodedata.category(ch)[0] in {'L', 'N', 'P', 'Z'}
+
+
+def _docstring_ids(tree):
+    ids = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, 'body', ())
+        if not body or not isinstance(body[0], ast.Expr):
+            continue
+        value = body[0].value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            ids.add(id(value))
+    return ids
+
+
+def _scan_sources(sources):
+    bad = []
+    for path, text in sources.items():
+        tree = ast.parse(text, filename=path)
+        skip = _docstring_ids(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if id(node) in skip:
+                continue
+            for ch in node.value:
+                if not _allowed_char(ch):
+                    bad.append((path, node.lineno, repr(ch), node.value[:60]))
+                    break
+    return bad
+
+
+assert _scan_sources({'client/pause_screen.py': 'HINT = "Сетка ✓"\n'}), \
+    'glyph scanner missed an injected tick'
+_sources = {rel: (ROOT / rel).read_text(encoding='utf-8') for rel in UI_TEXT_FILES}
+_violations = _scan_sources(_sources)
+assert not _violations, 'decorative glyphs in UI strings: %r' % (_violations,)
+print('UI strings contain no decorative glyphs OK')
 
 # ── settings ─────────────────────────────────────────────────────
 s = Settings()
@@ -79,37 +146,13 @@ click = pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=ps.buttons[0].c
 assert ps.handle([click]) == 'resume'
 print("pause screen OK")
 
-# ── editor screen ────────────────────────────────────────────────
-ed = MapEditorScreen(1000, 700)
-sz0 = ed.editor.sz
-ed._button('size_plus')
-assert ed.editor.sz == sz0 + 4
-ed._button('size_minus')
-assert ed.editor.sz == sz0
-c = ed.canvas.center
-cell = ed._cell_at(c)
-assert cell is not None
-assert ed._cell_at((0, 0)) is None
-ed._apply_brush(c, erase=False)
-cx, cy = cell
-assert ed.editor.grid[cy][cx] == ed.brush, (ed.editor.grid[cy][cx], ed.brush)
-ed._apply_brush(c, erase=True)
-assert ed.editor.grid[cy][cx] == '.'
-ed._apply_brush(c, erase=False)
-ed.map_name = 'smoke_test'
-ed._save()
-assert os.path.exists(os.path.join(editor_mod.MAPS_DIR, 'smoke_test.json'))
-saved = [row[:] for row in ed.editor.grid]
-ed._button('clear')
-assert ed.editor.grid[cy][cx] == '.'
-ed._load()
-assert ed.editor.grid == saved
-ed.draw(surface)
-play_click = pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=ed.buttons['play'].center)
-assert ed.handle([play_click]) == 'play'
-gm = ed.to_game_map()
-assert gm.width == ed.editor.sz and gm.height == ed.editor.sz
-print("editor screen OK (incl. save/load, play)")
+# ── sector editor is the only editor screen ─────────────────────
+se = SectorEditorScreen(1000, 700)
+assert 'mode' not in se.buttons, 'sector editor still offers a tile-mode switch'
+se.draw(surface)
+f5 = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_F5, unicode='')
+assert se.handle([f5]) == 'play', se.status
+print("sector editor OK (single editor path, play)")
 
 # ── lobby screen has new buttons ─────────────────────────────────
 lb = LobbyScreen(1000, 700, "Player", "localhost:7777")
@@ -160,7 +203,7 @@ def click_at(canvas_pos, size):
 
 
 for size in ((640, 480), (1000, 700), (1600, 900), (3840, 2160)):
-    assert ed.handle(click_at(ed.buttons['play'].center, size)) == 'play', size
+    assert se.handle(click_at(se.buttons['play'].center, size)) == 'play', size
     assert lb.handle(click_at(lb.buttons['settings'].center, size)) == 'settings', size
     assert ps.handle(click_at(ps.buttons[2].center, size)) == 'leave', size
     # A point in the black bars belongs to no control and must do nothing.

@@ -7,7 +7,8 @@ things worth pinning here are the crossings between client code and the wire:
   while a party is live;
 * the trailing match block is parsed into ``latest_match`` verbatim;
 * the model (title, tone, table order, accuracy) is derived from the snapshot,
-  not from any local guess;
+  not from any local guess; the co-op PvE roster reads authoritative records,
+  since interpolated ones drop ``stats``;
 * the single input gate ``_input_enabled()`` closes while dead/over and while
   paused, so no held key keeps feeding a finished player;
 * ``Enter`` is a menu key, not a game input -- it must not fire or move.
@@ -33,7 +34,7 @@ _tmp = tempfile.mkdtemp()
 settings_mod.CONFIG_PATH = os.path.join(_tmp, "config.json")
 
 from client.client import GameClient
-from client.end_screen import EndScreen
+from client.end_screen import EndScreen, STATS_VALUE_W
 from client.input_handler import InputHandler
 from client.network_client import NetworkClient
 from shared.protocol import (
@@ -153,6 +154,134 @@ def test_pvp_titles() -> None:
     check(client._end_model()["title"] == "НИЧЬЯ", "no winner must be a draw")
 
 
+def test_pve_cooperative_victory_roster() -> None:
+    client.bridge = object()
+    _armed_client(
+        match_phase="over", local_health=100, local_state=0, mode="pve",
+        player_id=2, secrets_total=4, _match_tick=200,
+        local_stats={"kills": 2, "shots_fired": 4, "shots_hit": 2},
+        _players_snapshot=[
+            _player(2, "Me", stats={"kills": 2, "deaths": 1,
+                                    "damage_dealt": 40, "secrets": 1}),
+            _player(5, "Top", stats={"kills": 7, "deaths": 0,
+                                     "damage_dealt": 320, "shots_fired": 4,
+                                     "shots_hit": 2, "secrets": 2}),
+            _player(1, "Mid", stats={"kills": 1, "deaths": 3,
+                                     "damage_dealt": 90}),
+        ],
+    )
+    m = client._end_model()
+    check(m["title"] == "УРОВЕНЬ ПРОЙДЕН", f"title {m['title']!r}")
+    check("roster" in m and "table" not in m, "co-op victory must offer a roster")
+    check([e["id"] for e in m["roster"]] == [5, 2, 1],
+          f"roster not sorted by kills: {[e['id'] for e in m['roster']]}")
+    check(m["roster"][1]["local"] is True, "local teammate not flagged")
+    check(m["roster"][1]["name"].endswith(" (вы)"), "local row has no marker")
+    top = dict(m["roster"][0]["stats"])
+    check(top["Урон нанесён"] == "320", f"damage {top['Урон нанесён']!r}")
+    check(top["Точность"] == "50%", f"accuracy {top['Точность']!r}")
+    check(top["Секреты"] == "2/4", f"secrets {top['Секреты']!r}")
+    check(top["Время"] == "0:10", f"time {top['Время']!r}")
+    banned = "▶✓▾▲▼←→↑↓⇄▌█"
+    check(not any(ch in m["hint"] for ch in banned),
+          f"decorative glyph in hint: {m['hint']!r}")
+
+
+def test_pve_solo_victory_has_no_roster() -> None:
+    client.bridge = object()
+    _armed_client(
+        match_phase="over", local_health=100, local_state=0, mode="pve",
+        player_id=2, _players_snapshot=[_player(2, "Me")],
+    )
+    m = client._end_model()
+    check("roster" not in m, "solo victory must keep the compact block")
+    check("stats" in m, "solo victory lost its local stats")
+
+
+def test_results_read_authoritative_stats() -> None:
+    """Interpolation rebuilds remote players and drops ``stats`` on purpose.
+
+    The results screen must therefore read the newest authoritative records,
+    not the smoothed ones handed to the renderer.
+    """
+    fresh = GameClient()
+    net = NetworkClient("localhost", 7777)
+    net.player_id = 7
+    payload = encode_world_state(
+        tick=3, players=[_player(7, "Ally", stats={"kills": 9})],
+        mode="pve",
+        match={"phase": "playing", "winner_id": 0, "time_left": 0,
+               "secrets_total": 0},
+    )
+    net._handle_world_state(Packet(PacketType.WORLD_STATE, 0, payload))
+    old_net = fresh.network
+    fresh.network = net
+    fresh.player_id = 7
+    try:
+        fresh._update_local_state()
+    finally:
+        fresh.network = old_net
+    check(fresh._players_snapshot[0]["stats"]["kills"] == 9,
+          "results read interpolated players without stats")
+
+
+def test_roster_navigation_and_hitbox() -> None:
+    screen = EndScreen(1000, 700)
+    roster = [
+        {"id": 1, "name": "A", "local": False, "stats": [("Убийства", "1")]},
+        {"id": 2, "name": "Me (вы)", "local": True, "stats": [("Убийства", "2")]},
+        {"id": 3, "name": "C", "local": False, "stats": [("Убийства", "3")]},
+    ]
+    model = {"title": "УРОВЕНЬ ПРОЙДЕН", "roster": roster,
+             "buttons": [("leave", "В МЕНЮ")], "primary": "leave",
+             "escapable": True, "hint": "Стрелки влево/вправо — игрок"}
+    screen.set_model(model)
+    check(screen._roster_selected == 1, "roster must open on the local player")
+    screen.handle([pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RIGHT)])
+    check(screen._roster_selected == 2, "right arrow did not move the roster")
+    screen.handle([pygame.event.Event(pygame.KEYDOWN, key=pygame.K_LEFT)])
+    check(screen._roster_selected == 1, "left arrow did not move the roster")
+    rect = screen._roster_rects[0]
+    screen.handle([pygame.event.Event(
+        pygame.MOUSEBUTTONDOWN, button=1, pos=(rect.centerx, rect.centery))])
+    check(screen._roster_selected == 0, "click on a drawn row missed it")
+    screen.draw(pygame.Surface((1000, 700)))
+    enter = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN)
+    check(screen.handle([enter]) == "leave", "roster stole the primary button")
+
+
+def test_roster_stats_fit_their_band() -> None:
+    screen = EndScreen(1000, 700)
+    rows = client._stat_rows(
+        {"kills": 12345, "deaths": 678, "damage_dealt": 987654,
+         "damage_taken": 123456, "shots_fired": 9999, "shots_hit": 8888,
+         "items": 321, "secrets": 17}, 5999)
+    for label, value in rows:
+        lw = screen.small_font.size(label)[0]
+        vw = screen.small_font.size(str(value))[0]
+        check(lw <= STATS_VALUE_W // 2 and vw <= STATS_VALUE_W // 2,
+              f"stat band overflow: {label!r}={value!r} ({lw}, {vw})")
+
+
+def test_roster_pages_for_large_party() -> None:
+    screen = EndScreen(1000, 700)
+    roster = [
+        {"id": i, "name": f"P{i}", "local": i == 0,
+         "stats": [("Убийства", str(i))]}
+        for i in range(14)
+    ]
+    screen.set_model({"title": "УРОВЕНЬ ПРОЙДЕН", "roster": roster,
+                      "buttons": [("leave", "В МЕНЮ")], "primary": "leave",
+                      "hint": ""})
+    check(len(screen._roster_rects) == 11,
+          f"first page has {len(screen._roster_rects)} rows")
+    for _ in range(13):
+        screen.handle([pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RIGHT)])
+    check(screen._roster_selected == 13, "cannot reach the last teammate")
+    check(len(screen._roster_rects) == 3,
+          f"last page has {len(screen._roster_rects)} rows")
+
+
 def test_pvp_table_sorted_highlight() -> None:
     client.bridge = object()
     _armed_client(
@@ -261,6 +390,12 @@ TESTS = [
     test_accuracy_pct_boundary,
     test_death_model,
     test_pve_victory_model,
+    test_pve_cooperative_victory_roster,
+    test_pve_solo_victory_has_no_roster,
+    test_results_read_authoritative_stats,
+    test_roster_navigation_and_hitbox,
+    test_roster_stats_fit_their_band,
+    test_roster_pages_for_large_party,
     test_pvp_titles,
     test_pvp_table_sorted_highlight,
     test_input_gate,

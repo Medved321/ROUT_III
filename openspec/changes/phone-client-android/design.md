@@ -230,12 +230,22 @@ pygame 2.1.0, а проект — Python 3.12 и pygame ≥ 2.5:
 - `pygame` — 2.6.1 (тот же рецепт, что у p4a, с поднятой версией);
 - `python3` и `hostpython3` — **оба** 3.12.14 (p4a сравнивает их и отказывается
   собирать при расхождении). Патчи p4a подключаются по абсолютному пути в
-  каталог его собственного рецепта: имена в локальном каталоге p4a ищет
-  относительно локального рецепта, а своего `patches/` у нас нет. Все четыре
-  патча (`pyconfig_detection`, `reproducible-buildinfo`,
-  `cpython-311-ctypes-find-library`, `fix_ensurepip`) проверены на CPython
-  3.12.14; `py3.8.1_fix_cortex_a8` подключается только при наличии `lld` и для
-  arm64 не нужен.
+  каталог его собственного рецепта: имена p4a ищет относительно локального
+  рецепта. Все четыре патча p4a (`pyconfig_detection`,
+  `reproducible-buildinfo`, `cpython-311-ctypes-find-library`,
+  `fix_ensurepip`) проверены на CPython 3.12.14; `py3.8.1_fix_cortex_a8`
+  подключается только при наличии `lld` и для arm64 не нужен.
+
+  Один патч — **наш**, `tools/android/recipes/python3/patches/
+  grp-no-group-enumeration.patch`: `Modules/grpmodule.c` в 3.12 зовёт
+  `setgrent()`/`getgrent()`/`endgrent()` безусловно, а configure эту функцию
+  даже не проверяет. bionic объявляет их только с API 26, а сборка идёт под
+  `ndk_api = 24`, поэтому модуль падал с `call to undeclared function
+  'setgrent'`. Патч возвращает пустой список из `grp.getgrall()` ниже API 26
+  (обходить в Android нечего), а `getgrgid()`/`getgrnam()` продолжают
+  работать через bionic-вызовы API 24. `Modules/pwdmodule.c` патча не требует:
+  его `getpwall()` уже закрыт `HAVE_GETPWENT`, который configure на API 24 не
+  находит.
 
 Точка входа `main.py` в корне — тонкий двойник `run_client.py`: ставит
 `SDL_TOUCH_MOUSE_EVENTS=0` до импорта pygame, `os.chdir` к распакованному
@@ -296,6 +306,58 @@ numpy.
 - **Отключённая синтетическая мышь** → весь тач-путь меню и оверлея теперь на
   `FINGER*`; регрессию держат `smoke_touch_controls.py` (оверлей) и
   `smoke_android_build.py` (порядок установки флага до pygame, перевод пальца).
+
+## Startup failure visibility on the device
+
+p4a runs the entry point with `PyRun_SimpleFile` and finishes with `exit(ret)`:
+an escaping exception (including `SystemExit`) closes the window, and on a phone
+that is indistinguishable from a native crash. There is no dialog, no traceback,
+and app-private storage is not reachable from a file manager on Android 11+.
+
+- **One guarded function.** All startup work moved into `main.py: _startup()`
+  under a single `except BaseException`; imports live inside it because an
+  `ImportError` is the likeliest Android-only failure. `sys.exit(main())` was
+  removed for the same reason — returning from `main()` lets p4a end the process
+  itself.
+- **Two channels, because one is not enough.** The on-screen report covers a
+  Python-level failure; the `rout3-boot.json` marker (status `startup` /
+  `failed` / `running`, last stage, interpreter version, tail of the log) covers
+  the failures that cannot draw -- a native crash in SDL/numpy, or the display
+  never coming up. The next launch shows the marker before retrying, so the
+  phone itself becomes the report. The log also mirrors to `stderr`, which p4a
+  forwards to logcat.
+- **Markers are cleared deliberately.** `mark_running()` runs immediately before
+  `asyncio.run`, so being killed later is a normal close; `clear_boot()` runs
+  after a clean start and after the player dismisses a report, so the alarm is
+  shown once, not on every launch.
+- **`tools/android_log.py` is the fallback when the screen never appears.** It
+  pulls logcat (including the separate `crash` buffer) and the app-private files
+  over `adb`, and names an APK/device ABI mismatch -- the one failure that
+  installs fine and closes before Python starts, leaving no marker at all.
+- **The window before Python is Java, so the first reporter is Java.** p4a's
+  `PythonActivity.onCreate` builds its resource manager, then calls
+  `super.onCreate`, which loads every native library and builds the SDL surface,
+  and only then shows the presplash. A failure in that sequence closes the window
+  with no splash, no dialog and no boot marker -- Python has not run yet. The
+  launcher is therefore `org.rout3.DiagActivity` (`android.entrypoint`), a
+  `PythonActivity` subclass that runs `super.onCreate` inside `Throwable`, names
+  the failing library when SDL reports `mBrokenLibraries`, and keeps the traceback
+  on screen as selectable white-on-black text. Libraries are also loaded one at a
+  time *before* `super.onCreate`, with the name written to the journal before each
+  load: a `SIGSEGV` inside `JNI_OnLoad` is not an exception, it kills the process
+  between two statements, and then the last line is the only thing that names the
+  culprit. `org.rout3.DiagApp`
+  (`android:name` on `<application>`, spliced from
+  `tools/android/manifest_application.xml`) opens the same journal before any
+  activity exists, and its uncaught-exception handler covers the one thing the
+  `try` cannot: a failure while the framework loads or verifies the launcher
+  class. The journal is
+  `Android/data/<package>/files/rout3-java.log` -- readable over USB/MTP without
+  adb or any permission -- mirrored to app-private storage and logcat, and every
+  line is flushed and `fsync`ed because the process may die on the next statement.
+  `smoke_android_build.py` holds the wiring (entrypoint, source dir, application
+  attribute, import whitelist, both sinks); the sources are compiled into the APK
+  and never shipped as files.
 
 ## Migration Plan
 

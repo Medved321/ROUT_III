@@ -210,14 +210,26 @@ class SectorScene:
         return -1
 
     def _line_borders_slab(self, li: int) -> bool:
-        """True when linedef ``li`` borders a floating slab (task 4.1)."""
+        """True when linedef ``li`` touches a floating slab.
+
+        Both slab<->host borders and slab<->slab seams are overlay geometry.
+        A seam between two plates must not reach the base wall pass either:
+        with ``floor_h > ceil_h`` it is treated as a solid wall, emits no band
+        but still owns the column in ``solid_depth``/``view_buf``, which cuts
+        the far plate at the seam (change
+        ``floating-sector-overlay-clip-fix``).  The seam itself is drawn only
+        by ``platform_render._side_bands`` when the two plates differ in
+        height; an equal-height seam is invisible.  One-sided slab borders
+        count as slab borders.
+        """
         if not self.has_floating:
             return False
         n = len(self.floating)
-        for sec in (self.front_sec[li], self.back_sec[li]):
-            if 0 <= sec < n and self.floating[sec]:
-                return True
-        return False
+        f = self.front_sec[li]
+        b = self.back_sec[li]
+        f_float = 0 <= f < n and self.floating[f]
+        b_float = 0 <= b < n and self.floating[b]
+        return f_float or b_float
 
     def slab_borders(self, sid: int) -> list:
         """Boundary quads of one slab.
@@ -646,9 +658,19 @@ def _walk_subsectors(tree, px, py, pa) -> list:
     return out
 
 
+def _record_clip(col, t, clip_top, clip_bot, clip_hist):
+    """Snapshot the column's clip frontier after a portal tightened it."""
+    if clip_hist is None:
+        return
+    hist = clip_hist[col]
+    if hist is None:
+        hist = clip_hist[col] = []
+    hist.append((t, clip_top[col], clip_bot[col]))
+
+
 def _seg_wall_bands(bands, scene, tree, si, px, py, pa, F, hc, iw, ih, eye,
                     view, clip_top=None, clip_bot=None, flat_spans=None,
-                    view_buf=None, solid_depth=None):
+                    view_buf=None, solid_depth=None, clip_hist=None):
     """Project one seg into ``bands``, DOOM ``R_RenderSegLoop`` style.
 
     Without clip arrays the seg is emitted as raw projected bands (no
@@ -694,6 +716,12 @@ def _seg_wall_bands(bands, scene, tree, si, px, py, pa, F, hc, iw, ih, eye,
     wall that CLOSES each column — the nearest solid wall (``solid_depth``)
     or the two-sided lip that pinches the interval shut — into
     ``view_buf[col]``, the per-column z-buffer for sprites/particles.
+
+    With ``clip_hist`` (change ``floating-sector-overlay-clip-fix``) a
+    two-sided seg or door plate that tightens ``clip_top``/``clip_bot`` appends
+    a ``(depth, top, bot)`` snapshot for that column.  The slab overlay picks
+    the last snapshot in front of the plate, so a farther portal cannot erase
+    the plate while a nearer doorway still limits it.
     """
     s = tree.segs[si]
     ax1, ay1 = s.x1, s.y1
@@ -899,6 +927,7 @@ def _seg_wall_bands(bands, scene, tree, si, px, py, pa, F, hc, iw, ih, eye,
                                   ax1, ay1, ax2, ay2, t))
                 if pb > clip_top[col]:
                     clip_top[col] = pb
+                    _record_clip(col, t, clip_top, clip_bot, clip_hist)
             if p <= 0.0:
                 # Fully shut: the door owns the column so nothing behind it
                 # shows through, and it is the occlusion distance for sprites.
@@ -953,6 +982,11 @@ def _seg_wall_bands(bands, scene, tree, si, px, py, pa, F, hc, iw, ih, eye,
                           ax1, ay1, ax2, ay2, t))
         nb = yfb if yfb > yl else yl
         clip_bot[col] = nb if nb < flrob else flrob
+        # Snapshot the frontier at this portal's depth.  The slab overlay
+        # picks the last snapshot before the plate, so portals behind it are
+        # ignored without losing nearer doorways (change
+        # ``floating-sector-overlay-clip-fix``).
+        _record_clip(col, t, clip_top, clip_bot, clip_hist)
         # The first (nearest) wall that closes this column is the occlusion
         # distance for the z-buffer (task 4.4 — sprites/particles/fog).
         if view_buf is not None and clip_top[col] >= clip_bot[col] \
@@ -1063,6 +1097,11 @@ def bsp_clipped_frame(vh=None, vy=None, view_buf=None) -> tuple:
     # per-column gate and repaints, so the result does not depend on the
     # arbitrary seg order inside a subsector.
     solid_depth = [math.inf] * iw
+    # Clip-frontier snapshots per column, recorded only when the slab overlay
+    # will actually run.  A plate picks the last snapshot in front of it, so
+    # portals behind are ignored without losing nearer doorways (change
+    # ``floating-sector-overlay-clip-fix``).  Maps without plates pay nothing.
+    clip_hist = [None] * iw if gs.platforms_enabled and scene.has_floating else None
     order = _walk_subsectors(bsp, px, py, pa)
     bands = []
     flat_spans = []
@@ -1083,7 +1122,7 @@ def bsp_clipped_frame(vh=None, vy=None, view_buf=None) -> tuple:
             _seg_wall_bands(bands, scene, bsp, si, px, py, pa,
                             F, hc, iw, ih, eye, view,
                             clip_top, clip_bot, flat_spans, view_buf,
-                            solid_depth)
+                            solid_depth, clip_hist)
     # ---- Phase B: visplane flats (task 4.3) ----
     if flat_spans:
         if gs.flat_textured and HAVE_NP:
@@ -1107,7 +1146,7 @@ def bsp_clipped_frame(vh=None, vy=None, view_buf=None) -> tuple:
 
         gs.platform_occluders = platform_render.draw_platforms(
             frame, scene, px, py, pa, eye, F, hc, iw, ih, iw_f, ih_f,
-            fwidths, clip_top, clip_bot, view_buf, view, vh, vy)
+            fwidths, clip_top, clip_bot, view_buf, view, vh, vy, clip_hist)
     _upscale(frame, vy, vh)
     return order, clip_top, clip_bot
 

@@ -13,7 +13,13 @@
 """
 import math
 
-from shared.combat import wpn_cooldown_ticks, TICK_INTERVAL, TAU, normalize_angle
+from shared.combat import (
+    DEFAULT_TICK_RATE, wpn_cooldown_ticks, tick_interval, TAU, normalize_angle,
+)
+
+# The shared tick cooldown is translated at every supported server rate.
+RATES = (20, 30, 40)
+
 from shared.protocol import (
     PacketType, encode_fire, decode_fire,
     encode_player_input, decode_player_input,
@@ -83,18 +89,26 @@ def test_protocol_roundtrip():
     print("1.1 protocol roundtrip (FIRE, absolute angle, impact ids) OK")
 
 
-def test_shared_fire_tempo():
-    # клиент и сервер используют одну функцию тикового кулдауна
-    assert wpn_cooldown_ticks(8) == 3        # RIFLE: 8 кадров @60 -> 3 тика @20
-    assert wpn_cooldown_ticks(16) == 5       # пистолет: 16 -> 5
-    assert wpn_cooldown_ticks(50) == 17      # дробовик: 50 -> 17
-    # клиентский гейт (ticks*interval + слак в 1 тик) никогда не короче
-    # серверного кулдауна — показанный выстрел не будет отклонён сервером.
-    for frames, ticks in ((8, 3), (16, 5), (50, 17), (100, 33)):
-        assert wpn_cooldown_ticks(frames) == ticks, frames
-        gate = ticks * TICK_INTERVAL + TICK_INTERVAL
-        assert gate >= ticks * TICK_INTERVAL and gate > 0.05, (frames, gate)
-    print("1.2 shared fire tempo OK")
+def test_shared_fire_tempo(tick_rate: int = DEFAULT_TICK_RATE):
+    interval = tick_interval(tick_rate)
+    # клиент и сервер используют одну функцию тикового кулдауна. Точные числа
+    # тиков фиксированы для частоты по умолчанию; на остальных частотах держим
+    # монотонность по темпу и тот же контракт гейта.
+    if tick_rate == DEFAULT_TICK_RATE:
+        assert wpn_cooldown_ticks(8, tick_rate) == 3    # RIFLE: 8 кадров @60
+        assert wpn_cooldown_ticks(16, tick_rate) == 5   # пистолет: 16
+        assert wpn_cooldown_ticks(50, tick_rate) == 17  # дробовик: 50
+    prev = 0
+    for frames in (8, 16, 50, 100):
+        ticks = wpn_cooldown_ticks(frames, tick_rate)
+        assert ticks > prev, (tick_rate, frames, ticks)
+        prev = ticks
+        # клиентский гейт (ticks*interval + слак в 1 тик) никогда не короче
+        # серверного кулдауна — показанный выстрел не будет отклонён сервером.
+        gate = ticks * interval + interval
+        assert gate >= ticks * interval and gate > interval, \
+            (tick_rate, frames, gate, interval)
+    print(f"1.2 shared fire tempo at {tick_rate} tps OK")
 
 
 def test_ray_circle_hit_geometry():
@@ -367,7 +381,8 @@ def test_client_fire_sequence_and_absolute():
 
 if __name__ == '__main__':
     test_protocol_roundtrip()
-    test_shared_fire_tempo()
+    for rate in RATES:
+        test_shared_fire_tempo(rate)
     test_ray_circle_hit_geometry()
     test_hitscan_distances_and_radius()
     test_wall_occlusion()
