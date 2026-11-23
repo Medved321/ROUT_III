@@ -495,6 +495,21 @@ def section_crash_reporter():
 
 
 # ── 4a. the Java reporter that covers the pre-Python window ──────
+def _java_method_body(source: str, signature: str) -> str:
+    """Body of one Java method, brace-balanced (nested ``if`` included)."""
+    start = source.index(signature)
+    opening = source.index("{", start)
+    depth = 0
+    for pos in range(opening, len(source)):
+        if source[pos] == "{":
+            depth += 1
+        elif source[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[opening + 1:pos]
+    raise AssertionError(f"unbalanced braces in {signature}")
+
+
 def section_java_reporter():
     """The first frames of an APK launch exist only in Java.
 
@@ -538,6 +553,23 @@ def section_java_reporter():
           "libs must be loaded before the activity so a native crash names one")
     check('DiagLog.mark("native: loading " + name)' in diag,
           "the library name must reach the disk before the library is loaded")
+
+    # Android's Activity.performStart()/performResume()/... check a mCalled flag
+    # after each callback.  A failure flag that returns early used to produce
+    # SuperNotCalledException *after* the report was drawn, hiding the real
+    # startup error.  Any override we keep must reach super unconditionally.
+    check("sFailed" not in diag,
+          "a failure flag must not gate lifecycle callbacks: Android requires super")
+    for callback in ("onCreate", "onStart", "onResume", "onPause", "onStop", "onDestroy"):
+        signature = f"protected void {callback}("
+        if signature not in diag:
+            continue  # stock implementation inherited from p4a/SDL is fine
+        body = _java_method_body(diag, signature)
+        check(re.search(rf"\bsuper\.{callback}\s*\(", body) is not None,
+              f"{callback} must call super")
+        super_at = body.index(f"super.{callback}(")
+        check("return" not in body[:super_at],
+              f"{callback}: an early return skips super and crashes the activity")
 
     # Only platform and p4a APIs: the Java sources are compiled by the APK build
     # alone, so a dependency on a jar that is not in the bootstrap is invisible

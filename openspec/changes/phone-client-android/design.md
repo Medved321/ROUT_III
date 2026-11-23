@@ -358,6 +358,19 @@ and app-private storage is not reachable from a file manager on Android 11+.
   `smoke_android_build.py` holds the wiring (entrypoint, source dir, application
   attribute, import whitelist, both sinks); the sources are compiled into the APK
   and never shipped as files.
+- **A failure flag must never skip a lifecycle `super` call.** The first version
+  of `DiagActivity` returned from `onStart`/`onResume`/`onPause`/`onStop` (and from
+  `onCreate` on a Recents relaunch) when startup had failed, hoping to keep a
+  half-built SDL from resuming. Android checks a `mCalled` flag in
+  `Activity.performStart()` and friends, so the guard produced
+  `SuperNotCalledException` *after* the traceback had been drawn -- the phone
+  showed a generic lifecycle crash instead of the real startup error. p4a already
+  catches `UnsatisfiedLinkError` around the native calls in `onResume`/`onPause`,
+  and SDL's `onStart`/`onStop` call the framework implementation first, so there
+  is nothing to protect: `DiagActivity` no longer overrides those four methods,
+  `onCreate`/`onDestroy` always reach `super`, and the saved report is simply
+  redrawn on a re-created activity. `section_java_reporter` checks this
+  structurally: every remaining override must call `super` before any `return`.
 
 ## Migration Plan
 

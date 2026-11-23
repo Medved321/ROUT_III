@@ -48,8 +48,6 @@ import java.util.Arrays;
  * shipped as files inside it.
  */
 public class DiagActivity extends org.kivy.android.PythonActivity {
-    /** Set when startup failed: a half-built SDL must not be resumed. */
-    private static boolean sFailed;
     /** The text shown the first time; a re-created activity shows it again. */
     private static String sReport;
 
@@ -57,12 +55,6 @@ public class DiagActivity extends org.kivy.android.PythonActivity {
     protected void onCreate(Bundle state) {
         DiagLog.init(this);
         DiagLog.mark("activity: onCreate");
-
-        if (sFailed) {
-            // A relaunch from Recents must not call the broken super.onCreate again.
-            screen(sReport);
-            return;
-        }
 
         DiagLog.mark("launch: " + apkVersion());
         DiagLog.mark("device: " + Build.MANUFACTURER + " " + Build.MODEL
@@ -101,46 +93,16 @@ public class DiagActivity extends org.kivy.android.PythonActivity {
         DiagLog.mark("startup handed to Python");
     }
 
-    // PythonActivity keeps unpacking and starting Python after super.onCreate, so
-    // these guards only keep a half-built SDL from being started or resumed.
-    @Override
-    protected void onStart() {
-        if (sFailed) {
-            return;
-        }
-        super.onStart();
-    }
-
-    @Override
-    protected void onResume() {
-        if (sFailed) {
-            return;
-        }
-        super.onResume();
-    }
-
-    @Override
-    protected void onPause() {
-        if (sFailed) {
-            return;
-        }
-        super.onPause();
-    }
-
-    @Override
-    protected void onStop() {
-        if (sFailed) {
-            return;
-        }
-        super.onStop();
-    }
-
+    // Every lifecycle callback MUST reach the superclass, even when startup has
+    // failed: Activity.performStart()/performResume() raise SuperNotCalledException
+    // otherwise, and that secondary crash hides the report this class exists to
+    // show.  p4a already guards the native calls in onResume/onPause and SDL's
+    // onStart/onStop call Activity's implementation first, so a failed startup
+    // needs no extra guard here.  There is no custom work to protect, hence no
+    // overrides for onStart/onResume/onPause/onStop at all.
     @Override
     protected void onDestroy() {
-        DiagLog.mark(sFailed ? "report closed" : "activity destroyed");
-        if (sFailed) {
-            return;
-        }
+        DiagLog.mark(sReport == null ? "activity destroyed" : "report closed");
         super.onDestroy();
     }
 
@@ -148,9 +110,10 @@ public class DiagActivity extends org.kivy.android.PythonActivity {
 
     /** Record a startup failure and keep it on screen. */
     private void fail(String where, Throwable failure) {
-        sFailed = true;
         DiagLog.crash(where, failure);
         if (sReport != null) {
+            // A re-created activity has an empty window: draw the old report again.
+            screen(sReport);
             return;
         }
         String detail;
