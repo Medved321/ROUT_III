@@ -960,7 +960,7 @@ class SectorMap:
         if best is None:
             return None
         above = [c for c in ceilings if c >= best]
-        if not above or min(above) - best < ACTOR_HEIGHT:
+        if above and min(above) - best < ACTOR_HEIGHT:
             return None
         return float(best)
 

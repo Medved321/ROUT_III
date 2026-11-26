@@ -592,12 +592,21 @@ def section_java_reporter():
     check("DiagLog.installHandler" in diag_app,
           "class-loading failures need the handler installed before the activity")
 
-    # Both sinks and the durability of every line: the process may die on the
+    # Three sinks and the durability of every line: the process may die on the
     # next statement, so a buffered last marker is the same as no marker.
     log = sources["DiagLog"]
     check("getExternalFilesDir(null)" in log,
           "the journal must be reachable over USB, without adb")
     check("getFilesDir()" in log, "app-private storage is the fallback")
+    check("MediaStore.Downloads.EXTERNAL_CONTENT_URI" in log and
+          "Environment.DIRECTORY_DOWNLOADS" in log,
+          "Android 11+ hides Android/data: the journal needs a copy in Downloads")
+    check('sResolver.openOutputStream(sDownloads, "wa")' in log,
+          "the Downloads copy must be appended, not rewritten on every marker")
+    check("findDownloads(relative)" in log and "ContentUris.withAppendedId" in log,
+          "every launch must reuse one Downloads row, not leave stale '(1).log' copies")
+    check("DiagLog.publicPath()" in diag and "publicPath()" in sources["DiagLog"],
+          "the on-screen report and the toast must name the readable copy")
     check("out.getFD().sync()" in log, "every marker must survive the next line")
     check("setDefaultUncaughtExceptionHandler" in log,
           "an uncaught exception must leave a trace")

@@ -158,9 +158,13 @@ def _ray_intervals(loops, px, py, dx, dy, t_max) -> list:
             if t > 0.0:
                 ts.append(t)
             ax, ay = bx, by
-    if len(ts) < 2:
+    if not ts:
         return []
     ts.sort()
+    # Odd forward crossings mean the origin is inside the polygon (even-odd).
+    # The ray starts inside, so the first interval is [_NEAR, ts[0]].
+    if len(ts) % 2 == 1:
+        ts.insert(0, 0.0)
     out = []
     for i in range(0, len(ts) - 1, 2):
         t0 = ts[i]

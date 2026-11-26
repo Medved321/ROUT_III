@@ -337,14 +337,16 @@ def _initial_segs(sm: SectorMap) -> list:
 
 
 def _floating_lines(sm: SectorMap) -> set[int]:
-    """Linedefs that border a floating slab against a non-floating sector.
+    """Linedefs with any floating side — overlay borders, not BSP partitions.
 
-    The BSP is the flat world of *host* sectors.  An ordinary<->floating
-    border is not a partition: splitting the plane along it would hand the
-    area under the slab to the slab's own subsector, and the host's floor —
+    The BSP is the flat world of *host* sectors.  A border that touches a
+    floating slab is not a partition: splitting the plane along it would hand
+    the area under the slab to the slab's own subsector, and the host's floor —
     which by ``_ensure_polys`` still spans the footprint — would have nothing
-    left to draw it.  Floating-floating borders are normal borders between
-    slabs and may be partitioned/rendered.
+    left to draw it.  That includes the seam between two slabs: equal heights
+    are an invisible interior face, a level change is a visible step, and in
+    either case the face belongs to the overlay, not the base pass
+    (change ``floating-sector-overlay-clip-fix``).
 
     Maps without slabs get an empty set, so their tree is bit-for-bit the one
     they had before this change.
@@ -361,9 +363,7 @@ def _floating_lines(sm: SectorMap) -> set[int]:
 
     out = set()
     for li, ld in enumerate(sm.linedefs):
-        f = _is_float(ld.front)
-        b = _is_float(ld.back)
-        if f != b:
+        if _is_float(ld.front) or _is_float(ld.back):
             out.add(li)
     return out
 

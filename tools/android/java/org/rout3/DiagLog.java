@@ -1,10 +1,19 @@
 package org.rout3;
 
+import android.content.ContentResolver;
+import android.content.ContentUris;
+import android.content.ContentValues;
 import android.content.Context;
+import android.database.Cursor;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Environment;
+import android.provider.MediaStore;
 import android.util.Log;
 
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.OutputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
@@ -21,11 +30,15 @@ import java.util.Locale;
  * missing or read-only storage directory only costs the file copy -- logcat still
  * receives every line.
  *
- * <p>Two sinks are kept on purpose.  {@code getExternalFilesDir(null)} lives at
+ * <p>Three sinks are kept on purpose.  {@code getExternalFilesDir(null)} lives at
  * {@code Android/data/<package>/files/rout3-java.log}, which is readable over
  * USB/MTP without adb and without any storage permission; {@code getFilesDir()}
  * is app-private and always present, so the journal survives a phone where the
- * external volume is unmounted.  Both are trimmed once per launch.
+ * external volume is unmounted.  Since Android 11 many phones hide Android/data
+ * from both the file manager and MTP, so a MediaStore row in
+ * {@code Downloads/ROUT3/rout3-java.log} is appended as well: it is visible in
+ * the ordinary Files app with no adb, no MTP and no permission request.  The two
+ * file copies are trimmed once per launch; the Downloads copy is appended.
  *
  * <p>Each line is flushed <em>and synced</em>: the case this file exists for is
  * the process dying immediately, and buffering would lose exactly the last marker,
@@ -45,6 +58,13 @@ final class DiagLog {
     private static File sExternal;
     /** Always present; null only if the app has no files dir at all. */
     private static File sInternal;
+    /**
+     * MediaStore row in Downloads/ROUT3. Android 11+ hides Android/data both
+     * from the file manager and, on some phones, from MTP; this copy is visible
+     * in the ordinary "Files" app without adb and without any permission.
+     */
+    private static Uri sDownloads;
+    private static ContentResolver sResolver;
     private static boolean sReady;
     private static boolean sHandler;
 
@@ -56,6 +76,7 @@ final class DiagLog {
             return;
         }
         sReady = true;
+        sResolver = context.getContentResolver();
         try {
             File dir = context.getExternalFilesDir(null);
             if (dir != null) {
@@ -68,6 +89,26 @@ final class DiagLog {
             sInternal = new File(context.getFilesDir(), LOG_NAME);
         } catch (Throwable ignored) {
             // Nothing to do: logcat still gets every line.
+        }
+        if (Build.VERSION.SDK_INT >= 29) {
+            try {
+                String relative = Environment.DIRECTORY_DOWNLOADS + "/ROUT3";
+                // Reuse the existing row: a fresh insert would give each launch
+                // its own "(1).log", and the path on screen would point at an old
+                // report instead of the failure being diagnosed.
+                sDownloads = findDownloads(relative);
+                if (sDownloads == null) {
+                    ContentValues values = new ContentValues();
+                    values.put(MediaStore.MediaColumns.DISPLAY_NAME, LOG_NAME);
+                    values.put(MediaStore.MediaColumns.MIME_TYPE, "text/plain");
+                    values.put(MediaStore.MediaColumns.RELATIVE_PATH, relative);
+                    sDownloads = sResolver.insert(
+                            MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                }
+            } catch (Throwable ignored) {
+                // No Downloads volume: the two file sinks and logcat remain.
+                sDownloads = null;
+            }
         }
         for (File target : new File[] {sExternal, sInternal}) {
             try {
@@ -88,6 +129,42 @@ final class DiagLog {
             return sInternal.getAbsolutePath();
         }
         return "нет";
+    }
+
+    /** Find the Downloads row left by an earlier launch, if there is one. */
+    private static Uri findDownloads(String relative) {
+        Cursor cursor = null;
+        try {
+            String[] projection = {MediaStore.MediaColumns._ID};
+            String selection = MediaStore.MediaColumns.DISPLAY_NAME + "=? AND "
+                    + MediaStore.MediaColumns.RELATIVE_PATH + "=?";
+            cursor = sResolver.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    projection, selection, new String[] {LOG_NAME, relative}, null);
+            if (cursor != null && cursor.moveToFirst()) {
+                long id = cursor.getLong(
+                        cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID));
+                return ContentUris.withAppendedId(
+                        MediaStore.Downloads.EXTERNAL_CONTENT_URI, id);
+            }
+        } catch (Throwable ignored) {
+            // A query we cannot run only costs a new row; the journal still works.
+        } finally {
+            if (cursor != null) {
+                try {
+                    cursor.close();
+                } catch (Throwable ignored) {
+                    // Closing a cursor we could not read is not an error.
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Where a person can open the journal with the ordinary Files app. */
+    static String publicPath() {
+        return sDownloads != null
+                ? "Загрузки/ROUT3/" + LOG_NAME
+                : path();
     }
 
     static synchronized void mark(String line) {
@@ -112,6 +189,26 @@ final class DiagLog {
                         out.close();
                     } catch (Throwable ignored) {
                         // Closing a file we could not write is not an error.
+                    }
+                }
+            }
+        }
+        if (sDownloads != null && sResolver != null) {
+            OutputStream out = null;
+            try {
+                out = sResolver.openOutputStream(sDownloads, "wa");
+                if (out != null) {
+                    out.write(bytes);
+                    out.flush();
+                }
+            } catch (Throwable ignored) {
+                // MediaStore is a convenience: logcat and the files still work.
+            } finally {
+                if (out != null) {
+                    try {
+                        out.close();
+                    } catch (Throwable ignored) {
+                        // Closing a stream we could not write is not an error.
                     }
                 }
             }
@@ -157,7 +254,7 @@ final class DiagLog {
                 crash("необработанное исключение в потоке " + thread.getName(), failure);
                 try {
                     android.widget.Toast.makeText(context,
-                            "ROUT III: сбой запуска\n" + path(),
+                            "ROUT III: сбой запуска\n" + publicPath(),
                             android.widget.Toast.LENGTH_LONG).show();
                 } catch (Throwable ignored) {
                     // A toast is a bonus; the journal is the contract.

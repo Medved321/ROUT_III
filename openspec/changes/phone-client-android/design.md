@@ -353,11 +353,19 @@ and app-private storage is not reachable from a file manager on Android 11+.
   `try` cannot: a failure while the framework loads or verifies the launcher
   class. The journal is
   `Android/data/<package>/files/rout3-java.log` -- readable over USB/MTP without
-  adb or any permission -- mirrored to app-private storage and logcat, and every
-  line is flushed and `fsync`ed because the process may die on the next statement.
-  `smoke_android_build.py` holds the wiring (entrypoint, source dir, application
-  attribute, import whitelist, both sinks); the sources are compiled into the APK
-  and never shipped as files.
+  adb or any permission -- mirrored to app-private storage and logcat. Since
+  Android 11 hides `Android/data` from many file managers *and* from MTP, a third
+  copy is appended to `Downloads/ROUT3/rout3-java.log` through MediaStore: it is
+  visible in the ordinary Files app without adb, MTP or a permission request, and
+  the on-screen report names that path. An existing MediaStore row is reused on
+  the next launch, so the file named on screen is the current report, not an old
+  `(1).log` left by an earlier run. Every line is flushed and `fsync`ed
+  because the process may die on the next statement. `smoke_android_build.py`
+  holds the wiring (entrypoint, source dir, application attribute, import
+  whitelist, three sinks); the sources are compiled into the APK and never
+  shipped as files. `tools/apk_check.py` settles the competing 16 KB-page
+  hypothesis from an APK alone by reading each `.so`'s `PT_LOAD` alignment; its
+  synthetic-ELF regression is `smoke_apk_check.py`.
 - **A failure flag must never skip a lifecycle `super` call.** The first version
   of `DiagActivity` returned from `onStart`/`onResume`/`onPause`/`onStop` (and from
   `onCreate` on a Recents relaunch) when startup had failed, hoping to keep a

@@ -210,10 +210,12 @@ class SectorScene:
         return -1
 
     def _line_borders_slab(self, li: int) -> bool:
-        """True when linedef ``li`` separates a floating slab from non-floating.
+        """True when linedef ``li`` has any floating side.
 
-        Floating-floating borders are normal slab seams and are not skipped.
-        One-sided slab borders count as slab borders.
+        Any border that touches a slab is overlay geometry: the base pass must
+        not own its columns, and the overlay draws the face (or nothing, for an
+        equal-height seam).  Floating-floating seams are included
+        (change ``floating-sector-overlay-clip-fix``).
         """
         if not self.has_floating:
             return False
@@ -222,7 +224,7 @@ class SectorScene:
         b = self.back_sec[li]
         f_float = 0 <= f < n and self.floating[f]
         b_float = 0 <= b < n and self.floating[b]
-        return f_float != b_float
+        return f_float or b_float
 
     def slab_borders(self, sid: int) -> list:
         """Boundary quads of one slab.
@@ -653,7 +655,7 @@ def _walk_subsectors(tree, px, py, pa) -> list:
 
 def _seg_wall_bands(bands, scene, tree, si, px, py, pa, F, hc, iw, ih, eye,
                     view, clip_top=None, clip_bot=None, flat_spans=None,
-                    view_buf=None, solid_depth=None):
+                    view_buf=None, solid_depth=None, clip_hist=None):
     """Project one seg into ``bands``, DOOM ``R_RenderSegLoop`` style.
 
     Without clip arrays the seg is emitted as raw projected bands (no
@@ -904,6 +906,8 @@ def _seg_wall_bands(bands, scene, tree, si, px, py, pa, F, hc, iw, ih, eye,
                                   ax1, ay1, ax2, ay2, t))
                 if pb > clip_top[col]:
                     clip_top[col] = pb
+                    if clip_hist is not None:
+                        clip_hist[col].append((t, clip_top[col], clip_bot[col]))
             if p <= 0.0:
                 # Fully shut: the door owns the column so nothing behind it
                 # shows through, and it is the occlusion distance for sprites.
@@ -958,6 +962,9 @@ def _seg_wall_bands(bands, scene, tree, si, px, py, pa, F, hc, iw, ih, eye,
                           ax1, ay1, ax2, ay2, t))
         nb = yfb if yfb > yl else yl
         clip_bot[col] = nb if nb < flrob else flrob
+        if clip_hist is not None and (clip_top[col] != ceilt
+                                       or clip_bot[col] != flrob):
+            clip_hist[col].append((t, clip_top[col], clip_bot[col]))
         # The first (nearest) wall that closes this column is the occlusion
         # distance for the z-buffer (task 4.4 — sprites/particles/fog).
         if view_buf is not None and clip_top[col] >= clip_bot[col] \
@@ -1068,6 +1075,7 @@ def bsp_clipped_frame(vh=None, vy=None, view_buf=None) -> tuple:
     # per-column gate and repaints, so the result does not depend on the
     # arbitrary seg order inside a subsector.
     solid_depth = [math.inf] * iw
+    clip_hist = [[] for _ in range(iw)] if scene.has_floating else None
     order = _walk_subsectors(bsp, px, py, pa)
     bands = []
     flat_spans = []
@@ -1088,7 +1096,7 @@ def bsp_clipped_frame(vh=None, vy=None, view_buf=None) -> tuple:
             _seg_wall_bands(bands, scene, bsp, si, px, py, pa,
                             F, hc, iw, ih, eye, view,
                             clip_top, clip_bot, flat_spans, view_buf,
-                            solid_depth)
+                            solid_depth, clip_hist)
     # ---- Phase B: visplane flats (task 4.3) ----
     if flat_spans:
         if gs.flat_textured and HAVE_NP:
@@ -1112,7 +1120,7 @@ def bsp_clipped_frame(vh=None, vy=None, view_buf=None) -> tuple:
 
         gs.platform_occluders = platform_render.draw_platforms(
             frame, scene, px, py, pa, eye, F, hc, iw, ih, iw_f, ih_f,
-            fwidths, clip_top, clip_bot, view_buf, view, vh, vy)
+            fwidths, clip_top, clip_bot, view_buf, view, vh, vy, clip_hist)
     _upscale(frame, vy, vh)
     return order, clip_top, clip_bot
 

@@ -599,7 +599,10 @@ class _Builder:
     def __init__(self):
         self.sm = SectorMap()
         self._verts: dict[tuple[float, float], int] = {}
-        self._lines: dict[tuple[int, int], int] = {}
+        # undirected edge key -> linedef indices.  Most edges have one; an
+        # overlapping same-side pair (allowed for floating slabs) creates a
+        # coincident same-direction linedef, so the value is a list.
+        self._lines: dict[tuple[int, int], list[int]] = {}
         self._names: list[str] = []
 
     def vertex(self, x: float, y: float) -> int:
@@ -700,31 +703,49 @@ class _Builder:
             keep = cross > 0 if hole else cross < 0
             v1, v2 = (ids[i], ids[j]) if keep else (ids[j], ids[i])
             key = (v1, v2) if v1 <= v2 else (v2, v1)
-            li = self._lines.get(key)
-            if li is None:
+            lis = self._lines.get(key)
+            where = lines[i] if i < len(lines) else room.line
+            if not lis:
                 side = self.side(room.upper, room.mid, room.lower, si)
                 self.sm.linedefs.append(LineDef(v1, v2, front=side))
-                self._lines[key] = len(self.sm.linedefs) - 1
+                self._lines[key] = [len(self.sm.linedefs) - 1]
                 continue
-            ld = self.sm.linedefs[li]
-            where = lines[i] if i < len(lines) else room.line
-            if (v1, v2) == (ld.v1, ld.v2):
-                other = self._names[self.sm.sidedefs[ld.front].sector]
-                if self.sm.sidedefs[ld.front].sector == si:
-                    continue        # the same room, the same face: ignore
-                raise TextMapError(
-                    where,
-                    f"комнаты «{other}» и «{room.name}» лежат по одну "
-                    f"сторону общей стены")
-            if ld.back >= 0:
-                if self.sm.sidedefs[ld.back].sector == si:
-                    continue
+            # Opposite direction + free back -> normal two-sided portal.
+            opp_free = None
+            opp_taken = None
+            same_sector = False
+            for li in lis:
+                ld = self.sm.linedefs[li]
+                if (v1, v2) == (ld.v2, ld.v1):
+                    if ld.back < 0:
+                        opp_free = li
+                    elif self.sm.sidedefs[ld.back].sector == si:
+                        same_sector = True
+                    else:
+                        opp_taken = li
+                elif (v1, v2) == (ld.v1, ld.v2):
+                    if self.sm.sidedefs[ld.front].sector == si:
+                        same_sector = True
+            if same_sector:
+                continue
+            if opp_free is not None:
+                ld = self.sm.linedefs[opp_free]
+                ld.back = self.side(room.upper, room.mid, room.lower, si)
+                continue
+            if opp_taken is not None:
+                ld = self.sm.linedefs[opp_taken]
                 other = self._names[self.sm.sidedefs[ld.back].sector]
                 raise TextMapError(
                     where,
                     f"грань «{other}»/«{room.name}»: третья комната "
                     f"на одной стене невозможна")
-            ld.back = self.side(room.upper, room.mid, room.lower, si)
+            # Same direction, different sector (overlapping/slab contact).
+            # One linedef cannot face two sectors on the same geometric side;
+            # create a coincident same-direction linedef so both rooms keep a
+            # valid border.
+            side = self.side(room.upper, room.mid, room.lower, si)
+            self.sm.linedefs.append(LineDef(v1, v2, front=side))
+            lis.append(len(self.sm.linedefs) - 1)
 
     def _wall(self, wall: _Wall) -> None:
         a = self.vertex(wall.x1, wall.y1)
@@ -734,22 +755,29 @@ class _Builder:
                 wall.line, f"СТЕНА: концы ({_fmt(wall.x1)}, {_fmt(wall.y1)})"
                            f" и ({_fmt(wall.x2)}, {_fmt(wall.y2)}) совпадают")
         key = (a, b) if a <= b else (b, a)
-        li = self._lines.get(key)
-        if li is not None:
-            ld = self.sm.linedefs[li]
-            self.paint(ld.front, wall)
-            self.paint(ld.back, wall)
-            if wall.special:
-                ld.special = wall.special
-            if wall.tag:
-                ld.tag = wall.tag
+        lis = self._lines.get(key)
+        if lis:
+            any_portal = False
+            for li in lis:
+                ld = self.sm.linedefs[li]
+                self.paint(ld.front, wall)
+                self.paint(ld.back, wall)
+                if wall.special:
+                    ld.special = wall.special
+                if wall.tag:
+                    ld.tag = wall.tag
+                if ld.back >= 0:
+                    any_portal = True
             if wall.solid:
-                if ld.back < 0:
+                if not any_portal:
                     raise TextMapError(
                         wall.line, f"СТЕНА ({_fmt(wall.x1)}, {_fmt(wall.y1)})-"
                                    f"({_fmt(wall.x2)}, {_fmt(wall.y2)}): "
                                    f"«сплошная» требует общей грани двух комнат")
-                ld.solid = True
+                for li in lis:
+                    ld = self.sm.linedefs[li]
+                    if ld.back >= 0:
+                        ld.solid = True
             return
         self.sm.invalidate()
         front, back = _probe_sectors(self.sm, wall.x1, wall.y1,
@@ -775,7 +803,7 @@ class _Builder:
         if wall.solid:
             ld.solid = True
         self.sm.linedefs.append(ld)
-        self._lines[key] = len(self.sm.linedefs) - 1
+        self._lines[key] = [len(self.sm.linedefs) - 1]
         self.sm.invalidate()
 
 

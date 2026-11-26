@@ -65,6 +65,11 @@ INTERESTING = (
     "Traceback",
     "stage:",
     "FAILED at stage",
+    "rout3-diag",
+    "FAILED PythonActivity",
+    "FAILED native libraries",
+    "SuperNotCalledException",
+    "mBrokenLibraries",
     "numpy",
     "pygame",
 )

@@ -26,9 +26,10 @@ import java.util.Arrays;
  * inside {@code Throwable}, so:
  *
  * <ul>
- *   <li>a failure is written to the journal in {@link DiagLog} (visible at
- *       {@code Android/data/org.rout3.rout3/files/rout3-java.log} over USB, no
- *       permission needed), mirrored to app-private storage and logcat;</li>
+ *   <li>a failure is written to the journal in {@link DiagLog} (visible in the
+ *       Files app at {@code Загрузки/ROUT3/rout3-java.log} and over USB at
+ *       {@code Android/data/org.rout3.rout3/files/rout3-java.log}, no permission
+ *       needed), mirrored to app-private storage and logcat;</li>
  *   <li>the stack trace is shown on screen as selectable white-on-black text, so it
  *       can be read, copied or photographed instead of the window simply
  *       vanishing;</li>
@@ -106,6 +107,27 @@ public class DiagActivity extends org.kivy.android.PythonActivity {
         super.onDestroy();
     }
 
+    // Every lifecycle callback MUST call super to avoid SuperNotCalledException:
+    @Override
+    protected void onStart() {
+        super.onStart();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+    }
+
     // ── reporting ────────────────────────────────────────────────────
 
     /** Record a startup failure and keep it on screen. */
@@ -123,7 +145,8 @@ public class DiagActivity extends org.kivy.android.PythonActivity {
             detail = String.valueOf(failure);
         }
         sReport = "ROUT III не смог запуститься\n\n" + where + "\n\n" + detail
-                + "\nжурнал: " + DiagLog.path();
+                + "\nжурнал: " + DiagLog.publicPath()
+                + "\n(копия: " + DiagLog.path() + ")";
         screen(sReport);
     }
 
@@ -136,7 +159,7 @@ public class DiagActivity extends org.kivy.android.PythonActivity {
     /** The traceback as selectable text: a crash that can be photographed is a bug report. */
     private void screen(String text) {
         if (text == null) {
-            text = "ROUT III не смог запуститься\n\nжурнал: " + DiagLog.path();
+            text = "ROUT III не смог запуститься\n\nжурнал: " + DiagLog.publicPath();
         }
         try {
             TextView view = new TextView(this);
